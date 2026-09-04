@@ -1,0 +1,330 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+    --bg: rgba(22, 22, 25, 0.93);
+    --stroke: rgba(255, 255, 255, 0.11);
+    --fg: #ececf1;
+    --muted: rgba(236, 236, 241, 0.52);
+    --accent: #7aa2ff;
+    --user: rgba(122, 162, 255, 0.16);
+    --tool: rgba(255, 255, 255, 0.05);
+    --danger: #ff6b6b;
+    --radius: 14px;
+}
+
+html, body {
+    height: 100%;
+    background: transparent;
+    color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    overflow: hidden;
+}
+
+#shell {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    /* Containing block for the absolutely positioned attach picker. */
+    position: relative;
+    background: var(--bg);
+    backdrop-filter: blur(22px);
+    border: 1px solid var(--stroke);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+
+/* ---------------------------------------------------------------- title bar */
+
+#bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 10px 9px 13px;
+    border-bottom: 1px solid var(--stroke);
+    /* Drag the whole panel by its title bar; buttons opt back out below. */
+    -webkit-app-region: drag;
+    flex: none;
+}
+
+#dot {
+    width: 8px;
+    height: 8px;
+    flex: none;
+    border-radius: 50%;
+    background: #35c759;
+    transition: background 160ms ease;
+}
+#dot.busy { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+#title { font-weight: 600; font-size: 13px; letter-spacing: 0.01em; }
+.spacer { flex: 1; }
+
+button {
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    border: none;
+    background: none;
+    -webkit-app-region: no-drag;
+}
+
+.ghost {
+    padding: 4px 9px;
+    font-size: 12px;
+    border-radius: 7px;
+    color: var(--muted);
+    border: 1px solid transparent;
+    transition: background 120ms ease, color 120ms ease;
+}
+.ghost:hover { background: rgba(255, 255, 255, 0.09); color: var(--fg); }
+.close { font-size: 17px; line-height: 1; padding: 2px 8px 4px; }
+
+/* -------------------------------------------------------------- transcript */
+
+#log {
+    flex: 1;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+}
+
+#log::-webkit-scrollbar { width: 9px; }
+#log::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.13);
+    border-radius: 5px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+
+.msg { display: flex; }
+.msg .body {
+    padding: 8px 11px;
+    border-radius: 11px;
+    max-width: 92%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.msg.user { justify-content: flex-end; }
+.msg.user .body { background: var(--user); border: 1px solid rgba(122, 162, 255, 0.28); }
+
+.msg.assistant .body { background: rgba(255, 255, 255, 0.06); }
+
+.msg.tool .body,
+.msg.system .body {
+    background: var(--tool);
+    color: var(--muted);
+    font-size: 12.5px;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    padding: 5px 9px;
+    border-radius: 7px;
+}
+
+.msg.error .body {
+    background: rgba(255, 107, 107, 0.12);
+    border: 1px solid rgba(255, 107, 107, 0.32);
+    color: #ffc4c4;
+}
+
+/* Caret while tokens are still arriving. */
+.body.streaming::after {
+    content: '';
+    display: inline-block;
+    width: 7px;
+    height: 1em;
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    background: var(--accent);
+    animation: caret 1s steps(2) infinite;
+}
+@keyframes caret { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+
+/* ---------------------------------------------------------------- composer */
+
+#composer {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    padding: 10px;
+    border-top: 1px solid var(--stroke);
+    flex: none;
+}
+
+#input {
+    flex: 1;
+    resize: none;
+    padding: 9px 11px;
+    border-radius: 10px;
+    border: 1px solid var(--stroke);
+    background: rgba(0, 0, 0, 0.28);
+    color: var(--fg);
+    font: inherit;
+    max-height: 140px;
+    outline: none;
+    transition: border-color 120ms ease;
+}
+#input:focus { border-color: rgba(122, 162, 255, 0.55); }
+#input::placeholder { color: rgba(236, 236, 241, 0.35); }
+
+#send {
+    flex: none;
+    padding: 9px 15px;
+    border-radius: 10px;
+    background: var(--accent);
+    color: #0d1220;
+    font-weight: 600;
+    transition: background 120ms ease;
+}
+#send:hover { background: #93b4ff; }
+#send.stop { background: var(--danger); color: #2a0d0d; }
+
+#status {
+    flex: none;
+    padding: 5px 12px 8px;
+    font-size: 11px;
+    color: var(--muted);
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #dot.busy, .body.streaming::after { animation: none; }
+}
+
+/* ---------------------------------------------------------- attach picker */
+
+/* An author `display` beats the [hidden] attribute's UA `display: none`, so the
+   panel must opt out explicitly or it is permanently visible. */
+#picker[hidden] { display: none; }
+
+#picker {
+    position: absolute;
+    inset: 44px 10px auto 10px;
+    max-height: calc(100% - 130px);
+    display: flex;
+    flex-direction: column;
+    padding: 12px;
+    border-radius: 12px;
+    background: rgba(28, 28, 32, 0.985);
+    border: 1px solid var(--stroke);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.6);
+    z-index: 10;
+}
+
+#picker-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+#picker-head strong { flex: 1; font-size: 13px; }
+
+#picker-note {
+    margin-bottom: 10px;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.45;
+}
+
+#picker-list {
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    color: var(--muted);
+    font-size: 12.5px;
+}
+
+.ws-head {
+    margin-bottom: 5px;
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+
+.session {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 9px;
+    margin-bottom: 3px;
+    border-radius: 8px;
+    text-align: left;
+    color: var(--fg);
+    font-size: 12.5px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid transparent;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+.session:hover {
+    background: rgba(122, 162, 255, 0.14);
+    border-color: rgba(122, 162, 255, 0.4);
+}
+
+.session-title {
+    flex: 1;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.session-when {
+    flex: none;
+    color: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------- following an IDE */
+
+#mirror-bar[hidden] { display: none; }
+
+#mirror-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+    padding: 7px 10px 7px 12px;
+    background: rgba(122, 162, 255, 0.1);
+    border-bottom: 1px solid rgba(122, 162, 255, 0.24);
+    font-size: 12px;
+}
+
+#mirror-dot {
+    width: 7px;
+    height: 7px;
+    flex: none;
+    border-radius: 50%;
+    background: #35c759;
+    animation: pulse 1.6s ease-in-out infinite;
+}
+
+#mirror-label {
+    flex: 1;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--fg);
+}
+
+#mirror-stop { flex: none; font-size: 11px; }
+
+#input:disabled,
+#send:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #mirror-dot { animation: none; }
+}

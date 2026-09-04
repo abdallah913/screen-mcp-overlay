@@ -1,0 +1,40 @@
+[package]
+name = "uia-helper"
+version = "0.1.0"
+edition = "2021"
+description = "Window and UI Automation queries for Screen MCP Overlay"
+
+[dependencies]
+uiautomation = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+windows-future = "0.3"
+# Pure-Rust PNG encoder for PrintWindow captures.
+png = "0.17"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Dwm",
+    # OCR for surfaces with no accessibility tree (canvas, games, remote desktop).
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation_Collections",
+    # Focus, occlusion, PrintWindow captures and scrolling.
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Storage_Xps",
+    "Win32_System_Threading",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

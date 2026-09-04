@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Screen MCP Overlay</title>
+<link rel="stylesheet" href="hud.css" />
+
+<div id="shell">
+  <header id="bar">
+    <span id="dot"></span>
+    <span id="title">Screen Overlay</span>
+    <div class="spacer"></div>
+    <button id="attach" class="ghost" title="Follow a Claude Code session from your editor, live">Follow</button>
+    <button id="clear" class="ghost" title="Clear everything drawn on screen (Ctrl+Shift+X)">Clear</button>
+    <button id="new" class="ghost" title="Start a new conversation">New</button>
+    <button id="copy" class="ghost" title="Copy the MCP URL to the clipboard">URL</button>
+    <button id="close" class="ghost close" title="Hide the panel (Ctrl+Shift+O)">&times;</button>
+  </header>
+
+  <div id="mirror-bar" hidden>
+    <span id="mirror-dot"></span>
+    <span id="mirror-label"></span>
+    <button id="mirror-stop" class="ghost">Stop following</button>
+  </div>
+
+  <div id="log"></div>
+
+  <div id="picker" hidden>
+    <div id="picker-head">
+      <strong>Follow a session from your editor</strong>
+      <button id="picker-close" class="ghost close">&times;</button>
+    </div>
+    <p id="picker-note">
+      The panel becomes a live, read-only view of that conversation — everything you send and
+      receive in your editor shows up here as it happens.
+    </p>
+    <div id="picker-list"></div>
+  </div>
+
+  <footer id="composer">
+    <textarea id="input" rows="1" placeholder="Ask about what's on your screen…" spellcheck="false"></textarea>
+    <button id="send">Send</button>
+  </footer>
+
+  <div id="status">starting…</div>
+</div>
+
+<script src="hud.js"></script>

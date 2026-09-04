@@ -1,0 +1,91 @@
+{
+  "name": "screen-mcp-overlay",
+  "version": "0.1.0",
+  "description": "A desktop overlay that lets Claude Code and any MCP client see your screen and draw guidance on it.",
+  "license": "Apache-2.0",
+  "main": "dist/main/index.js",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs --watch",
+    "start": "npm run build && node scripts/start.mjs",
+    "typecheck": "tsc --noEmit",
+    "connect": "node scripts/connect.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "visual-check": "node scripts/visual-check.mjs",
+    "icon": "node scripts/make-icon.mjs",
+    "dist": "npm run icon && npm run build:native && npm run build && electron-builder --win",
+    "dist:dir": "npm run icon && npm run build:native && npm run build && electron-builder --win --dir",
+    "build:native": "cargo build --release --manifest-path native/uia-helper/Cargo.toml",
+    "build:test": "esbuild src/shared/geometry.ts src/shared/uitree.ts --bundle --platform=node --format=esm --outdir=dist-test --log-level=error",
+    "test": "npm run build:test && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.258",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "^44.1.1",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.25.0",
+    "rcedit": "^5.0.2",
+    "typescript": "^5.7.0"
+  },
+  "author": {
+    "name": "XelQore"
+  },
+  "build": {
+    "appId": "com.xelqore.screen-mcp-overlay",
+    "productName": "Screen MCP Overlay",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/@anthropic-ai/claude-agent-sdk/**"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Screen MCP Overlay",
+      "artifactName": "ScreenMcpOverlay-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "ScreenMcpOverlay-Portable-${version}.${ext}"
+    },
+    "afterPack": "./scripts/after-pack.cjs",
+    "extraResources": [
+      {
+        "from": "native/uia-helper/target/release/uia-helper.exe",
+        "to": "uia-helper.exe"
+      }
+    ]
+  }
+}

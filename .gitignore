@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+release/
+build/*.png
+build/*.ico
+native/uia-helper/target/
+
+# Contain the MCP access token
+.mcp.json
+.vscode/mcp.json
+dist-test/

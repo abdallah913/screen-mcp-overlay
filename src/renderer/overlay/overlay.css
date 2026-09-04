@@ -1,0 +1,77 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: transparent;
+    /* The window is click-through at the OS level; this keeps the renderer
+       from showing a text cursor or selection during the brief interactive
+       window while a click request is pending. */
+    user-select: none;
+    cursor: default;
+}
+
+#c {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+body.picking { cursor: crosshair; }
+body.picking #c { cursor: crosshair; }
+
+#banner {
+    position: fixed;
+    top: 24px;
+    left: 50%;
+    transform: translate(-50%, -12px);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 70vw;
+    padding: 11px 16px;
+    border-radius: 12px;
+    background: rgba(18, 18, 20, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
+    color: #f5f5f7;
+    font: 500 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 140ms ease, transform 140ms ease;
+}
+
+#banner.visible {
+    opacity: 1;
+    transform: translate(-50%, 0);
+}
+
+#banner-dot {
+    width: 9px;
+    height: 9px;
+    flex: none;
+    border-radius: 50%;
+    background: #ff453a;
+    animation: blink 1.2s ease-in-out infinite;
+}
+
+#banner-text { flex: 1; }
+
+#banner-hint {
+    flex: none;
+    padding: 3px 7px;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(245, 245, 247, 0.65);
+    font-size: 12px;
+}
+
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #banner-dot { animation: none; }
+}
