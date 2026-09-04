@@ -22,24 +22,33 @@ Windows 10 (2004+) or Windows 11.
 
 ## 1. Install
 
-Build it:
+### [⬇ Download the latest release](https://github.com/abdallah913/screen-mcp-overlay/releases/latest)
 
-```bash
-npm install
-npm run dist
-```
-
-Needs [Node 20+](https://nodejs.org) and [Rust](https://rustup.rs) (for the UI Automation helper).
-You get two files in `release/` — use either:
+Grab one of the two files on that page — no build tools, no Node, nothing to set up:
 
 | File | Use |
 |---|---|
-| `ScreenMcpOverlay-Setup-0.1.0.exe` | Installer, with shortcuts |
-| `ScreenMcpOverlay-Portable-0.1.0.exe` | One self-contained file, installs nothing |
+| `ScreenMcpOverlay-Setup-<version>.exe` | **Recommended.** Installer, with Start-menu and desktop shortcuts |
+| `ScreenMcpOverlay-Portable-<version>.exe` | One self-contained file. Run it from anywhere, installs nothing |
 
-The app sits in your **system tray**. Right-click it to start automatically at login.
+Run it and the app appears in your **system tray**. Right-click the tray icon to start it
+automatically at login.
 
-> The build is unsigned, so Windows SmartScreen warns on first run — **More info → Run anyway**.
+> The build is unsigned, so Windows SmartScreen warns on first run — click **More info → Run anyway**.
+
+**Updating:** there's no auto-updater yet, so check the
+[releases page](https://github.com/abdallah913/screen-mcp-overlay/releases) now and then. Download
+the new installer and run it over the top; your settings and MCP token are kept.
+
+<details>
+<summary>Or build it yourself</summary>
+
+Needs [Node 20+](https://nodejs.org) and [Rust](https://rustup.rs) (for the UI Automation helper).
+
+```bash
+npm install
+npm run dist     # writes the installer and portable exe to release/
+```
 
 Or run from source without packaging:
 
@@ -47,6 +56,8 @@ Or run from source without packaging:
 npm install
 npm start
 ```
+
+</details>
 
 ## 2. Connect it to an agent
 
