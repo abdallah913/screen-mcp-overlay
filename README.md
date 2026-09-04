@@ -131,8 +131,10 @@ The agent draws on your screen and waits for you between steps.
 | `Escape` | Cancel a pending click request |
 
 There's also a **built-in chat panel** (bottom-right, draggable) if you'd rather not switch to a
-terminal. It can also **follow** a Claude Code conversation you already have open in VS Code, so you
-see it live on your screen.
+terminal, which can **follow** a Claude Code conversation you already have open in VS Code so you see
+it live on your screen. The panel needs the Claude Agent SDK, which is not bundled with the
+installer — run the app from source to use it (see *Or build it yourself* above). Everything else
+works the same either way.
 
 ---
 
@@ -164,6 +166,30 @@ Drawings can be **anchored** to a window or a control, so they follow their targ
 - **[docs/RESEARCH.md](docs/RESEARCH.md)** — the prior-art survey that shaped the design.
 - **[Known limitations](docs/DESIGN.md#status)** — what isn't done yet.
 
+## Privacy
+
+Everything stays on your machine.
+
+- Screenshots are written to a temporary folder and deleted when the app exits. They are never
+  uploaded anywhere.
+- There is **no telemetry**, no analytics and no crash reporting.
+- The MCP server listens on loopback only (`127.0.0.1`) and requires an access token. It sends no CORS
+  headers, refuses any request carrying an `Origin`, and enables DNS-rebinding protection — so a web
+  page you happen to be visiting cannot reach it and read your screen.
+- Every capture posts a line into the overlay panel. A screen read is never silent.
+- The overlay does not control your mouse or keyboard. It can bring a window to the front and scroll
+  one, and that is the extent of it.
+
+The agent you connect, of course, sends what it captures to whatever service that agent uses. That
+part is between you and your agent.
+
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](LICENSE). Third-party components and their licences are listed in [NOTICE](NOTICE).
+
+The built-in chat panel uses your own local Claude Code installation and your own credentials — this
+project never sees, stores or proxies them, and the proprietary Claude Agent SDK is not distributed
+with the installer.
+
+Claude and Claude Code are trademarks of Anthropic PBC. This project is not affiliated with, endorsed
+by, or sponsored by Anthropic.

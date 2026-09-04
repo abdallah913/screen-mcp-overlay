@@ -268,6 +268,18 @@ Verified working on a 2560×1440 display at 1.25× scaling captured down to 1200
 A translucent panel (bottom-right, draggable) lets you talk to the agent without leaving your
 screen. It runs Claude through the Claude Agent SDK, wired to this same MCP server.
 
+**The SDK is an optional dependency and is not shipped in the packaged app.** It is proprietary
+("(c) Anthropic PBC. All rights reserved"), so bundling it would put the download under Anthropic's
+terms instead of this project's Apache-2.0 licence, for a feature that is a convenience rather than
+the product. A source build installs it from npm and the panel works; a release build does not have
+it and [sdk.ts](../src/main/agent/sdk.ts) turns the load failure into an explanation rather than a
+module-resolution error. Nothing else depends on it — the MCP server, the tools and every agent that
+connects over HTTP behave identically.
+
+The panel never handles credentials. It has no API-key, OAuth or login code at all; the SDK resolves
+authentication from the user's own Claude Code installation on their own machine, so usage bills to
+them and this project never sees, stores or proxies a credential.
+
 It is deliberately restricted: it may use the overlay tools plus `Read`, `Glob` and `Grep`.
 `Bash`, `Write`, `Edit` and everything else are refused by `canUseTool` in
 [src/main/agent/claude.ts](../src/main/agent/claude.ts). The panel is for guiding you around your
@@ -319,7 +331,7 @@ typing into the panel directly.
 | `SCREEN_OVERLAY_SHOW_IN_CAPTURE` | unset | Set to `1` to make annotations visible in screen recordings and shares |
 
 Preferences set from the tray menu (start at login, capture visibility) persist in
-`%APPDATA%\Screen MCP Overlay\settings.json`. An env var always wins for that run.
+`%APPDATA%\screen-mcp-overlay\settings.json`. An env var always wins for that run.
 
 ---
 

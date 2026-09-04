@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { loadSdk } from './sdk.js';
 
 /**
  * Attaching the overlay's chat panel to a Claude Code session you already have
@@ -31,14 +32,7 @@ export interface SessionChoice {
     dir: string;
 }
 
-// ESM-only module imported from CJS, so the type query needs a resolution mode.
-type SdkModule = typeof import('@anthropic-ai/claude-agent-sdk', { with: { 'resolution-mode': 'import' } });
-
-let sdk: SdkModule | undefined;
-async function load(): Promise<SdkModule> {
-    if (!sdk) sdk = await import('@anthropic-ai/claude-agent-sdk');
-    return sdk;
-}
+const load = loadSdk;
 
 function isAlive(pid: number): boolean {
     try {

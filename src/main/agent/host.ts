@@ -3,6 +3,7 @@ import type { AgentEvent, AgentProvider } from './types.js';
 import { ClaudeProvider } from './claude.js';
 import { clearLog, pushMessage, setBusy, setMirror, streamMessage } from '../hud.js';
 import { listIdeWorkspaces, listSessionsForDir, type IdeWorkspace, type SessionChoice } from './sessions.js';
+import { sdkUnavailable } from './sdk.js';
 import { mirroring, startMirror, stopMirror } from './mirror.js';
 
 /**
@@ -48,7 +49,7 @@ export function initAgentHost(): void {
             try {
                 sessions = await listSessionsForDir(ws.dir, 5);
             } catch (err) {
-                pushMessage('error', `Could not read sessions for ${ws.label}: ${(err as Error).message}`);
+                pushMessage('error', `Could not read sessions for ${ws.label}. ${sdkUnavailable(err)}`);
             }
             out.push({ workspace: ws, sessions });
         }

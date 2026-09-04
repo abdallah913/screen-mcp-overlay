@@ -1,0 +1,57 @@
+Screen MCP Overlay
+Copyright 2026 XelQore
+
+This product includes software developed by third parties, listed below with
+their licences. Copies of the Apache License 2.0 accompany this distribution as
+the LICENSE file; the MIT and BSD licences of the remaining components are
+included with those components inside the application package.
+
+
+Bundled in the packaged application
+-----------------------------------
+
+Electron and the Chromium content module
+  MIT (Electron) and BSD-3-Clause plus others (Chromium and its dependencies).
+  Full texts ship inside the application directory as LICENSE.electron.txt and
+  LICENSES.chromium.html.
+
+@modelcontextprotocol/sdk .......... MIT
+zod ................................ MIT
+
+
+Statically linked into uia-helper.exe
+-------------------------------------
+
+uiautomation ....................... Apache-2.0
+  https://crates.io/crates/uiautomation
+  Copyright the uiautomation authors. Licensed under the Apache License,
+  Version 2.0; see the accompanying LICENSE file for the full text.
+
+windows, windows-core, windows-future, windows-strings
+                                     MIT OR Apache-2.0
+chrono ............................. MIT OR Apache-2.0
+flate2 ............................. MIT OR Apache-2.0
+png ................................ MIT OR Apache-2.0
+serde, serde_json .................. MIT OR Apache-2.0
+
+
+Build-time only, not distributed
+--------------------------------
+
+TypeScript ......................... Apache-2.0
+esbuild ............................ MIT
+electron-builder ................... MIT
+rcedit ............................. MIT
+
+
+Not distributed with this application
+-------------------------------------
+
+@anthropic-ai/claude-agent-sdk is a proprietary package ("(c) Anthropic PBC.
+All rights reserved") used only by the optional built-in chat panel. It is
+deliberately excluded from the packaged application and is installed by the
+developer at build time, or by the user, from npm under Anthropic's own terms.
+See https://code.claude.com/docs/en/legal-and-compliance.
+
+Claude and Claude Code are trademarks of Anthropic PBC. This project is not
+affiliated with, endorsed by, or sponsored by Anthropic.

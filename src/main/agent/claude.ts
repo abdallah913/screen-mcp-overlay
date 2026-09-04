@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import type { AgentEvent, AgentProvider, SendInput } from './types.js';
 import { mcpUrl } from '../mcp/server.js';
+import { loadSdk, sdkUnavailable, type SdkModule } from './sdk.js';
 
 /**
  * The built-in provider: Claude, via the Claude Agent SDK.
@@ -41,16 +42,11 @@ Working method:
 
 // The Agent SDK is ESM-only and this file compiles to CJS, so the type-only
 // import needs an explicit resolution mode.
-type QueryFn = typeof import('@anthropic-ai/claude-agent-sdk', { with: { 'resolution-mode': 'import' } }).query;
+type QueryFn = SdkModule['query'];
 type QueryHandle = ReturnType<QueryFn>;
 
-let cachedQuery: QueryFn | null = null;
-
 async function loadQuery(): Promise<QueryFn> {
-    if (cachedQuery) return cachedQuery;
-    const mod = await import('@anthropic-ai/claude-agent-sdk');
-    cachedQuery = mod.query;
-    return cachedQuery;
+    return (await loadSdk()).query;
 }
 
 export class ClaudeProvider implements AgentProvider {
@@ -63,7 +59,7 @@ export class ClaudeProvider implements AgentProvider {
         try {
             await loadQuery();
         } catch (err) {
-            return `Could not load @anthropic-ai/claude-agent-sdk: ${(err as Error).message}`;
+            return sdkUnavailable(err);
         }
         if (!mcpUrl()) return 'The MCP server has not started yet.';
         return null;
