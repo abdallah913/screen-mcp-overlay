@@ -239,58 +239,91 @@ fn list_windows() -> Vec<WindowInfo> {
 
 // -------------------------------------------------------------------- uia
 
-/// Control types worth naming. UIA exposes far more; these are the ones an
-/// agent would plausibly ask to point at.
-fn role_id(role: &str) -> Option<i32> {
-    Some(match role.to_ascii_lowercase().as_str() {
-        "button" => 50000,
-        "checkbox" => 50002,
-        "combobox" => 50003,
-        "edit" | "textbox" | "input" => 50004,
-        "hyperlink" | "link" => 50005,
-        "image" => 50006,
-        "listitem" => 50007,
-        "list" => 50008,
-        "menuitem" => 50011,
-        "radiobutton" => 50013,
-        "tab" => 50018,
-        "tabitem" => 50019,
-        "text" | "label" => 50020,
-        "toolbar" => 50021,
-        "tree" => 50023,
-        "treeitem" => 50024,
-        "group" => 50026,
-        "document" => 50030,
-        "pane" => 50033,
-        "window" => 50032,
-        _ => return None,
-    })
+/// Every UIA control type, under the short name agents use for it.
+///
+/// This used to cover twenty types, and the gaps were silent in both
+/// directions: a slider or menu came back as "other", and filtering by an
+/// unlisted role quietly dropped the filter and matched every control.
+const ROLES: &[(i32, &str)] = &[
+    (50000, "button"),
+    (50001, "calendar"),
+    (50002, "checkbox"),
+    (50003, "combobox"),
+    (50004, "edit"),
+    (50005, "link"),
+    (50006, "image"),
+    (50007, "listitem"),
+    (50008, "list"),
+    (50009, "menu"),
+    (50010, "menubar"),
+    (50011, "menuitem"),
+    (50012, "progressbar"),
+    (50013, "radiobutton"),
+    (50014, "scrollbar"),
+    (50015, "slider"),
+    (50016, "spinner"),
+    (50017, "statusbar"),
+    (50018, "tab"),
+    (50019, "tabitem"),
+    (50020, "text"),
+    (50021, "toolbar"),
+    (50022, "tooltip"),
+    (50023, "tree"),
+    (50024, "treeitem"),
+    (50025, "custom"),
+    (50026, "group"),
+    (50027, "thumb"),
+    (50028, "datagrid"),
+    (50029, "dataitem"),
+    (50030, "document"),
+    (50031, "splitbutton"),
+    (50032, "window"),
+    (50033, "pane"),
+    (50034, "header"),
+    (50035, "headeritem"),
+    (50036, "table"),
+    (50037, "titlebar"),
+    (50038, "separator"),
+    (50039, "semanticzoom"),
+    (50040, "appbar"),
+];
+
+/// Other names agents reach for, mapped onto the canonical ones above.
+const ROLE_ALIASES: &[(&str, &str)] = &[
+    ("textbox", "edit"),
+    ("input", "edit"),
+    ("hyperlink", "link"),
+    ("label", "text"),
+    ("radio", "radiobutton"),
+    ("dialog", "window"),
+];
+
+/// Resolve a role filter, or explain which roles exist.
+///
+/// Spaces, hyphens and underscores are ignored, so "list item" and
+/// "menu_item" work as well as "listitem".
+fn role_id(role: &str) -> Result<i32, String> {
+    let wanted: String = role
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '_'))
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let canonical = ROLE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == wanted)
+        .map_or(wanted.as_str(), |(_, name)| *name);
+    ROLES
+        .iter()
+        .find(|(_, name)| *name == canonical)
+        .map(|(id, _)| *id)
+        .ok_or_else(|| {
+            let known: Vec<&str> = ROLES.iter().map(|(_, name)| *name).collect();
+            format!("unknown role '{role}'. Known roles: {}", known.join(", "))
+        })
 }
 
 fn role_name(id: i32) -> &'static str {
-    match id {
-        50000 => "button",
-        50002 => "checkbox",
-        50003 => "combobox",
-        50004 => "edit",
-        50005 => "link",
-        50006 => "image",
-        50007 => "listitem",
-        50008 => "list",
-        50011 => "menuitem",
-        50013 => "radiobutton",
-        50018 => "tab",
-        50019 => "tabitem",
-        50020 => "text",
-        50021 => "toolbar",
-        50023 => "tree",
-        50024 => "treeitem",
-        50026 => "group",
-        50030 => "document",
-        50032 => "window",
-        50033 => "pane",
-        _ => "other",
-    }
+    ROLES.iter().find(|(rid, _)| *rid == id).map_or("other", |(_, name)| *name)
 }
 
 /// The control's current value, for inputs, combos and sliders.
@@ -329,15 +362,45 @@ fn to_rect(el: &UIElement) -> Option<Rect> {
     Some(Rect { x: l, y: t, width: rr - l, height: b - t })
 }
 
+/// How many element handles to keep alive at once.
+///
+/// Each cached UIElement is a COM reference that pins memory in the target
+/// application's accessibility provider, not just here. The cache used to grow
+/// forever: a describe adds up to a thousand, and a fifteen-minute
+/// wait_for_element adds a few every poll. Anchors are touched on every tracker
+/// tick, so least-recently-used eviction never drops one that is on screen.
+const CACHE_LIMIT: usize = 5000;
+
 struct Session {
     auto: UIAutomation,
-    /// Live UIElement handles. Keeping the objects beats re-resolving by
-    /// RuntimeId: it is faster and survives relayout within the same run.
-    cache: HashMap<String, UIElement>,
+    /// Live UIElement handles plus the tick they were last used. Keeping the
+    /// objects beats re-resolving by RuntimeId: it is faster and survives
+    /// relayout within the same run.
+    cache: HashMap<String, (UIElement, u64)>,
     next: u64,
+    clock: u64,
 }
 
 impl Session {
+    /// Cache an element and hand back the ref the client will use for it.
+    fn remember(&mut self, el: UIElement) -> String {
+        self.next += 1;
+        self.clock += 1;
+        let key = format!("el_{}", self.next);
+        self.cache.insert(key.clone(), (el, self.clock));
+        if self.cache.len() > CACHE_LIMIT {
+            // Evict a quarter at once so the sort runs once per ~1000 inserts
+            // rather than on every one.
+            let mut ages: Vec<(u64, String)> =
+                self.cache.iter().map(|(k, (_, used))| (*used, k.clone())).collect();
+            ages.sort_unstable();
+            for (_, k) in ages.into_iter().take(CACHE_LIMIT / 4) {
+                self.cache.remove(&k);
+            }
+        }
+        key
+    }
+
     fn find_elements(
         &mut self,
         window_ref: Option<&str>,
@@ -356,25 +419,28 @@ impl Session {
             None => self.auto.get_root_element().map_err(|e| e.to_string())?,
         };
 
-        // Search on the cheapest available property, then filter in Rust. A
-        // substring match is what an agent naturally asks for, and UIA has no
-        // "contains" condition.
-        let cond = match role.and_then(role_id) {
-            Some(id) => self
-                .auto
-                .create_property_condition(UIProperty::ControlType, Variant::from(id), None)
-                .map_err(|e| e.to_string())?,
-            None => self
-                .auto
-                .create_property_condition(UIProperty::IsEnabled, Variant::from(true), None)
-                .map_err(|e| e.to_string())?,
+        // Filter on control type in UIA, then on name in Rust: a substring
+        // match is what an agent naturally asks for, and UIA has no "contains"
+        // condition. Without a role this must match everything. It used to be
+        // IsEnabled=true, which hid disabled controls from every search, so a
+        // button greying out counted as "disappears" and a disabled one could
+        // never "appear".
+        let cond = match role {
+            Some(r) => {
+                let id = role_id(r)?;
+                self.auto
+                    .create_property_condition(UIProperty::ControlType, Variant::from(id), None)
+                    .map_err(|e| e.to_string())?
+            }
+            None => self.auto.create_true_condition().map_err(|e| e.to_string())?,
         };
 
         // find_all walks the entire subtree before returning. Across the whole
         // desktop that is seconds, which makes polling waits useless. When the
         // caller only wants one match, find_first short-circuits on the first
         // hit instead.
-        let found: Vec<UIElement> = if limit == 1 && name.is_none() && automation_id.is_none() {
+        let first_only = limit == 1 && name.is_none() && automation_id.is_none();
+        let found: Vec<UIElement> = if first_only {
             match root.find_first(TreeScope::Descendants, &cond) {
                 Ok(el) => vec![el],
                 Err(_) => Vec::new(),
@@ -400,23 +466,24 @@ impl Session {
                 if !el_name.to_ascii_lowercase().contains(n.as_str()) {
                     continue;
                 }
-            } else if el_name.trim().is_empty() {
+            } else if !first_only && el_name.trim().is_empty() {
+                // Unnamed matches are noise in a listing, but find_first
+                // returns exactly one element; discarding it would report "no
+                // such control" while named ones exist.
                 continue;
             }
             let Some(rect) = to_rect(el) else { continue };
 
-            self.next += 1;
-            let key = format!("el_{}", self.next);
             let ctrl = el.get_control_type().map(|c| c as i32).unwrap_or(0);
+            let enabled = el.is_enabled().unwrap_or(true);
             out.push(ElementInfo {
-                r#ref: key.clone(),
+                r#ref: self.remember(el.clone()),
                 name: el_name,
                 role: role_name(ctrl).to_string(),
                 automation_id: el_auto,
                 rect,
-                enabled: el.is_enabled().unwrap_or(true),
+                enabled,
             });
-            self.cache.insert(key, el.clone());
             if out.len() >= limit {
                 break;
             }
@@ -477,29 +544,32 @@ impl Session {
             if depth > 0 && name.trim().is_empty() && value.is_none() {
                 continue;
             }
-            self.next += 1;
-            let key = format!("el_{}", self.next);
             let ctrl = el.get_control_type().map(|c| c as i32).unwrap_or(0);
+            let automation_id = automation_id_of(&el);
+            let enabled = el.is_enabled().unwrap_or(true);
             out.push(DescribedNode {
                 depth,
-                r#ref: key.clone(),
+                r#ref: self.remember(el),
                 name,
                 role: role_name(ctrl).to_string(),
-                automation_id: automation_id_of(&el),
+                automation_id,
                 value,
-                enabled: el.is_enabled().unwrap_or(true),
+                enabled,
                 rect,
             });
-            self.cache.insert(key, el);
         }
         Ok(out)
     }
 
-    /// Re-read current rectangles. This is the tracker's hot path.
-    fn resolve(&self, refs: &[String]) -> Vec<Resolved> {
+    /// Re-read current rectangles. This is the tracker's hot path, and the
+    /// touch here is what keeps on-screen anchors out of cache eviction.
+    fn resolve(&mut self, refs: &[String]) -> Vec<Resolved> {
+        self.clock += 1;
+        let now = self.clock;
         refs.iter()
             .map(|r| {
-                let rect = if let Some(el) = self.cache.get(r) {
+                let rect = if let Some((el, used)) = self.cache.get_mut(r) {
+                    *used = now;
                     to_rect(el)
                 } else if let Ok(raw) = r.parse::<isize>() {
                     let hwnd = HWND(raw as *mut std::ffi::c_void);
@@ -552,7 +622,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut session = Session { auto, cache: HashMap::new(), next: 0 };
+    let mut session = Session { auto, cache: HashMap::new(), next: 0, clock: 0 };
 
     reply(0, Ok(serde_json::json!({ "ready": true, "version": env!("CARGO_PKG_VERSION") })));
 
@@ -634,5 +704,37 @@ fn main() {
             "ping" => reply(req.id, Ok(serde_json::json!({ "pong": true }))),
             other => reply::<()>(req.id, Err(format!("unknown op '{other}'"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_role_round_trips() {
+        for (id, name) in ROLES {
+            assert_eq!(role_id(name), Ok(*id), "{name}");
+            assert_eq!(role_name(*id), *name);
+        }
+    }
+
+    #[test]
+    fn aliases_and_spacing_resolve() {
+        assert_eq!(role_id("TextBox"), role_id("edit"));
+        assert_eq!(role_id("list item"), role_id("listitem"));
+        assert_eq!(role_id("menu_item"), role_id("menuitem"));
+        assert_eq!(role_id("dialog"), role_id("window"));
+    }
+
+    #[test]
+    fn unknown_role_is_an_error_naming_the_options() {
+        let err = role_id("widget").unwrap_err();
+        assert!(err.contains("'widget'") && err.contains("slider"), "{err}");
+    }
+
+    #[test]
+    fn unmapped_control_type_is_other() {
+        assert_eq!(role_name(49999), "other");
     }
 }
