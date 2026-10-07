@@ -19,7 +19,7 @@ setTimeout(() => spawn('notepad.exe', [], { detached: true, stdio: 'ignore' }).u
 let started = Date.now();
 console.log('\n' + textOf(await c.callTool({
     name: 'wait_for_element',
-    arguments: { condition: 'appears', name: 'Notepad', role: 'window', timeoutMs: 30000, pollMs: 400 }
+    arguments: { condition: 'appears', name: 'Notepad', role: 'window', timeoutMs: 30000 }
 })));
 console.log(`(client-side elapsed: ${((Date.now() - started) / 1000).toFixed(1)}s)`);
 
@@ -35,7 +35,7 @@ setTimeout(() => {
 started = Date.now();
 console.log('\n' + textOf(await c.callTool({
     name: 'wait_for_element',
-    arguments: { condition: 'disappears', name: 'Notepad', role: 'window', timeoutMs: 30000, pollMs: 400 }
+    arguments: { condition: 'disappears', name: 'Notepad', role: 'window', timeoutMs: 30000 }
 })));
 console.log(`(client-side elapsed: ${((Date.now() - started) / 1000).toFixed(1)}s)`);
 
@@ -43,7 +43,7 @@ console.log(`(client-side elapsed: ${((Date.now() - started) / 1000).toFixed(1)}
 started = Date.now();
 console.log('\n' + textOf(await c.callTool({
     name: 'wait_for_element',
-    arguments: { condition: 'appears', name: 'ThisControlDoesNotExist', timeoutMs: 4000, pollMs: 500 }
+    arguments: { condition: 'appears', name: 'ThisControlDoesNotExist', timeoutMs: 4000 }
 })));
 console.log(`(client-side elapsed: ${((Date.now() - started) / 1000).toFixed(1)}s)`);
 

@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { registerTools } from './tools.js';
 import { listWindows } from '../uia.js';
+import { windowLine } from '../../shared/windows.js';
 import { store } from '../store.js';
 import { settings } from '../settings.js';
 
@@ -26,24 +27,74 @@ let boundPort = 0;
 let portWasTaken = 0;
 let activeRequests = 0;
 
-function buildServer(): McpServer {
-    const server = new McpServer(
-        { name: 'screen-mcp-overlay', version: '0.1.0' },
-        {
-            instructions:
-                "Inspect the user's screen and draw guidance onto it. Click-through, so drawings never block them.\n" +
-                'Loop: list_windows -> describe_window -> annotate with anchor {kind:"name"} -> wait_for_element.\n' +
-                'describe_window before capture_screen: text beats a ~1.8k-token image and yields anchorable refs. ' +
-                'Capture only for visual questions or an empty tree (canvas, games, browser page content).\n' +
-                'Anchor rather than using fixed coordinates; fixed ones go stale as soon as a window moves.\n' +
-                'wait_for_element to sequence steps, timeoutMs:0 to assert state. wait_for_user_click when you ' +
-                'cannot tell which element they mean.'
-        }
-    );
+/**
+ * Sent once per connection and typically placed in the agent's system prompt,
+ * so it carries the strategy the individual tool descriptions cannot: which
+ * tool to reach for first, and the shape of a walkthrough.
+ */
+const INSTRUCTIONS =
+    "See the user's screen and draw guidance on it; drawings are click-through. Any window parameter takes " +
+    'a ref, a title substring or "foreground", so list_windows is rarely needed.\n' +
+    'Read cheapest first: describe_window (text tree, anchorable refs; pass since= to re-check) > read_text ' +
+    '(OCR, when the tree is empty) > capture_screen (an image, only for visual questions).\n' +
+    'Point by anchoring annotate to the control, e.g. anchor {window:"Notepad", name:"Save"}: anchored drawings ' +
+    'follow it, fixed coordinates go stale when a window moves.\n' +
+    'Walkthroughs: one highlight_and_wait per step, with until set to the state that proves the step is done. ' +
+    'wait_for_element sequences anything else; timeoutMs:0 asserts state. wait_for_user_click when you cannot ' +
+    'tell what the user means.';
+
+export function buildServer(): McpServer {
+    const server = new McpServer({ name: 'screen-mcp-overlay', version: '0.1.0' }, { instructions: INSTRUCTIONS });
     registerTools(server);
+    compactToolList(server);
     registerResources(server);
     registerPrompts(server);
     return server;
+}
+
+type ListHandler = (request: unknown, extra: unknown) => Promise<{ tools: unknown[] }>;
+let compactedList: { tools: unknown[] } | undefined;
+
+/**
+ * Strip schema noise from tools/list.
+ *
+ * The tool list is resent on every turn of every conversation, so anything in
+ * it that tells the model nothing is paid for over and over. The SDK's zod
+ * conversion adds two such things: a `$schema` URI on every tool, and
+ * `+-9007199254740991` bounds on every integer without an explicit limit. Over
+ * thirteen tools that is about 700 characters a turn.
+ *
+ * The list is also static, so it is built once rather than per request: every
+ * request gets a fresh McpServer in stateless mode, and would otherwise redo the
+ * zod-to-JSON-Schema conversion for every tool on every tools/list.
+ *
+ * This reaches into the SDK's handler map, which is not public API. If that ever
+ * moves, the guard below falls back to the SDK's own (uncompacted) list, and the
+ * token-budget test fails loudly.
+ */
+function compactToolList(server: McpServer): void {
+    const handlers = (server.server as unknown as { _requestHandlers?: Map<string, ListHandler> })._requestHandlers;
+    const original = handlers?.get('tools/list');
+    if (!handlers || !original) return;
+    handlers.set('tools/list', async (request, extra) => {
+        if (!compactedList) {
+            const listed = await original(request, extra);
+            compactedList = { ...listed, tools: listed.tools.map(stripSchemaNoise) };
+        }
+        return compactedList;
+    });
+}
+
+export function stripSchemaNoise(node: unknown): unknown {
+    if (Array.isArray(node)) return node.map(stripSchemaNoise);
+    if (!node || typeof node !== 'object') return node;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node)) {
+        if (k === '$schema') continue;
+        if ((k === 'maximum' || k === 'minimum') && Math.abs(v as number) === Number.MAX_SAFE_INTEGER) continue;
+        out[k] = stripSchemaNoise(v);
+    }
+    return out;
 }
 
 /**
@@ -59,14 +110,11 @@ function registerResources(server: McpServer): void {
         'screen://windows',
         {
             title: 'Open windows',
-            description: 'Visible top-level windows with refs and rectangles.',
+            description: 'Visible top-level windows: ref WxH@x,y title.',
             mimeType: 'text/plain'
         },
         async uri => {
-            const windows = await listWindows();
-            const body = windows
-                .map(w => `${w.ref}\t${w.rect.width}x${w.rect.height} @${w.rect.x},${w.rect.y}\t${w.title}`)
-                .join('\n');
+            const body = (await listWindows()).map(windowLine).join('\n');
             return {
                 contents: [
                     {
@@ -97,11 +145,11 @@ function registerPrompts(server: McpServer): void {
                         type: 'text',
                         text:
                             `Guide me through: ${task}\n\n` +
-                            'Work one step at a time. For each step: find the control with describe_window or ' +
-                            'find_ui_elements, draw it with annotate using anchor {kind:"name"} so the drawing ' +
-                            'follows the window, tell me what to do in one sentence, then call wait_for_element ' +
-                            'to wait until I have done it before moving on. Read the screen with describe_window ' +
-                            'rather than screenshots unless you need to see something visual.'
+                            'Work one step at a time. Find each control with describe_window (not a screenshot ' +
+                            'unless you need to see something visual), then make the step a single ' +
+                            'highlight_and_wait: the control as the target, one sentence as the prompt, and until ' +
+                            'set to what proves I have done it, such as the dialog that should open. Move on only ' +
+                            'when it is met.'
                     }
                 }
             ]

@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import type { AgentEvent, AgentProvider, SendInput } from './types.js';
 import { mcpUrl } from '../mcp/server.js';
+import { TOOL_NAMES } from '../mcp/tools.js';
 import { loadSdk, sdkUnavailable, type SdkModule } from './sdk.js';
 
 /**
@@ -13,15 +14,13 @@ import { loadSdk, sdkUnavailable, type SdkModule } from './sdk.js';
 
 const SERVER_NAME = 'screen-overlay';
 
-/** Our own MCP tools, in the mcp__<server>__<tool> form the agent sees them as. */
-const OVERLAY_TOOLS = [
-    'list_displays',
-    'capture_screen',
-    'annotate',
-    'clear_annotations',
-    'wait_for_user_click',
-    'show_message'
-].map(t => `mcp__${SERVER_NAME}__${t}`);
+/**
+ * Our own MCP tools, in the mcp__<server>__<tool> form the agent sees them as.
+ * Derived from the server's own list: a hand-kept copy here once named a tool
+ * that no longer existed and left out nine that did, so canUseTool denied the
+ * panel describe_window and every other cheap way of reading the screen.
+ */
+const OVERLAY_TOOLS = TOOL_NAMES.map(t => `mcp__${SERVER_NAME}__${t}`);
 
 /**
  * Read-only built-ins the agent may use unprompted. Everything else -- Bash,
@@ -30,14 +29,15 @@ const OVERLAY_TOOLS = [
  */
 const ALLOWED_BUILTINS = ['Read', 'Glob', 'Grep'];
 
-const SYSTEM_APPEND = `You are driving a screen overlay on the user's desktop. You can see their screen and draw on it.
-
-Working method:
-- Call capture_screen, then read the returned PNG path to actually look at it.
-- Point at things by drawing on the real screen with annotate, using space:"image" and the pixel coordinates you read off that screenshot. Do not convert coordinates yourself.
-- Prefer showing over telling. A box or arrow on the thing you mean is clearer than a paragraph describing where it is.
-- Keep the screen uncluttered: a couple of shapes at a time, and clear_annotations when the user has moved on.
-- When you cannot tell which element the user means, call wait_for_user_click and let them point, rather than guessing.
+/**
+ * Only what is specific to the panel. How to use the tools -- read the tree
+ * before screenshotting, anchor rather than use coordinates -- arrives with the
+ * MCP server's own instructions, so repeating it here would cost tokens and,
+ * as an earlier version of this prompt showed, drift out of step with them.
+ */
+const SYSTEM_APPEND = `You are the chat panel of a screen overlay on the user's desktop. You see their screen and draw on it with the ${SERVER_NAME} tools; follow that server's instructions for how.
+- Show rather than tell: a circle anchored to the right control beats a paragraph describing where it is.
+- Keep the screen uncluttered: a couple of shapes at a time, cleared when the user moves on.
 - Keep replies short. The user is looking at their screen, not at this panel.`;
 
 // The Agent SDK is ESM-only and this file compiles to CJS, so the type-only
@@ -197,8 +197,15 @@ function summarise(name: string, input: unknown): string {
     const args = (input ?? {}) as Record<string, unknown>;
 
     switch (short) {
+        case 'list_windows':
+            return 'listing your windows';
+        case 'describe_window':
+        case 'find_ui_elements':
+            return `reading ${args.window ? String(args.window) : 'the screen'}`;
+        case 'read_text':
+            return 'reading text off the screen';
         case 'capture_screen':
-            return `looking at ${args.display ? `display ${String(args.display)}` : 'the screen'}`;
+            return `looking at ${args.window ? String(args.window) : args.display ? `display ${String(args.display)}` : 'the screen'}`;
         case 'annotate': {
             const shapes = Array.isArray(args.shapes) ? args.shapes : [];
             const kinds = shapes.map(s => String((s as { type?: unknown }).type ?? '?'));
@@ -207,11 +214,12 @@ function summarise(name: string, input: unknown): string {
         case 'clear_annotations':
             return 'clearing the screen';
         case 'wait_for_user_click':
-            return `asking you to click: ${String(args.prompt ?? '')}`;
+        case 'highlight_and_wait':
+            return `asking you: ${String(args.prompt ?? '')}`;
+        case 'wait_for_element':
+            return `waiting for ${String(args.name ?? args.automationId ?? args.role ?? 'the UI')}`;
         case 'show_message':
             return 'posting a message';
-        case 'list_displays':
-            return 'checking your displays';
         case 'Read':
             return `reading ${String(args.file_path ?? '')}`;
         default:

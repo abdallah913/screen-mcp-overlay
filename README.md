@@ -142,22 +142,23 @@ works the same either way.
 
 | Tool | What it does |
 |---|---|
-| `list_windows` | Windows and monitors: refs, titles, rects. The starting point |
+| `list_windows` | Windows and monitors: refs, titles, rects |
 | `describe_window` | A window's controls as a text tree. ~3.6x cheaper than a screenshot |
+| `find_ui_elements` | Search a window's tree by name, role or AutomationId |
+| `read_text` | OCR a window or region, with per-line rectangles |
 | `capture_screen` | Screenshot to disk. Renders a single window correctly even when covered |
 | `annotate` | Draw `box`, `highlight`, `circle`, `arrow`, `label`, `step`, `spotlight` |
 | `clear_annotations` | Remove some or all drawings |
-| `wait_for_user_click` | Ask the user to point at something, get the coordinates back |
+| `highlight_and_wait` | One walkthrough step: circle a control, wait until the user has done it, clear |
 | `wait_for_element` | Block until a control appears, disappears or becomes enabled |
-| `find_ui_elements` | Search a window's tree by name, role or AutomationId |
-| `read_text` | OCR a window or region, with per-line rectangles |
-| `speak` | Say a line out loud, for hands-free guidance |
+| `wait_for_user_click` | Ask the user to point at something, get the coordinates back |
 | `focus_window` | Bring a window to the front. Does not click or type |
 | `scroll_window` | Scroll a window to reveal content |
-| `highlight_and_wait` | Point at a control and wait for the user to click it, in one call |
-| `show_message` | Post a line into the overlay panel |
+| `show_message` | Post a line into the overlay panel, and optionally say it out loud |
 
-Drawings can be **anchored** to a window or a control, so they follow their target when it moves.
+Any `window` argument takes a ref, a **title substring** (`"Notepad"`) or `"foreground"`, so an agent
+rarely needs `list_windows` first. Drawings can be **anchored** to a window or a control
+(`anchor: {window: "Notepad", name: "Save"}`), so they follow their target when it moves.
 
 ## Documentation
 

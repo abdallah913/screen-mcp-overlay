@@ -64,7 +64,9 @@ resize();
 
 window.overlayApi.onState(state => {
     annotations = state.annotations;
-    displayId = annotations[0]?.displayId ?? displayId;
+    // Learning this from annotations[0] left it empty on a display with
+    // nothing drawn, and the main process silently dropped every click there.
+    displayId = state.displayId;
     const wasPending = click !== null;
     click = state.click;
     if (!click) collected = 0;

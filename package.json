@@ -17,7 +17,7 @@
     "dist": "npm run icon && npm run build:native && npm run build && electron-builder --win",
     "dist:dir": "npm run icon && npm run build:native && npm run build && electron-builder --win --dir",
     "build:native": "cargo build --release --manifest-path native/uia-helper/Cargo.toml",
-    "build:test": "esbuild src/shared/geometry.ts src/shared/uitree.ts --bundle --platform=node --format=esm --outdir=dist-test --log-level=error",
+    "build:test": "node scripts/build-test.mjs",
     "test": "npm run build:test && node --test test/*.test.mjs"
   },
   "dependencies": {

@@ -155,3 +155,61 @@ test('a real tree produces no diagnosis', () => {
     ]);
     assert.equal(d, null);
 });
+
+// --- echo pruning and row formats -----------------------------------------
+
+import { pruneEchoes, row, elementLine } from '../dist-test/uitree.js';
+
+test('a text child repeating its container name is dropped', () => {
+    // Chromium's shape: every button and link carries a text child with its label.
+    const nodes = toSnapshotNodes([
+        n(0, 'window', 'App'),
+        n(3, 'button', 'Save'),
+        n(5, 'text', 'Save'),
+        n(3, 'link', 'Help'),
+        n(4, 'text', 'Help')
+    ]);
+    assert.deepEqual(nodes.map(x => `${x.role}:${x.name}`), ['window:App', 'button:Save', 'link:Help']);
+});
+
+test('text that says something new is kept', () => {
+    const kept = pruneEchoes([
+        n(0, 'window', 'App'),
+        n(1, 'button', 'Save'),
+        n(2, 'text', 'Save all'),
+        n(2, 'text', 'Save', { value: 'x' }),
+        n(2, 'text', 'Save', { automation_id: 'lbl' })
+    ]);
+    assert.equal(kept.length, 5);
+});
+
+test('only text roles are pruned, and never a direct child of the window', () => {
+    // The Chromium wrapper that repeats the window title must survive, or
+    // diagnoseTree reports "no provider" instead of "frame only".
+    const kept = pruneEchoes([n(0, 'window', 'Studio'), n(1, 'text', 'Studio'), n(1, 'pane', 'Studio')]);
+    assert.equal(kept.length, 3);
+    const nested = pruneEchoes([n(0, 'window', 'W'), n(1, 'group', 'Tools'), n(2, 'group', 'Tools')]);
+    assert.equal(nested.length, 3);
+});
+
+test('pruning keys and diffs consistently across snapshots', () => {
+    const t = () => [n(0, 'window', 'App'), n(1, 'button', 'Go'), n(2, 'text', 'Go'), n(1, 'button', 'Stop')];
+    assert.equal(diffLines(toSnapshotNodes(t()), toSnapshotNodes(t())), null);
+});
+
+test('a value equal to the name is not printed twice', () => {
+    const [, node] = toSnapshotNodes([n(0, 'window', 'W'), n(1, 'text', 'Ready', { value: 'Ready' })]);
+    assert.equal(row(node, false).includes('"Ready"'), false);
+});
+
+test('element lines match describe rows, plus the rect', () => {
+    const line = elementLine({
+        ref: 'el_7',
+        name: 'Export',
+        role: 'button',
+        automation_id: 'ExportBtn',
+        enabled: false,
+        rect: { x: 100, y: 200, width: 80, height: 24 }
+    });
+    assert.equal(line, 'Export [button] disabled id=ExportBtn  80x24@100,200  el_7');
+});

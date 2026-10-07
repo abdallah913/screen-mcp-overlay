@@ -34,8 +34,8 @@ export async function describeWindowAsText(opts: DescribeOptions): Promise<strin
     });
     if (nodes.length === 0) {
         return (
-            'That window exposes no accessibility tree. This is normal for canvas UIs, games and ' +
-            'some browser page content — use capture_screen for those.'
+            'That window exposes no accessibility tree, which is normal for canvas UIs, games and some ' +
+            'web content. Use read_text to read it, or capture_screen to see it.'
         );
     }
 

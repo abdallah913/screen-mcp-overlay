@@ -13,5 +13,5 @@
     "noEmit": true,
     "types": ["node", "electron"]
   },
-  "include": ["src/**/*.ts", "scripts/**/*.mjs"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.mjs"]
 }

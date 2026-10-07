@@ -46,6 +46,7 @@ export function cleanupCaptureDir(): void {
 export async function captureWindow(opts: {
     windowRef: string;
     maxDimension: number;
+    maxPixels?: number;
     grid: boolean;
 }): Promise<CaptureRecord> {
     const id = store.nextId('cap');
@@ -56,7 +57,7 @@ export async function captureWindow(opts: {
     if (image.isEmpty()) throw new Error('the window rendered an empty image');
 
     const size = image.getSize();
-    const downscale = fitScale(size, opts.maxDimension);
+    const downscale = fitScale(size, opts.maxDimension, opts.maxPixels);
     if (downscale < 1) {
         image = image.resize({
             width: Math.max(1, Math.round(size.width * downscale)),
@@ -109,6 +110,8 @@ export interface CaptureOptions {
     region?: Rect;
     /** Longest edge of the written PNG. Caps token cost. */
     maxDimension: number;
+    /** Area cap, so a model API never has to rescale the image. */
+    maxPixels?: number;
     /** Burn a labelled coordinate grid into the image to help agents aim. */
     grid: boolean;
 }
@@ -159,7 +162,7 @@ export async function captureDisplay(opts: CaptureOptions): Promise<CaptureRecor
     }
 
     const cropped = image.getSize();
-    const downscale = fitScale(cropped, opts.maxDimension);
+    const downscale = fitScale(cropped, opts.maxDimension, opts.maxPixels);
     if (downscale < 1) {
         image = image.resize({
             width: Math.max(1, Math.round(cropped.width * downscale)),

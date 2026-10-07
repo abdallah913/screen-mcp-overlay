@@ -24,6 +24,40 @@ export function clean(s: string): string {
     return s.replace(/\s+/g, ' ').trim();
 }
 
+/** `WxH@x,y`: the one rectangle format every tool prints. */
+export function rectText(r: { x: number; y: number; width: number; height: number }): string {
+    return `${r.width}x${r.height}@${r.x},${r.y}`;
+}
+
+/**
+ * Drop text nodes that only repeat their container's name.
+ *
+ * Chromium, Electron and WinUI put a text child inside nearly every button,
+ * link, tab and list item, carrying the same label as its parent: `Save
+ * [button]` immediately followed by `Save [text]`. The child adds a row and a
+ * ref and says nothing new, and the parent is the better anchor anyway. These
+ * are exactly the toolkits whose trees are largest, so this is where rows cost
+ * most.
+ *
+ * Only `text` echoes are dropped, and never a direct child of the window:
+ * Chromium's wrapper that repeats the window title is what diagnoseTree keys
+ * on, and removing it would turn "frame only" into a misleading "no provider".
+ */
+export function pruneEchoes<T extends Pick<RawNode, 'depth' | 'name' | 'role' | 'value' | 'automation_id'>>(
+    nodes: T[]
+): T[] {
+    const stack: { depth: number; name: string }[] = [];
+    return nodes.filter(n => {
+        while (stack.length > 0 && stack[stack.length - 1]!.depth >= n.depth) stack.pop();
+        const parent = stack.length > 1 ? stack[stack.length - 1] : undefined;
+        const name = clean(n.name);
+        stack.push({ depth: n.depth, name });
+        const echo =
+            n.role === 'text' && !n.value && !n.automation_id && name !== '' && name === parent?.name;
+        return !echo;
+    });
+}
+
 /**
  * Indent by position in the retained ancestor chain, not by raw UIA depth.
  *
@@ -84,7 +118,8 @@ export function structuralKeys(
     });
 }
 
-export function toSnapshotNodes(nodes: RawNode[]): SnapshotNode[] {
+export function toSnapshotNodes(raw: RawNode[]): SnapshotNode[] {
+    const nodes = pruneEchoes(raw);
     const depths = displayDepths(nodes);
     const keys = structuralKeys(nodes);
     return nodes.map((n, i) => ({
@@ -102,14 +137,31 @@ export function toSnapshotNodes(nodes: RawNode[]): SnapshotNode[] {
 
 export function row(n: SnapshotNode, includeRects: boolean): string {
     const parts = [`${'  '.repeat(n.indent)}${n.name || '(unnamed)'} [${n.role}]`];
-    if (n.value) parts.push(` "${n.value}"`);
+    // A text control's value is often its name again.
+    if (n.value && n.value !== n.name) parts.push(` "${n.value}"`);
     if (!n.enabled) parts.push(' disabled');
     if (n.automationId) parts.push(` id=${n.automationId}`);
-    if (includeRects || n.indent === 0) {
-        parts.push(`  ${n.rect.width}x${n.rect.height} @${n.rect.x},${n.rect.y}`);
-    }
+    if (includeRects || n.indent === 0) parts.push(`  ${rectText(n.rect)}`);
     if (n.indent > 0) parts.push(`  ${n.ref}`);
     return parts.join('');
+}
+
+/**
+ * A search hit, in the same shape as a describe_window row plus its rect, so
+ * the agent reads one format whichever tool found the control.
+ */
+export function elementLine(e: {
+    ref: string;
+    name: string;
+    role: string;
+    automation_id?: string;
+    enabled: boolean;
+    rect: { x: number; y: number; width: number; height: number };
+}): string {
+    return (
+        `${clean(e.name) || '(unnamed)'} [${e.role}]${e.enabled ? '' : ' disabled'}` +
+        `${e.automation_id ? ` id=${e.automation_id}` : ''}  ${rectText(e.rect)}  ${e.ref}`
+    );
 }
 
 function state(n: SnapshotNode): string {

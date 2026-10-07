@@ -8,7 +8,7 @@
  * Run the overlay with SCREEN_OVERLAY_SHOW_IN_CAPTURE=1 to see it happen.
  */
 
-import { connectOverlay, textOf } from './lib/client.mjs';
+import { connectOverlay, parseWindows, textOf } from './lib/client.mjs';
 import { execFileSync } from 'node:child_process';
 
 const client = await connectOverlay('dev-script');
@@ -17,8 +17,7 @@ const client = await connectOverlay('dev-script');
 const windows = textOf(await client.callTool({ name: 'list_windows', arguments: {} }));
 console.log(windows.split('\n').slice(0, 10).join('\n'));
 
-const entries = [...windows.matchAll(/- ref=(\d+)[^\n]*\n\s+title: ([^\n]+)\n\s+rect: (\d+)x(\d+) at \((-?\d+), (-?\d+)\)/g)]
-    .map(m => ({ ref: m[1], title: m[2], w: +m[3], h: +m[4], x: +m[5], y: +m[6] }));
+const entries = parseWindows(windows);
 
 // A movable, non-maximised window is the honest test case.
 const target = entries.find(e => e.w < 2000 && e.h < 1200 && e.x > 0) ?? entries[0];
@@ -29,9 +28,10 @@ console.log(`\ntarget: "${target.title}" ref=${target.ref} at (${target.x}, ${ta
 console.log('\n' + textOf(await client.callTool({
     name: 'annotate',
     arguments: {
-        anchor: { kind: 'window', ref: target.ref },
+        // A box with no size fits its anchor.
+        anchor: { window: target.ref },
         shapes: [
-            { type: 'box', fit: true, pad: 6, text: 'anchored', color: '#32d74b', thickness: 4 },
+            { type: 'box', pad: 6, text: 'anchored', color: '#32d74b', thickness: 4 },
             { type: 'label', x: 20, y: 40, text: 'follows the window' }
         ]
     }
@@ -58,8 +58,8 @@ $r = New-Object W+R
 const readBack = async () => {
     // Re-listing gives the window's live rect; the annotation is pinned to it.
     const t = textOf(await client.callTool({ name: 'list_windows', arguments: {} }));
-    const m = new RegExp(`- ref=${target.ref}[^\\n]*\\n\\s+title: [^\\n]+\\n\\s+rect: (\\d+)x(\\d+) at \\((-?\\d+), (-?\\d+)\\)`).exec(t);
-    return m ? { x: +m[3], y: +m[4] } : null;
+    const w = parseWindows(t).find(e => e.ref === target.ref);
+    return w ? { x: w.x, y: w.y } : null;
 };
 
 console.log('\nbefore move :', JSON.stringify(await readBack()));

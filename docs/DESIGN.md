@@ -26,16 +26,29 @@ is the reasoning, the measurements and the things that turned out to be harder t
 state, and an anchorable ref per line:
 
 ```
-Export Dialog [window]  800x600 @420,300
-  Format [combobox] "PNG"        el_3
-  Quality [slider] "80"          el_4
-  Export [button] disabled       el_5
-  Cancel [button]                el_6
+Export Dialog [window]  800x600@420,300
+  Format [combobox] "PNG"  el_3
+  Quality [slider] "80"  el_4
+  Export [button] disabled  el_5
+  Cancel [button]  el_6
 ```
 
 Measured on a full Chrome window: **512 tokens versus 1844 for a screenshot of the same window, 3.6x
 cheaper** — and more actionable, because every line can be pointed at directly. A focused dialog does
-better than 3.6x; a browser window is close to the worst case, since most of its tree is chrome.
+better than 3.6x; a browser window is close to the worst case, since most of its tree is chrome. (Both
+sides have shrunk since: screenshots now default to ~1.5k tokens, see [Coordinates](#coordinates--the-part-that-usually-breaks),
+and trees drop echo rows, below.)
+
+Chromium, Electron and WinUI put a `text` child inside nearly every button, link and list item, carrying
+the same label as its parent: `Save [button]` followed by `Save [text]`. That child is a row and a ref
+that say nothing new, in exactly the toolkits whose trees are biggest, so it is dropped. Only `text`
+echoes go, never one with a value or an AutomationId, and never a direct child of the window (Chromium's
+title-repeating wrapper is what the diagnosis below keys on). A value equal to its own name is not
+printed twice either.
+
+Search hits from `find_ui_elements` and `wait_for_element` use the same row shape plus a rectangle —
+`Export [button] disabled id=ExportBtn  80x24@250,150  el_2` — so there is one format to read, and every
+tool prints rectangles as `WxH@x,y`.
 
 When a tree comes back thin, `describe_window` says **why**. The two failure modes need different
 fallbacks and look identical from the node list alone: no accessibility provider attached at all,
@@ -115,15 +128,55 @@ about 19 levels down, and pruning unnamed containers leaves gaps, so indenting b
 forty columns — while ranking depths globally (the first thing tried here) gives siblings different
 indents and misrepresents the structure.
 
+### Naming windows
+
+Every `window` parameter takes a ref, a title substring, or `"foreground"`. Before that, the first move
+of almost every task was `list_windows`: a whole round trip, plus a response that grows by a line per open
+window, just to learn a number to pass to the next call. Now an agent goes straight to
+`describe_window {window: "Notepad"}`.
+
+Matching is in [src/shared/windows.ts](../src/shared/windows.ts): an exact title beats a substring, and
+among several matches the foreground window wins, then the frontmost (the list arrives in z-order). It
+guesses rather than reporting "ambiguous" because the chosen window's title is in every response, so a
+wrong guess is visible and cheap to correct. No match is an error that lists the open windows, so the
+agent can correct itself without a separate `list_windows`. A numeric ref skips the window list entirely.
+
+Anchors store the resolved ref, not the title — a title like Notepad's changes the moment the document
+is edited.
+
 ### Tool surface
 
-The tool list itself is context on every turn, so it is kept terse and the prose lives here instead.
-An early trim measured via `tools/list` took it from **11,104 chars across 10 tools to 7,670 across
-9** — about 2,073 tokens — *with* `describe_window` added and `list_displays` folded into
-`list_windows`. It has since grown back to **12,049 chars across 14 tools, about 3,256 tokens**, as
-`focus_window`, `scroll_window` and `highlight_and_wait` were added. `highlight_and_wait` is pure
-composition of `annotate` and `wait_for_user_click`, so folding it back would recover roughly 450
-tokens per turn at the cost of one extra call per walkthrough step.
+The tool list is resent on every turn of every conversation, so it is kept terse and the prose lives
+here instead. Measured as the model sees it (name, description and input schema per tool, serialised):
+
+| | Tools | Characters | ~Tokens per turn |
+|---|---|---|---|
+| Early trim | 9 | 7,670 | 2,073 |
+| Before this pass | 14 | 12,673 | 3,425 |
+| Now | 13 | **10,153** | **2,744** |
+
+That is with `until`, `automationId` on waits and title matching all *added*. `npm test` pins it with a
+budget (`TOOL_LIST_BUDGET` in [test/tools.test.mjs](../test/tools.test.mjs)), so growth is a deliberate
+choice rather than drift. Where it came from:
+
+- **Schema noise.** The SDK's zod conversion puts a `$schema` URI on every tool and `±9007199254740991`
+  bounds on every unbounded integer. Neither tells the model anything; together they were ~700
+  characters a turn. [server.ts](../src/main/mcp/server.ts) strips them, and builds the list once
+  rather than re-converting every schema on every request.
+- **Descriptions versus responses.** A description is paid on every turn; a response only when the tool
+  runs. So descriptions say what a tool does and when to reach for it, and caveats that only matter in
+  the moment — an occluded window, an unscoped search, an app that ignores wheel messages — moved into
+  the responses that trigger them.
+- **Inference over parameters.** An anchor's `kind` and a shape's `fit` are inferred (a name means a
+  control, a ref means that element, otherwise a window; an anchored shape without a size fits its
+  target). Both still work if sent. `speak` became `show_message {speak: true}`, and `wait_for_element`
+  lost `pollMs`, which cost CPU, never tokens.
+- **Nested selectors go undescribed.** `name`, `automationId` and `role` are described once per tool;
+  the copies inside `until` are not.
+
+Responses were tightened the same way: `list_windows` is one line per window (`ref WxH@x,y title`)
+instead of three with the window class, and `capture_screen`, `annotate` and `find_ui_elements` dropped
+the boilerplate that repeated their own descriptions.
 
 ### Resources and prompts
 
@@ -147,11 +200,26 @@ mouse or keyboard.
 through rather than only their visible part. The pointer does not move. Re-read with
 `describe_window` afterwards: refs and rectangles change once content scrolls.
 
-`highlight_and_wait` is annotate plus wait plus clear in one call — the basic walkthrough step:
+`highlight_and_wait` is the basic walkthrough step — circle a control with the instruction, wait until
+the user has done it, clear the circle — in one call where it used to take three:
 
 ```jsonc
-{ "window": "330312", "name": "Export", "prompt": "Click Export when you are ready" }
+{
+  "window": "Paint", "name": "Export", "prompt": "Click Export",
+  "until": { "condition": "appears", "role": "window", "name": "Save as" }
+}
 ```
+
+With `until`, the overlay stays click-through: the user operates the application normally, and the call
+returns once the UI reaches that state (searched in the step's window unless `until.window` says
+otherwise; `role: "window"` alone watches for a new top-level window). Without `until`, it waits for a
+confirming click instead — and **that click is captured by the overlay, so the application never
+receives it**. The original version only had that mode, which made it a poor walkthrough step: the user
+clicked Export, nothing happened in the app, and the agent moved on to a dialog that never opened. In
+click mode the response says whether the click landed on the target, measured against the circle's live
+position.
+
+Either way it clears only its own circle, rather than everything on screen.
 
 ### Sequencing with `wait_for_element`
 
@@ -162,9 +230,14 @@ how long the app takes:
 { "condition": "appears", "name": "Export complete", "window": "330312", "timeoutMs": 120000 }
 ```
 
-Conditions are `appears`, `disappears` (a spinner finishing, a dialog closing) and `enabled`. On
-success it returns the matching control's ref, ready to anchor to. On timeout it returns `met:false`
-rather than erroring, so the agent can decide whether to escalate to a screenshot.
+Conditions are `appears`, `disappears` (a spinner finishing, a dialog closing) and `enabled`, matched by
+`name`, `role` or `automationId`. On success it returns the matching control's row, ready to anchor to.
+On timeout it returns `NOT met` rather than erroring, so the agent can decide what to do next.
+
+Searches see disabled controls. They used not to: the helper's base condition was `IsEnabled=true`, so
+a button greying out counted as `disappears` and a disabled one could never `appear`. An `enabled` wait
+on a role alone also used to stop at the first match, which could be a disabled control while an
+enabled one existed.
 
 `timeoutMs: 0` checks once and returns immediately — that is the assertion form, answering
 "is Export disabled?" in a few tokens rather than returning a tree to reason over. It is the same
@@ -186,29 +259,30 @@ Fixed coordinates go stale the moment a window moves. Pass an `anchor` and they 
 
 ```jsonc
 {
-  "anchor": { "kind": "element", "ref": "el_7" },   // from find_ui_elements
-  "shapes": [{ "type": "circle", "fit": true, "pad": 10, "text": "click here" }]
+  "anchor": { "window": "Notepad", "name": "Save" },
+  "shapes": [{ "type": "circle", "pad": 10, "text": "click here" }]
 }
 ```
 
-`fit: true` snaps the shape to the target's own rectangle. Without it, `x`/`y`/`width`/`height` are
-offsets from the target's top-left in physical pixels. Either way a background tracker re-reads the
+A rectangle shape with no size snaps to the target's own rectangle, grown by `pad`. Given a size,
+`x`/`y`/`width`/`height` are offsets from the target's top-left in physical pixels. Either way a background tracker re-reads the
 target's rectangle every 120 ms and moves the drawing with it, across monitors if need be. If the
 target closes or is minimised the annotation hides itself, and reappears if the target comes back.
 
-Three anchor kinds, increasing in robustness:
+Three anchor forms, increasing in robustness. The kind is inferred from what is given (an explicit
+`kind` is still accepted):
 
 | Anchor | Survives | Use when |
 |---|---|---|
-| `window` (ref from `list_windows`) | the window moving | pointing at a region of an app |
-| `element` (ref from `find_ui_elements`) | moving, resizing **and** relayout | pointing at a specific control |
-| `name` (`{kind:"name", window, name}` or `automationId`) | all of the above, **plus the control being recreated** | almost always |
+| `{window}` | the window moving | pointing at a region of an app |
+| `{ref}` (a ref from `describe_window` or `find_ui_elements`) | moving, resizing **and** relayout | pointing at a specific control |
+| `{window, name}` (or `automationId`, `role`) | all of the above, **plus the control being recreated** | almost always |
 
 Prefer `automationId` over `name` when the app sets one: it is the app's own handle, so it survives
 relabelling and translation where a name match does not. `describe_window` and `find_ui_elements`
 show `id=...` on rows that have one — on VS Code, 12 of 92 rows do.
 
-`kind: "name"` resolves the selector and draws in **one call**, replacing the
+A `{window, name}` anchor resolves the selector and draws in **one call**, replacing the
 find_ui_elements-read-result-then-annotate round trip. It also stores the selector, so when the ref
 stops resolving the tracker re-finds the control by name (throttled to every 2 s, since that costs a
 tree search). That is what lets an anchored drawing survive a helper restart, and it is the first
@@ -219,6 +293,13 @@ screenshot, ask for it by name and get its exact rectangle. Coverage is good for
 and surprisingly good for Electron ones (VS Code exposes ~2800 nodes), thinner for browser *page*
 content, and absent for canvas and game UIs — so reading coordinates off a screenshot remains the
 fallback, not a deprecated path.
+
+Roles are the short names of all 41 UIA control types (`button`, `slider`, `menu`, `dataitem`, …, plus
+aliases such as `textbox` and `dialog`). The helper used to name twenty, and the gaps failed silently in
+both directions: a slider came back as `[other]`, and filtering by an unlisted role dropped the filter
+and matched every control with the right name. An unknown role is now an error that lists the real ones,
+so the agent learns the vocabulary from the one call that needed it rather than from every tool
+description.
 
 ## Coordinates — the part that usually breaks
 
@@ -243,6 +324,21 @@ tagged with the `captureId`:
 shape lands in the wrong place, the bug is in that one file.
 
 Verified working on a 2560×1440 display at 1.25× scaling captured down to 1200×675.
+
+### The default capture size
+
+The contract only holds if the model sees the image at the size it was written. A model API that
+receives an image over its limit shrinks it first, and the model then reads coordinates in the shrunken
+image while `space:"image"` interprets them in ours. Claude models before the high-resolution generation
+rescale anything over **1568px on the long edge or ~1.15 megapixels**; the old default capped only the
+edge, and a 16:9 frame at 1568px wide is 1.38MP, so on those models every coordinate came back 7-9%
+short.
+
+The default now fits both limits — a 1920×1080 display captures at 1430×804 — which also cuts a
+screenshot from ~1.8k to ~1.5k tokens. High-resolution models (Opus 4.7 and later, Sonnet 5 and later)
+accept up to 2576px with 1:1 coordinates; pass `maxDimension` to use that, and the area cap no longer
+applies. A downscaled capture says so in its response, since that is the usual reason small text is
+unreadable.
 
 ---
 
@@ -284,6 +380,13 @@ It is deliberately restricted: it may use the overlay tools plus `Read`, `Glob` 
 `Bash`, `Write`, `Edit` and everything else are refused by `canUseTool` in
 [src/main/agent/claude.ts](../src/main/agent/claude.ts). The panel is for guiding you around your
 screen, not for editing your machine.
+
+The overlay half of that allow-list is `TOOL_NAMES` from [tools.ts](../src/main/mcp/tools.ts), not a
+copy. The copy it replaced had drifted: it named `list_displays`, which no longer existed, and left out
+nine tools that did, so the panel was refused `describe_window` and every other cheap way to read the
+screen — while its system prompt told it to start every task with a screenshot. The panel's prompt now
+carries only what is specific to the panel and defers to the MCP server's instructions for the rest, so
+there is one place that describes how to use the tools.
 
 ## Following a session from your editor
 
@@ -368,7 +471,8 @@ npm run dist           # installer + portable exe
 npm run dist:dir       # unpacked app only, for quick checks
 
 node scripts/smoke.mjs         # end-to-end MCP client test against a running overlay
-npm test                       # 30 unit tests: coordinate geometry + tree keys and diffing
+npm test                       # 71 tests: geometry, tree keys and diffing, window matching, and every
+                               # MCP tool end to end against a fake helper (runs on any OS)
 node scripts/anchor-check.mjs  # anchors a box to a window, moves it, checks the box follows
 node scripts/describe-check.mjs # describe_window vs screenshot cost, selector anchors
 node scripts/wait-check.mjs    # wait_for_element against a real app opening and closing
@@ -391,7 +495,7 @@ node scripts/visual-check.mjs  # draw calibration markers, then re-capture to ey
 native/
   uia-helper/  Rust: window enumeration + UI Automation queries (JSON lines over stdio)
 src/
-  shared/      types, coordinate conversion, UI-tree keys and diffing (all pure, all tested)
+  shared/      types, coordinate conversion, UI-tree keys and diffing, window matching (pure, tested)
   main/        Electron main: displays, capture, overlay windows, store, clicks
                uia.ts (helper client) + anchors.ts (the tracking loop)
     mcp/       HTTP MCP server + tool definitions
@@ -400,7 +504,14 @@ src/
   renderer/
     overlay/   canvas that draws the annotations
     hud/       chat panel
+test/
+  support/     Electron stub + harness that bundles the real MCP server for Node
 ```
+
+`npm test` runs on any OS. The tool tests drive the real server and every handler; only the helper
+process is replaced, through `useHelperTransport` in [uia.ts](../src/main/uia.ts), by canned responses.
+The Rust helper's own tests (`cargo test`) need Windows; elsewhere,
+`cargo check --tests --target x86_64-pc-windows-gnu` at least compiles them.
 
 ---
 
@@ -430,6 +541,13 @@ display refresh rate forever; it now only loops while something is actually anim
 tracker polled at a fixed 120 ms whether or not anything moved; it now backs off to 600 ms after
 eight quiet ticks and snaps straight back on any change, so drag latency stays imperceptible.
 
+The helper's element cache was the third, slower leak. Every ref it hands out keeps a COM reference to
+the element alive, which pins memory in the *target application's* accessibility provider as well as
+in the helper, and nothing was ever evicted: a describe adds up to a thousand, and a fifteen-minute
+`wait_for_element` adds a few on every poll. It is now capped at 5,000 with least-recently-used eviction.
+The anchor tracker re-reads its refs on every tick, which counts as use, so a ref with a drawing on it is
+never the one evicted.
+
 Worth naming because the obvious fix was the wrong one: UIA event subscriptions
 (`AddAutomationEventHandler`) were the planned answer, and would have meant COM apartment threading
 in the helper. Measuring first showed the helper's own CPU was **unmeasurable — 0.00s over 10
@@ -454,16 +572,15 @@ v0.1. Working and verified end to end on Windows 11. Not yet done:
 - **macOS / Linux** — the architecture is cross-platform and Electron handles most of it, but
   `WDA_EXCLUDEFROMCAPTURE` is Windows-only. macOS `setContentProtection` maps to
   `NSWindowSharingNone`; Linux has no equivalent and would need hide-then-capture.
-- **Wider test coverage** — `npm test` covers the two pure modules where the subtle bugs live:
-  `geometry.ts` (14 cases) and `uitree.ts` (16 cases — structural keys, the ancestor-rename
-  regression, diff classification, tree diagnosis). The scripts in `scripts/` are still manual, and
-  the Rust helper has no tests.
+- **Wider test coverage** — `npm test` covers the pure modules where the subtle bugs live and the whole
+  MCP tool layer against a fake helper, including a budget on the size of the tool list. The scripts
+  in `scripts/` are still manual, and the Rust helper's tests cover only its control-type table.
 - **Qt/QML coverage is unverified.** The diagnosis distinguishes "no provider" from "frame only", but
   no Qt application has actually been tested against it. Worth checking before relying on a
   tree-driven walkthrough of one, rather than discovering it mid-walkthrough.
 - **Port conflicts** — if a foreign process holds 7777 you get a panel message and nothing works.
   Falling back to an ephemeral port and rewriting the registered config would be better.
-- **Cross-run anchors** — `kind:"name"` selectors now survive a helper restart, but element refs
+- **Cross-run anchors** — `{window, name}` selectors now survive a helper restart, but element refs
   still die with the app. Stable `AutomationId`s on your own controls would make selectors exact
   rather than fuzzy name matches, and immune to localisation and label edits. Persisting a *selector*
   (window title + control name + role) and re-resolving it on a later run would let a saved

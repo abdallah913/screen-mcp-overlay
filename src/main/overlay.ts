@@ -84,6 +84,7 @@ function createOverlayWindow(display: DisplayInfo): OverlayWindow {
 function currentState(display: DisplayInfo): OverlayState {
     const req = store.getClickRequest();
     return {
+        displayId: display.id,
         // Anchored annotations whose target vanished are kept in the store but
         // must not be drawn; they come back if the window reappears.
         annotations: store.forDisplay(display.id).filter(a => !a.hidden),

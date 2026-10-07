@@ -24,6 +24,7 @@ export interface WaitRequest {
     window?: string;
     name?: string;
     role?: string;
+    automationId?: string;
     timeoutMs: number;
     pollMs: number;
 }
@@ -60,20 +61,23 @@ function satisfied(condition: WaitCondition, matches: ElementInfo[]): ElementInf
  * for; EnumWindows answers the same question in milliseconds.
  */
 async function probe(req: WaitRequest): Promise<ElementInfo[]> {
-    const wantsWindow = req.role === 'window' && !req.window;
+    const wantsWindow = req.role === 'window' && !req.window && !req.automationId;
     if (wantsWindow) {
         const needle = req.name?.toLowerCase();
         return (await listWindows())
             .filter(w => !needle || w.title.toLowerCase().includes(needle))
             .map(w => ({ ref: w.ref, name: w.title, role: 'window', rect: w.rect, enabled: true }));
     }
+    // "Any control of this role appeared" can short-circuit on the first match,
+    // which turns a whole-tree walk into an early exit. "enabled" cannot: the
+    // first match may be a disabled one while an enabled one exists.
+    const firstWillDo = req.condition === 'appears' && !req.name && !req.automationId;
     return findElements({
         window: req.window,
         name: req.name,
         role: req.role,
-        // Without a name filter the helper can short-circuit on the first match,
-        // which turns a whole-tree walk into an early exit.
-        limit: req.condition === 'disappears' || req.name ? 10 : 1
+        automationId: req.automationId,
+        limit: firstWillDo ? 1 : 10
     });
 }
 

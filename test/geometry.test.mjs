@@ -8,7 +8,9 @@ import {
     physicalToDipRect,
     physicalToImagePoint,
     clampRectToDisplay,
-    fitScale
+    fitScale,
+    rectContains,
+    DEFAULT_CAPTURE
 } from '../dist-test/geometry.js';
 
 /**
@@ -120,4 +122,30 @@ test('fitScale only shrinks, never enlarges', () => {
 
 test('fitScale measures the long edge whichever way the display is oriented', () => {
     assert.equal(fitScale({ width: 600, height: 2000 }, 1000), 0.5);
+});
+
+test('fitScale caps area as well as the long edge', () => {
+    // A 16:9 frame at 1568px wide is 1.38MP, over the 1.15MP that older Claude
+    // models accept before rescaling, so the area cap must bind first.
+    const k = fitScale({ width: 1920, height: 1080 }, DEFAULT_CAPTURE.maxDimension, DEFAULT_CAPTURE.maxPixels);
+    const w = Math.round(1920 * k);
+    const h = Math.round(1080 * k);
+    assert.ok(w * h <= DEFAULT_CAPTURE.maxPixels + 2000, `${w}x${h}`);
+    assert.ok(w < DEFAULT_CAPTURE.maxDimension);
+});
+
+test('fitScale leaves a small image alone even with an area cap', () => {
+    assert.equal(fitScale({ width: 800, height: 600 }, 1568, 1_150_000), 1);
+});
+
+test('fitScale without an area cap behaves as before', () => {
+    assert.equal(fitScale({ width: 2560, height: 1440 }, 2576), 1);
+});
+
+test('rectContains includes edges and excludes outside points', () => {
+    const r = { x: 10, y: 10, width: 20, height: 10 };
+    assert.equal(rectContains(r, { x: 10, y: 10 }), true);
+    assert.equal(rectContains(r, { x: 30, y: 20 }), true);
+    assert.equal(rectContains(r, { x: 31, y: 15 }), false);
+    assert.equal(rectContains(r, { x: 15, y: 9 }), false);
 });

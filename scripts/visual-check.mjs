@@ -6,17 +6,15 @@
  * SCREEN_OVERLAY_SHOW_IN_CAPTURE=1, otherwise it excludes itself from capture.
  */
 
-import { connectOverlay, textOf } from './lib/client.mjs';
+import { captureIdOf, captureSizeOf, connectOverlay, textOf } from './lib/client.mjs';
 
 const client = await connectOverlay('dev-script');
 
 
 // A reference capture first, so we can address the screen in image coordinates.
 const first = textOf(await client.callTool({ name: 'capture_screen', arguments: { maxDimension: 1200 } }));
-const captureId = /captureId: (\S+)/.exec(first)[1];
-const size = /Captured (\d+)x(\d+)/.exec(first);
-const W = Number(size[1]);
-const H = Number(size[2]);
+const captureId = captureIdOf(first);
+const [W, H] = captureSizeOf(first);
 console.log(`reference capture ${captureId}: ${W}x${H}`);
 
 // Shapes placed at exact fractions of the image so misplacement is obvious.

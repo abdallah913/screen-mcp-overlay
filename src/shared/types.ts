@@ -188,6 +188,12 @@ export interface HudMessage {
 }
 
 export interface OverlayState {
+    /**
+     * The display this overlay window covers. Sent explicitly because a click
+     * report must name its display, and an overlay with nothing drawn on it
+     * has no annotation to learn the id from.
+     */
+    displayId: string;
     annotations: Annotation[];
     click: ClickRequest | null;
 }

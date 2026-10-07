@@ -8,14 +8,12 @@
  * must warn that it does not.
  */
 
-import { connectOverlay, textOf } from './lib/client.mjs';
+import { connectOverlay, parseWindows, pathOf, textOf } from './lib/client.mjs';
 
 const c = await connectOverlay('occlusion-check');
 
 const wins = textOf(await c.callTool({ name: 'list_windows', arguments: {} }));
-const entries = [
-    ...wins.matchAll(/- ref=(\d+)[^\n]*\n\s+title: ([^\n]+)\n\s+rect: (\d+)x(\d+)/g)
-].map(m => ({ ref: m[1], title: m[2], w: +m[3], h: +m[4] }));
+const entries = parseWindows(wins);
 
 if (entries.length < 2) {
     console.log('need at least two windows open for this test');
@@ -43,7 +41,7 @@ const asRendered = textOf(
         arguments: { window: target.ref, asRendered: true, maxDimension: 1100 }
     })
 );
-console.log(asRendered.split('\n').filter(l => /WARNING|Captured|path:/.test(l)).join('\n'));
+console.log(asRendered.split('\n').filter(l => /WARNING|^cap_|path:/.test(l)).join('\n'));
 
 console.log('\n--- focus the target, then re-check occlusion ---');
 console.log(textOf(await c.callTool({ name: 'focus_window', arguments: { window: target.ref } })));
@@ -56,7 +54,7 @@ const after = textOf(
 );
 console.log(`warns now: ${/WARNING/.test(after)}`);
 
-console.log('\nRENDERED=' + /path: (.+)/.exec(rendered)[1].trim());
-console.log('ASRENDERED=' + /path: (.+)/.exec(asRendered)[1].trim());
+console.log('\nRENDERED=' + pathOf(rendered));
+console.log('ASRENDERED=' + pathOf(asRendered));
 
 await c.close();

@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Rect } from '../shared/types.js';
+import { isWindowRef, matchWindow } from '../shared/windows.js';
 
 /**
  * Client for the Rust UI Automation helper.
@@ -166,7 +167,20 @@ function start(): boolean {
     return true;
 }
 
+export type HelperTransport = (op: string, params: Record<string, unknown>) => Promise<unknown>;
+let transport: HelperTransport | null = null;
+
+/**
+ * Answer helper requests in-process instead of spawning the helper. Tests use
+ * this to drive every tool through the real code above the helper on machines
+ * that cannot run it.
+ */
+export function useHelperTransport(fn: HelperTransport | null): void {
+    transport = fn;
+}
+
 function send<T>(op: string, params: Record<string, unknown> = {}, timeoutMs = 8000): Promise<T> {
+    if (transport) return transport(op, params) as Promise<T>;
     if (!start()) return Promise.reject(new Error(unavailable ?? 'helper unavailable'));
     const id = nextId++;
     return new Promise<T>((resolve, reject) => {
@@ -184,6 +198,19 @@ function send<T>(op: string, params: Record<string, unknown> = {}, timeoutMs = 8
 export async function listWindows(): Promise<WindowInfo[]> {
     const all = await send<WindowInfo[]>('list_windows');
     return all.filter(w => w.pid !== process.pid && !w.minimized);
+}
+
+/**
+ * Turn whatever an agent passed as a window into a ref: a ref as-is (no helper
+ * round trip), otherwise a title substring or "foreground", resolved against
+ * the live window list. Throws with the open windows listed when nothing
+ * matches, so the agent can correct itself without a separate list_windows.
+ */
+export async function resolveWindow(query: string): Promise<string> {
+    if (isWindowRef(query)) return query.trim();
+    const found = matchWindow(query, await listWindows());
+    if (typeof found === 'string') throw new Error(found);
+    return found.ref;
 }
 
 export async function findElements(opts: {

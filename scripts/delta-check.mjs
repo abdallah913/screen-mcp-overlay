@@ -8,9 +8,8 @@
  * rather than emit a diff that is longer).
  */
 
-import { connectOverlay, textOf } from './lib/client.mjs';
+import { connectOverlay, parseWindows, textOf } from './lib/client.mjs';
 import { spawn, execFileSync } from 'node:child_process';
-import { join } from 'node:path';
 
 const c = await connectOverlay('dev-script');
 const snapOf = s => /snapshotId: (\S+)/.exec(s)?.[1];
@@ -20,13 +19,13 @@ const cost = s => Math.round(s.length / 3.7);
 spawn('notepad.exe', [], { detached: true, stdio: 'ignore' }).unref();
 await new Promise(r => setTimeout(r, 2500));
 
-const wins = textOf(await c.callTool({ name: 'list_windows', arguments: {} }));
-const m = /- ref=(\d+)[^\n]*\n\s+title: ([^\n]*Notepad[^\n]*)/.exec(wins);
-if (!m) {
+const windows = parseWindows(textOf(await c.callTool({ name: 'list_windows', arguments: {} })));
+const notepad = windows.find(w => /Notepad/.test(w.title));
+if (!notepad) {
     console.log('Notepad window not found; aborting');
     process.exit(1);
 }
-const [, ref] = m;
+const { ref } = notepad;
 
 // 1. baseline
 const first = textOf(await c.callTool({ name: 'describe_window', arguments: { window: ref, maxNodes: 80 } }));
@@ -56,8 +55,8 @@ console.log(`4. unknown baseline: ${bogus.split('\n')[0]}`);
 console.log(`   degraded to full tree: ${bogus.split('\n').length > 5}`);
 
 // 5. baseline from a different window must also degrade
-const other = /- ref=(\d+)/.exec(wins)[1];
-if (other !== ref) {
+const other = windows.find(w => w.ref !== ref)?.ref;
+if (other) {
     const cross = textOf(await c.callTool({ name: 'describe_window', arguments: { window: other, since: snapOf(changed), maxNodes: 40 } }));
     console.log(`5. cross-window   : ${cross.split('\n')[0]}`);
 }
