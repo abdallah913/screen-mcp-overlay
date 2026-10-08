@@ -5,13 +5,17 @@
 //! the one that was asked for. Returning another application's pixels under the
 //! requested window's name is the worst kind of wrong: it looks right, so an
 //! agent annotates over it confidently.
+//!
+//! The helper serves every request on one thread, so nothing here may wait on
+//! the target app without a bound: a hung window gets a clear error, never a
+//! call that blocks until it recovers.
 
 use serde::Serialize;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT, WIN32_ERROR, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
-    SRCCOPY,
+    BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    MonitorFromPoint, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
+    HGDIOBJ, MONITOR_DEFAULTTONULL, SRCCOPY,
 };
 // PrintWindow lives under Storage::Xps, and AttachThreadInput under
 // System::Threading, rather than where their use would suggest.
@@ -19,17 +23,27 @@ use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, SendMessageW, SetForegroundWindow, ShowWindow, GWL_EXSTYLE,
-    GW_HWNDPREV, SW_RESTORE, WM_MOUSEWHEEL, WS_EX_TOOLWINDOW,
+    BringWindowToTop, GetAncestor, GetClientRect, GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindow,
+    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SendMessageTimeoutW,
+    SetForegroundWindow, ShowWindow, WindowFromPoint, GA_ROOT, GA_ROOTOWNER, GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV,
+    SMTO_ABORTIFHUNG, SW_RESTORE, WM_MOUSEWHEEL, WM_NULL, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 use crate::model::{Coverage, PrintResult, Rect};
-use crate::windows::{is_cloaked, rect_of};
+use crate::windows::{class_of, is_cloaked, is_elevated, is_hung, rect_of, title_of};
 
 /// PW_RENDERFULLCONTENT: renders DirectComposition surfaces too, which is what
 /// makes this work for Chromium and other GPU-composited apps.
 const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(2);
+
+/// How long a window gets to answer a message before it counts as not
+/// responding. Long enough for a busy app, short enough that a request queued
+/// behind it in the helper does not time out too.
+const MESSAGE_TIMEOUT_MS: u32 = 1000;
+
+const NOT_RESPONDING: &str = "that window is not responding, so Windows cannot reach it until the app recovers. \
+     Wait for it, or ask the user whether it has frozen";
+const CLOSED: &str = "that window has closed";
 
 #[derive(Serialize)]
 pub struct Occlusion {
@@ -47,6 +61,16 @@ fn intersect(a: &Rect, b: &Rect) -> i64 {
     } else {
         x as i64 * y as i64
     }
+}
+
+fn pid_of(hwnd: HWND) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
+fn exists(hwnd: HWND) -> bool {
+    unsafe { IsWindow(Some(hwnd)) }.as_bool()
 }
 
 /// How much of `hwnd` is hidden behind windows above it in the Z order.
@@ -71,15 +95,13 @@ pub fn occlusion_of(hwnd: HWND, ignore_pid: u32) -> Occlusion {
         // The overlay's own windows cover the whole screen and are click-through
         // and excluded from capture, so counting them would report every window
         // as fully occluded, always.
-        let mut owner_pid = 0u32;
-        unsafe { GetWindowThreadProcessId(above, Some(&mut owner_pid)) };
-        let ours = ignore_pid != 0 && owner_pid == ignore_pid;
+        let ours = ignore_pid != 0 && pid_of(above) == ignore_pid;
         if visible && !tool && !ours && !is_cloaked(above) && !unsafe { IsIconic(above) }.as_bool() {
             if let Some(r) = rect_of(above) {
                 let overlap = intersect(&target, &r);
                 if overlap > area / 100 {
                     covered += overlap;
-                    by.push(crate::windows::title_of(above));
+                    by.push(title_of(above));
                 }
             }
         }
@@ -89,6 +111,55 @@ pub fn occlusion_of(hwnd: HWND, ignore_pid: u32) -> Occlusion {
     Occlusion { covered: (covered as f64 / area as f64).min(1.0) as f32, by }
 }
 
+// ------------------------------------------------------------- messages
+
+/// How a SendMessageTimeoutW call ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Delivery {
+    Delivered,
+    /// UIPI: the window runs at a higher integrity level than we do.
+    Blocked,
+    /// The window did not answer in time, or Windows already knew it was hung.
+    NotResponding,
+    Failed(u32),
+}
+
+/// SendMessageTimeoutW returns 0 on any failure and leaves the reason in the
+/// last error: ERROR_ACCESS_DENIED is UIPI, ERROR_TIMEOUT a window that did
+/// not answer (SMTO_ABORTIFHUNG reports a known-hung window the same way).
+fn delivery(returned: isize, last_error: u32) -> Delivery {
+    if returned != 0 {
+        Delivery::Delivered
+    } else if last_error == ERROR_ACCESS_DENIED.0 {
+        Delivery::Blocked
+    } else if last_error == ERROR_TIMEOUT.0 {
+        Delivery::NotResponding
+    } else {
+        Delivery::Failed(last_error)
+    }
+}
+
+fn send_bounded(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Delivery {
+    let mut answer = 0usize;
+    unsafe {
+        // Cleared first: a success leaves the last error alone, so a stale code
+        // from an earlier call would read as this call's failure.
+        SetLastError(WIN32_ERROR(0));
+        let returned =
+            SendMessageTimeoutW(hwnd, msg, wparam, lparam, SMTO_ABORTIFHUNG, MESSAGE_TIMEOUT_MS, Some(&mut answer));
+        delivery(returned.0, GetLastError().0)
+    }
+}
+
+/// Whether the window's thread answers at all. IsHungAppWindow only trips after
+/// 5 s of silence, so a window that froze a moment ago is caught by a WM_NULL
+/// round trip instead. A UIPI refusal says nothing about responsiveness.
+fn responds(hwnd: HWND) -> bool {
+    !is_hung(hwnd) && send_bounded(hwnd, WM_NULL, WPARAM(0), LPARAM(0)) != Delivery::NotResponding
+}
+
+// ----------------------------------------------------------------- focus
+
 /// Bring a window to the front and give it focus.
 ///
 /// Windows refuses SetForegroundWindow from a process that does not already own
@@ -96,8 +167,16 @@ pub fn occlusion_of(hwnd: HWND, ignore_pid: u32) -> Occlusion {
 /// foreground thread's input queue first is the documented way round it, and is
 /// what every window-manager utility does.
 pub fn focus(hwnd: HWND) -> Result<(), String> {
+    if !exists(hwnd) {
+        return Err(CLOSED.into());
+    }
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
         return Err("that window is not visible".into());
+    }
+    // Restoring and attaching input to a hung thread would block this helper
+    // for as long as the app stays frozen.
+    if !responds(hwnd) {
+        return Err(NOT_RESPONDING.into());
     }
     unsafe {
         if IsIconic(hwnd).as_bool() {
@@ -128,6 +207,16 @@ pub fn focus(hwnd: HWND) -> Result<(), String> {
         }
 
         if !ok && GetForegroundWindow() != hwnd {
+            // UIPI also stops the input-queue attach that makes the change
+            // possible, so for an elevated window that is the real reason.
+            if is_elevated(target_pid) {
+                return Err(
+                    "Windows refused the focus change: that window runs as administrator (elevated or \
+                     protected), so Windows blocks this app from bringing it forward. Ask the user to click \
+                     the window instead."
+                        .into(),
+                );
+            }
             return Err(
                 "Windows refused the focus change. This happens when the foreground application \
                  is locking focus, or during a drag. Ask the user to click the window instead."
@@ -138,46 +227,48 @@ pub fn focus(hwnd: HWND) -> Result<(), String> {
     Ok(())
 }
 
-/// Capture a window's own pixels, even when something is covering it.
-///
-/// PrintWindow asks the window to render itself into a bitmap, so the result is
-/// the window's content rather than whatever happens to be on screen at those
-/// coordinates.
-pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
-    let rect = rect_of(hwnd).ok_or("could not measure that window")?;
-    // PrintWindow works in window coordinates, which include the frame that the
-    // DWM extended bounds trims, so use the raw window rect for the bitmap size.
-    let mut raw = RECT::default();
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut raw)
-            .map_err(|e| e.to_string())?
-    };
-    let width = (raw.right - raw.left).max(1);
-    let height = (raw.bottom - raw.top).max(1);
-    let _ = rect;
+// --------------------------------------------------------------- capture
 
-    unsafe {
-        let screen_dc: HDC = GetDC(None);
-        if screen_dc.is_invalid() {
-            return Err("could not obtain a device context".into());
+/// A memory bitmap selected into a DC, released on every exit path.
+struct Canvas {
+    screen: HDC,
+    mem: HDC,
+    bitmap: HBITMAP,
+    old: HGDIOBJ,
+    width: i32,
+    height: i32,
+}
+
+impl Canvas {
+    fn new(width: i32, height: i32) -> Result<Canvas, String> {
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return Err("could not obtain a device context".into());
+            }
+            let mem = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            let old = SelectObject(mem, bitmap.into());
+            Ok(Canvas { screen, mem, bitmap, old, width, height })
         }
-        let mem_dc = CreateCompatibleDC(Some(screen_dc));
-        let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
-        let old = SelectObject(mem_dc, bitmap.into());
+    }
 
-        let printed = PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT).as_bool();
-        if !printed {
-            // Some windows refuse PrintWindow; fall back to copying the screen,
-            // which is what the old behaviour did all the time.
-            let _ = BitBlt(mem_dc, 0, 0, width, height, Some(screen_dc), raw.left, raw.top, SRCCOPY);
+    /// Copy what is on screen at `origin`: whatever is rendered there, which is
+    /// the target window only when nothing covers it.
+    fn copy_screen(&self, origin: (i32, i32)) {
+        unsafe {
+            let _ = BitBlt(self.mem, 0, 0, self.width, self.height, Some(self.screen), origin.0, origin.1, SRCCOPY);
         }
+    }
 
+    /// The bitmap as top-down BGRA rows.
+    fn pixels(&self) -> Result<Vec<u8>, String> {
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
+                biWidth: self.width,
                 // Negative height gives a top-down image, matching PNG order.
-                biHeight: -height,
+                biHeight: -self.height,
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB.0,
@@ -185,56 +276,179 @@ pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
             },
             ..Default::default()
         };
-
-        let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
-        let copied = GetDIBits(
-            mem_dc,
-            bitmap,
-            0,
-            height as u32,
-            Some(buf.as_mut_ptr() as *mut _),
-            &mut info,
-            DIB_RGB_COLORS,
-        );
-
-        SelectObject(mem_dc, old);
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteDC(mem_dc);
-        ReleaseDC(None, screen_dc);
-
+        let mut buf = vec![0u8; (self.width as usize) * (self.height as usize) * 4];
+        // GetDIBits wants the bitmap deselected, so swap the original back in
+        // for the read and reselect ours afterwards for a possible second pass.
+        let copied = unsafe {
+            SelectObject(self.mem, self.old);
+            let n = GetDIBits(
+                self.mem,
+                self.bitmap,
+                0,
+                self.height as u32,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            SelectObject(self.mem, self.bitmap.into());
+            n
+        };
         if copied == 0 {
             return Err("could not read the window bitmap".into());
         }
+        Ok(buf)
+    }
+}
 
-        // GDI hands back BGRA with an unreliable alpha channel; PNG wants RGBA
-        // and the window is opaque, so swap the channels and force alpha.
-        for px in buf.chunks_exact_mut(4) {
-            px.swap(0, 2);
-            px[3] = 255;
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.mem, self.old);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.mem);
+            ReleaseDC(None, self.screen);
         }
+    }
+}
 
-        let file = std::fs::File::create(path).map_err(|e| format!("could not write {path}: {e}"))?;
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        writer.write_image_data(&buf).map_err(|e| e.to_string())?;
-        writer.finish().map_err(|e| e.to_string())?;
+/// Channel tolerance for "the same colour": GPU surfaces that PrintWindow
+/// cannot read come back exactly black, but dithering and colour management
+/// can move an otherwise flat fill by a step or two.
+const UNIFORM_TOLERANCE: u8 = 4;
 
-        // The caller needs the origin as well as the size: PrintWindow works on
-        // the raw window rect, which includes the invisible resize border that
-        // the DWM extended bounds trims, so image coordinates are relative to
-        // this rectangle rather than to the one list_windows reports.
-        Ok(PrintResult { rect: Rect { x: raw.left, y: raw.top, width, height }, fallback: !printed })
+/// Whether every pixel of `region` (x, y, width, height in image pixels) in a
+/// BGRA image is the same colour, give or take the tolerance. That is what a
+/// DirectX or GPU surface looks like when PrintWindow could not read it: the
+/// frame may render, but the content is one flat colour, usually black. Alpha
+/// is ignored because GDI leaves it unreliable. An empty region checks the
+/// whole image.
+fn looks_blank(bgra: &[u8], width: usize, height: usize, region: (usize, usize, usize, usize)) -> bool {
+    let (mut rx, mut ry, mut rw, mut rh) = region;
+    if rw == 0 || rh == 0 || rx >= width || ry >= height {
+        (rx, ry, rw, rh) = (0, 0, width, height);
+    }
+    let rw = rw.min(width - rx);
+    let rh = rh.min(height - ry);
+    if rw == 0 || rh == 0 || bgra.len() < width * height * 4 {
+        return false;
+    }
+    let first = &bgra[(ry * width + rx) * 4..(ry * width + rx) * 4 + 3];
+    (ry..ry + rh).all(|y| {
+        let row = &bgra[(y * width + rx) * 4..(y * width + rx + rw) * 4];
+        row.chunks_exact(4)
+            .all(|px| px[..3].iter().zip(first).all(|(a, b)| a.abs_diff(*b) <= UNIFORM_TOLERANCE))
+    })
+}
+
+/// The client area's position inside the raw window rectangle, in image pixels.
+/// The frame and title bar usually render even when the content does not, so
+/// the blank check looks at the content alone.
+fn client_region(hwnd: HWND, raw: &RECT) -> (usize, usize, usize, usize) {
+    let mut client = RECT::default();
+    let mut origin = POINT::default();
+    unsafe {
+        if GetClientRect(hwnd, &mut client).is_err() || !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return (0, 0, 0, 0);
+        }
+    }
+    let x = (origin.x - raw.left).max(0) as usize;
+    let y = (origin.y - raw.top).max(0) as usize;
+    (x, y, client.right.max(0) as usize, client.bottom.max(0) as usize)
+}
+
+/// Capture a window's own pixels, even when something is covering it.
+///
+/// PrintWindow asks the window to render itself into a bitmap, so the result is
+/// the window's content rather than whatever happens to be on screen at those
+/// coordinates. When it cannot (the window refuses, is hung, or hands back a
+/// blank GPU surface) the screen is copied instead and `fallback` says so,
+/// because then anything covering the window is in the image.
+pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
+    if !exists(hwnd) {
+        return Err(CLOSED.into());
+    }
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return Err("that window is minimised, so it has nothing on screen to capture; focus_window restores it".into());
+    }
+    // PrintWindow works in window coordinates, which include the frame that the
+    // DWM extended bounds trims, so use the raw window rect for the bitmap size.
+    let mut raw = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut raw) }.map_err(|e| e.to_string())?;
+    let width = (raw.right - raw.left).max(1);
+    let height = (raw.bottom - raw.top).max(1);
+
+    let canvas = Canvas::new(width, height)?;
+    // PrintWindow is a message round trip to the window's thread: on a hung
+    // window it would block this helper, and every request behind it.
+    let mut printed = responds(hwnd) && unsafe { PrintWindow(hwnd, canvas.mem, PW_RENDERFULLCONTENT) }.as_bool();
+    let mut buf = canvas.pixels()?;
+    if printed && looks_blank(&buf, width as usize, height as usize, client_region(hwnd, &raw)) {
+        printed = false;
+    }
+    if !printed {
+        // On another virtual desktop the screen holds some other window
+        // entirely, which is exactly the wrong-pixels case this op exists to
+        // prevent.
+        if is_cloaked(hwnd) {
+            return Err("that window is on another virtual desktop and would not render itself, so there is \
+                        nothing of it on this screen to capture; focus_window brings it here"
+                .into());
+        }
+        canvas.copy_screen((raw.left, raw.top));
+        buf = canvas.pixels()?;
+    }
+    drop(canvas);
+
+    // GDI hands back BGRA with an unreliable alpha channel; PNG wants RGBA
+    // and the window is opaque, so swap the channels and force alpha.
+    for px in buf.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 255;
+    }
+
+    let file = std::fs::File::create(path).map_err(|e| format!("could not write {path}: {e}"))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(&buf).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+
+    // The caller needs the origin as well as the size: PrintWindow works on
+    // the raw window rect, which includes the invisible resize border that
+    // the DWM extended bounds trims, so image coordinates are relative to
+    // this rectangle rather than to the one list_windows reports.
+    Ok(PrintResult { rect: Rect { x: raw.left, y: raw.top, width, height }, fallback: !printed })
+}
+
+// ---------------------------------------------------------------- scroll
+
+/// What a failed scroll tells the agent. A silent success here would send it
+/// off to re-describe a view that never moved.
+fn scroll_outcome(d: Delivery) -> Result<(), String> {
+    match d {
+        Delivery::Delivered => Ok(()),
+        Delivery::Blocked => Err("that window runs as administrator, so Windows blocks messages to it from this app \
+             and it did not scroll. Ask the user to scroll it."
+            .into()),
+        Delivery::NotResponding => Err(format!("{NOT_RESPONDING}. It did not scroll.")),
+        Delivery::Failed(code) => Err(format!("Windows did not deliver the scroll (error {code}).")),
     }
 }
 
 /// Scroll a window by sending it wheel notches, as a user's wheel would.
 ///
-/// Wheel messages go to the window under the cursor in normal use; posting
+/// Wheel messages go to the window under the cursor in normal use; sending
 /// directly to the target avoids moving the pointer, which would be input
-/// control rather than a view change.
+/// control rather than a view change. The send is bounded, so a hung window
+/// costs at most a second instead of wedging the helper.
 pub fn scroll(hwnd: HWND, notches: i32) -> Result<(), String> {
+    if !exists(hwnd) {
+        return Err(CLOSED.into());
+    }
+    if is_hung(hwnd) {
+        return scroll_outcome(Delivery::NotResponding);
+    }
     let rect = rect_of(hwnd).ok_or("could not measure that window")?;
     // lParam carries screen coordinates of the pointer for the message.
     let x = rect.x + rect.width / 2;
@@ -242,16 +456,281 @@ pub fn scroll(hwnd: HWND, notches: i32) -> Result<(), String> {
     let lparam = LPARAM(((y as isize) << 16) | (x as isize & 0xffff));
     let delta = notches * 120; // WHEEL_DELTA
     let wparam = WPARAM(((delta as isize) << 16) as usize);
+    scroll_outcome(send_bounded(hwnd, WM_MOUSEWHEEL, wparam, lparam))
+}
 
-    unsafe {
-        SendMessageW(hwnd, WM_MOUSEWHEEL, Some(wparam), Some(lparam));
+// --------------------------------------------------------------- covered
+
+/// Sample grid per side: 25 points find any window covering a meaningful part
+/// of a control, at a cost of microseconds and no COM.
+const GRID: i64 = 5;
+
+/// The grid's points, row by row, at the centres of equal cells so the middle
+/// point is the rect's centre.
+fn grid_points(r: &Rect) -> Vec<(i32, i32)> {
+    let (x, y, w, h) = (r.x as i64, r.y as i64, r.width as i64, r.height as i64);
+    (0..GRID)
+        .flat_map(|row| {
+            (0..GRID).map(move |col| ((x + (2 * col + 1) * w / (2 * GRID)) as i32, (y + (2 * row + 1) * h / (2 * GRID)) as i32))
+        })
+        .collect()
+}
+
+/// Index of the rect's centre in `grid_points`.
+const CENTRE: usize = (GRID * GRID / 2) as usize;
+
+/// What one sample point landed on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sample {
+    /// Off every display, or bare desktop: nothing covers it, but the target
+    /// is not there either, so the point says nothing about covering.
+    Nowhere,
+    Target,
+    /// Another top-level window, by handle.
+    Other(isize),
+}
+
+/// The share of meaningful points that land on another window, whether the
+/// centre does, and the covering windows with the most points first (ties in
+/// the order first met).
+fn tally(samples: &[Sample]) -> (f32, bool, Vec<isize>) {
+    let mut seen = 0usize;
+    let mut covered = 0usize;
+    let mut by: Vec<(isize, usize)> = Vec::new();
+    for s in samples {
+        match *s {
+            Sample::Nowhere => {}
+            Sample::Target => seen += 1,
+            Sample::Other(h) => {
+                seen += 1;
+                covered += 1;
+                match by.iter_mut().find(|(k, _)| *k == h) {
+                    Some((_, n)) => *n += 1,
+                    None => by.push((h, 1)),
+                }
+            }
+        }
     }
-    Ok(())
+    // A stable sort keeps first-met order among equals.
+    by.sort_by(|a, b| b.1.cmp(&a.1));
+    let fraction = if seen == 0 { 0.0 } else { covered as f32 / seen as f32 };
+    let centre = matches!(samples.get(CENTRE), Some(Sample::Other(_)));
+    (fraction, centre, by.into_iter().map(|(h, _)| h).collect())
+}
+
+fn is_desktop(root: HWND) -> bool {
+    let shell = unsafe { root == GetShellWindow() || root == GetDesktopWindow() };
+    shell || class_of(root) == "WorkerW"
+}
+
+fn contains(r: &Rect, x: i32, y: i32) -> bool {
+    x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height
+}
+
+/// Whether a window can hide what is beneath it from the user's eyes.
+fn can_cover(hwnd: HWND, ignore_pid: u32) -> bool {
+    let shown = unsafe {
+        IsWindowVisible(hwnd).as_bool()
+            && !IsIconic(hwnd).as_bool()
+            // Click-through windows (our overlay, other apps' HUDs) are not
+            // hit-tested, matching what WindowFromPoint skips.
+            && GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 == 0
+    };
+    shown && !is_cloaked(hwnd) && !(ignore_pid != 0 && pid_of(hwnd) == ignore_pid)
+}
+
+/// The top-level window that owns what is drawn at a point, never one of ours.
+///
+/// WindowFromPoint already skips click-through windows, which is what our
+/// overlay is outside click mode. When it still lands on one of our windows
+/// (the overlay in click mode, the chat panel), the Z order below that window
+/// is walked for the first one that contains the point.
+pub fn root_at(x: i32, y: i32, ignore_pid: u32) -> Option<HWND> {
+    let pt = POINT { x, y };
+    unsafe {
+        if MonitorFromPoint(pt, MONITOR_DEFAULTTONULL).is_invalid() {
+            return None;
+        }
+        let hit = WindowFromPoint(pt);
+        if hit.is_invalid() {
+            return None;
+        }
+        let root = GetAncestor(hit, GA_ROOT);
+        let mut root = if root.is_invalid() { hit } else { root };
+        if !(ignore_pid != 0 && pid_of(root) == ignore_pid) {
+            return Some(root);
+        }
+        loop {
+            root = GetWindow(root, GW_HWNDNEXT).ok().filter(|h| !h.is_invalid())?;
+            if can_cover(root, ignore_pid) && rect_of(root).is_some_and(|r| contains(&r, x, y)) {
+                return Some(root);
+            }
+        }
+    }
+}
+
+/// A name the user would recognise for a covering window. Menus and dropdowns
+/// have no title of their own, so they take their owner's ("a popup of Paint"
+/// reads better than a class name).
+fn covering_name(hwnd: HWND) -> String {
+    let title = title_of(hwnd);
+    if !title.trim().is_empty() {
+        return title;
+    }
+    let owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+    if !owner.is_invalid() && owner != hwnd {
+        let owner_title = title_of(owner);
+        if !owner_title.trim().is_empty() {
+            return format!("a popup of {owner_title}");
+        }
+    }
+    class_of(hwnd)
 }
 
 /// How much of `rect` (virtual-screen physical; the whole window when None) is
 /// hidden behind other top-level windows, measured at the points the user would
-/// look at rather than by summing rectangles.
-pub fn covered(_hwnd: HWND, _rect: Option<Rect>, _ignore_pid: u32) -> Result<Coverage, String> {
-    Err("covered is not implemented yet".into())
+/// look at rather than by summing rectangles. Our own windows never count.
+pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32) -> Result<Coverage, String> {
+    if !exists(hwnd) {
+        return Err(CLOSED.into());
+    }
+    let target = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let target = if target.is_invalid() { hwnd } else { target };
+    if unsafe { IsIconic(target) }.as_bool() {
+        return Err("that window is minimised, so nothing of it is on screen".into());
+    }
+    if is_cloaked(target) {
+        return Err("that window is on another virtual desktop, so nothing of it is on this screen".into());
+    }
+    let area = match rect {
+        Some(r) => r,
+        None => rect_of(target).ok_or("could not measure that window")?,
+    };
+    if area.width <= 0 || area.height <= 0 {
+        return Err("that area is empty".into());
+    }
+
+    let samples: Vec<Sample> = grid_points(&area)
+        .into_iter()
+        .map(|(x, y)| match root_at(x, y, ignore_pid) {
+            None => Sample::Nowhere,
+            Some(root) if root == target => Sample::Target,
+            Some(root) if is_desktop(root) => Sample::Nowhere,
+            Some(root) => Sample::Other(root.0 as isize),
+        })
+        .collect();
+
+    let (fraction, centre_covered, by) = tally(&samples);
+    let mut names: Vec<String> = Vec::new();
+    for h in by {
+        let name = covering_name(HWND(h as *mut std::ffi::c_void));
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(Coverage { fraction, centre_covered, by: names })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_reads_the_last_error() {
+        assert_eq!(delivery(1, 0), Delivery::Delivered);
+        // A success with a stale error code is still a success.
+        assert_eq!(delivery(1, ERROR_ACCESS_DENIED.0), Delivery::Delivered);
+        assert_eq!(delivery(0, ERROR_ACCESS_DENIED.0), Delivery::Blocked);
+        assert_eq!(delivery(0, ERROR_TIMEOUT.0), Delivery::NotResponding);
+        assert_eq!(delivery(0, 1400), Delivery::Failed(1400));
+    }
+
+    #[test]
+    fn a_failed_scroll_is_never_a_success() {
+        assert!(scroll_outcome(Delivery::Delivered).is_ok());
+        assert!(scroll_outcome(Delivery::Blocked).unwrap_err().contains("runs as administrator"));
+        assert!(scroll_outcome(Delivery::NotResponding).unwrap_err().contains("not responding"));
+        assert!(scroll_outcome(Delivery::Failed(5)).is_err());
+    }
+
+    fn image(width: usize, height: usize, fill: [u8; 4]) -> Vec<u8> {
+        fill.iter().copied().cycle().take(width * height * 4).collect()
+    }
+
+    fn paint(buf: &mut [u8], width: usize, x: usize, y: usize, colour: [u8; 4]) {
+        buf[(y * width + x) * 4..(y * width + x) * 4 + 4].copy_from_slice(&colour);
+    }
+
+    #[test]
+    fn a_flat_black_surface_is_blank() {
+        let buf = image(8, 6, [0, 0, 0, 0]);
+        assert!(looks_blank(&buf, 8, 6, (0, 0, 0, 0)));
+        // Alpha is ignored, and a step of dithering is still flat.
+        let mut buf = image(8, 6, [10, 10, 10, 0]);
+        paint(&mut buf, 8, 3, 3, [12, 9, 13, 255]);
+        assert!(looks_blank(&buf, 8, 6, (0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn any_real_content_is_not_blank() {
+        let mut buf = image(8, 6, [0, 0, 0, 255]);
+        paint(&mut buf, 8, 7, 5, [200, 200, 200, 255]);
+        assert!(!looks_blank(&buf, 8, 6, (0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn a_rendered_frame_around_blank_content_is_blank() {
+        // Title bar row drawn, client area (rows 1..6) black.
+        let mut buf = image(8, 6, [0, 0, 0, 255]);
+        for x in 0..8 {
+            paint(&mut buf, 8, x, 0, [240, 240, 240, 255]);
+        }
+        assert!(!looks_blank(&buf, 8, 6, (0, 0, 0, 0)));
+        assert!(looks_blank(&buf, 8, 6, (0, 1, 8, 5)));
+        // A client rect running past the image is clipped, not trusted.
+        assert!(looks_blank(&buf, 8, 6, (0, 1, 50, 50)));
+    }
+
+    #[test]
+    fn grid_centre_is_the_rect_centre() {
+        let r = Rect { x: -100, y: 40, width: 200, height: 100 };
+        let pts = grid_points(&r);
+        assert_eq!(pts.len(), 25);
+        assert_eq!(pts[CENTRE], (0, 90));
+        assert_eq!(pts[0], (-80, 50));
+        assert_eq!(pts[24], (80, 130));
+        assert!(pts.iter().all(|&(x, y)| contains(&r, x, y)));
+    }
+
+    #[test]
+    fn tally_counts_only_points_that_say_something() {
+        let mut s = vec![Sample::Target; 25];
+        assert_eq!(tally(&s), (0.0, false, vec![]));
+
+        // Off-display points are left out of the share, not counted as clear.
+        for p in s.iter_mut().take(10) {
+            *p = Sample::Nowhere;
+        }
+        s[CENTRE] = Sample::Other(7);
+        let (fraction, centre, by) = tally(&s);
+        assert!((fraction - 1.0 / 15.0).abs() < 1e-6);
+        assert!(centre);
+        assert_eq!(by, vec![7]);
+
+        assert_eq!(tally(&[Sample::Nowhere; 25]), (0.0, false, vec![]));
+    }
+
+    #[test]
+    fn tally_names_the_biggest_cover_first() {
+        let mut s = vec![Sample::Target; 25];
+        s[0] = Sample::Other(1);
+        s[1] = Sample::Other(2);
+        s[2] = Sample::Other(2);
+        s[3] = Sample::Other(3);
+        let (fraction, centre, by) = tally(&s);
+        assert!((fraction - 4.0 / 25.0).abs() < 1e-6);
+        assert!(!centre);
+        // 2 covers most; 1 and 3 tie and keep the order they were met.
+        assert_eq!(by, vec![2, 1, 3]);
+    }
 }
