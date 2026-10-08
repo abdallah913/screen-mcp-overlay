@@ -74,7 +74,7 @@ export function registerDraw(server: McpServer): void {
                     const target = await resolveAnchor(args.anchor);
                     const created = placeAnchored(target, args.shapes, { replace: args.replace, ttlMs: args.ttlMs });
                     return text(
-                        `Drew ${ids(created)}${stepRange(created)} on ${target.what}; they follow it.${ttl}` +
+                        `Drew ${ids(created)}${stepRange(created)} on ${target.label}; they follow it.${ttl}` +
                             anchorNotes(target) +
                             hiddenNote()
                     );

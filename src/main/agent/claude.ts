@@ -3,6 +3,7 @@ import type { AgentEvent, AgentProvider, SendInput } from './types.js';
 import { mcpUrl } from '../mcp/server.js';
 import { TOOL_NAMES } from '../mcp/tools/index.js';
 import { loadSdk, sdkUnavailable, type SdkModule } from './sdk.js';
+import { summarise } from './summary.js';
 
 /**
  * The built-in provider: Claude, via the Claude Agent SDK.
@@ -35,10 +36,7 @@ const ALLOWED_BUILTINS = ['Read', 'Glob', 'Grep'];
  * MCP server's own instructions, so repeating it here would cost tokens and,
  * as an earlier version of this prompt showed, drift out of step with them.
  */
-const SYSTEM_APPEND = `You are the chat panel of a screen overlay on the user's desktop. You see their screen and draw on it with the ${SERVER_NAME} tools; follow that server's instructions for how.
-- Show rather than tell: a circle anchored to the right control beats a paragraph describing where it is.
-- Keep the screen uncluttered: a couple of shapes at a time, cleared when the user moves on.
-- Keep replies short. The user is looking at their screen, not at this panel.`;
+const SYSTEM_APPEND = `You are the chat panel of a screen overlay on the user's desktop. You see their screen and draw on it with the ${SERVER_NAME} tools; follow that server's instructions for how. Show rather than tell: a circle anchored to the right control beats a paragraph describing where it is.`;
 
 // The Agent SDK is ESM-only and this file compiles to CJS, so the type-only
 // import needs an explicit resolution mode.
@@ -188,41 +186,5 @@ export class ClaudeProvider implements AgentProvider {
             handle.close();
         }
         this.active = null;
-    }
-}
-
-/** A one-line, human-readable version of a tool call for the transcript. */
-function summarise(name: string, input: unknown): string {
-    const short = name.replace(/^mcp__[^_]+__/, '');
-    const args = (input ?? {}) as Record<string, unknown>;
-
-    switch (short) {
-        case 'list_windows':
-            return 'listing your windows';
-        case 'describe_window':
-        case 'find_ui_elements':
-            return `reading ${args.window ? String(args.window) : 'the screen'}`;
-        case 'read_text':
-            return 'reading text off the screen';
-        case 'capture_screen':
-            return `looking at ${args.window ? String(args.window) : args.display ? `display ${String(args.display)}` : 'the screen'}`;
-        case 'annotate': {
-            const shapes = Array.isArray(args.shapes) ? args.shapes : [];
-            const kinds = shapes.map(s => String((s as { type?: unknown }).type ?? '?'));
-            return `drawing ${kinds.length} shape(s): ${kinds.join(', ')}`;
-        }
-        case 'clear_annotations':
-            return 'clearing the screen';
-        case 'wait_for_user_click':
-        case 'highlight_and_wait':
-            return `asking you: ${String(args.prompt ?? '')}`;
-        case 'wait_for_element':
-            return `waiting for ${String(args.name ?? args.automationId ?? args.role ?? 'the UI')}`;
-        case 'show_message':
-            return 'posting a message';
-        case 'Read':
-            return `reading ${String(args.file_path ?? '')}`;
-        default:
-            return short;
     }
 }

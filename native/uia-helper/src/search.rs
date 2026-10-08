@@ -207,6 +207,19 @@ fn parse_window(w: &str) -> Result<isize, String> {
     w.parse().map_err(|_| format!("bad window ref '{w}'"))
 }
 
+/// A window ref to read controls from. A hung window answers UI Automation
+/// only after the transaction timeout, every call, so it is refused up front
+/// with the real reason instead of failing slowly with a misleading one.
+fn readable_window(w: &str) -> Result<isize, String> {
+    let raw = parse_window(w)?;
+    if crate::windows::is_hung(hwnd_of(raw)) {
+        return Err(format!(
+            "window {w} is not responding, so its controls cannot be read until it recovers"
+        ));
+    }
+    Ok(raw)
+}
+
 /// Ok(None) when a navigation or search found nothing, Err when the call
 /// itself failed. UIA reports "no such element" as a null result, which
 /// windows-rs turns into an error with an S_OK code.
@@ -337,7 +350,7 @@ impl Session {
             let root = self.auto.get_root_element().map_err(|e| e.to_string())?;
             return Ok(vec![Scope { root, top: 0, rect: None, popup: false }]);
         };
-        let raw = parse_window(w)?;
+        let raw = readable_window(w)?;
         let main = self
             .auto
             .element_from_handle(Handle::from(raw))
@@ -742,7 +755,7 @@ impl Session {
     }
 
     pub fn describe(&mut self, window_ref: &str, max_nodes: usize, max_depth: usize) -> Result<Described, String> {
-        let raw = parse_window(window_ref)?;
+        let raw = readable_window(window_ref)?;
         let req = props::request_for(&self.auto, props::DESCRIBE);
         let (root, cached) = self
             .element_for(raw, req.as_ref())

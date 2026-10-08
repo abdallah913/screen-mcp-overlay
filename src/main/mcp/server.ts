@@ -35,14 +35,20 @@ let activeRequests = 0;
  */
 const INSTRUCTIONS =
     "See the user's screen and draw guidance on it; drawings are click-through. Any window parameter takes " +
-    'a ref, a title substring or "foreground", so list_windows is rarely needed.\n' +
-    'Read cheapest first: describe_window (text tree, anchorable refs; pass since= to re-check) > read_text ' +
-    '(OCR, when the tree is empty) > capture_screen (an image, only for visual questions).\n' +
-    'Point by anchoring annotate to the control, e.g. anchor {window:"Notepad", name:"Save"}: anchored drawings ' +
-    'follow it, fixed coordinates go stale when a window moves.\n' +
-    'Walkthroughs: one highlight_and_wait per step, with until set to the state that proves the step is done. ' +
-    'wait_for_element sequences anything else; timeoutMs:0 asserts state. wait_for_user_click when you cannot ' +
-    'tell what the user means.';
+    'a ref, a title substring or "foreground".\n' +
+    'Read cheapest first: describe_window (text tree; since= for changes) > read_text (OCR, when the tree is ' +
+    'empty) > capture_screen (only to see visuals).\n' +
+    'Point by anchoring to the control, e.g. annotate anchor {window:"Notepad", name:"Save"}: drawings follow ' +
+    'it. A miss lists the closest names.\n' +
+    'Walkthroughs: for more than one step, say how many first. Then one highlight_and_wait per step (then: for ' +
+    'a known path): prompt = one action in the app\'s own words, prefixed n/N ("2/5 Click Export"); until = a ' +
+    'state only the user\'s action makes true, like the dialog it opens. Read its After block instead of ' +
+    're-describing.\n' +
+    'Results lead with a status word. Met: go on. NOT met / NOT started: re-read and rephrase, never repeat ' +
+    'as is. STUCK: show them where. DONE, SKIPPED, REPLIED (their words): act on it. CANCELLED, NO RESPONSE: ' +
+    'ask before drawing again.\n' +
+    'The user is watching the app, not your chat: keep chat to a line, and clear drawings when done. ' +
+    'wait_for_user_click when you cannot tell what they mean; show_message options for a quick question.';
 
 export function buildServer(): McpServer {
     const server = new McpServer({ name: 'screen-mcp-overlay', version: '0.1.0' }, { instructions: INSTRUCTIONS });
@@ -146,11 +152,13 @@ function registerPrompts(server: McpServer): void {
                         type: 'text',
                         text:
                             `Guide me through: ${task}\n\n` +
-                            'Work one step at a time. Find each control with describe_window (not a screenshot ' +
-                            'unless you need to see something visual), then make the step a single ' +
-                            'highlight_and_wait: the control as the target, one sentence as the prompt, and until ' +
-                            'set to what proves I have done it, such as the dialog that should open. Move on only ' +
-                            'when it is met.'
+                            'Look first with describe_window, not a screenshot unless something visual matters, ' +
+                            'and tell me in one line how many steps it will take. Then give one highlight_and_wait ' +
+                            'per step: the control as the target, one action using its exact on-screen label as ' +
+                            'the prompt, prefixed "n/N ", and until set to what proves I did it, never something ' +
+                            'already true. Move on only when it is Met; otherwise look again and say it ' +
+                            'differently. If I am STUCK, show me where it is. At the end, say what changed and ' +
+                            'clear the screen.'
                     }
                 }
             ]

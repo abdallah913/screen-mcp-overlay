@@ -14,9 +14,18 @@ const { stripSchemaNoise, TOOL_NAMES, store } = harness;
 /**
  * Model-visible size of the tool list (name + description + input schema per
  * tool), which is resent on every turn of every conversation. Raise it only
- * deliberately: it was 12,673 characters before the tool surface was tightened.
+ * deliberately, and record why in docs/DESIGN.md: it was 12,673 characters
+ * before the tool surface was tightened, 10,153 after, and 10,863 once
+ * walkthrough plans, value and change waits, multiple-choice questions and
+ * scrolling to a named control were added.
  */
-const TOOL_LIST_BUDGET = 10_500;
+const TOOL_LIST_BUDGET = 11_000;
+
+/**
+ * The server instructions, sent once per connection and usually placed in the
+ * system prompt. They carry the strategy no single tool description can.
+ */
+const INSTRUCTIONS_BUDGET = 1_400;
 
 test.beforeEach(() => store.clear());
 
@@ -38,6 +47,13 @@ test(`the tool list stays within its ${TOOL_LIST_BUDGET}-character budget`, asyn
         0
     );
     assert.ok(size <= TOOL_LIST_BUDGET, `tool list is ${size} chars`);
+});
+
+test(`the server instructions stay within ${INSTRUCTIONS_BUDGET} characters`, async () => {
+    const client = await connect();
+    const size = client.getInstructions().length;
+    await client.close();
+    assert.ok(size <= INSTRUCTIONS_BUDGET, `instructions are ${size} chars`);
 });
 
 test('the tool list carries no schema noise', async () => {
@@ -115,7 +131,7 @@ test('annotate anchors to a control by window title and name, in one call', asyn
         shapes: [{ type: 'circle', text: 'here' }]
     });
     assert.equal(isError, false, text);
-    assert.match(text, /^Drew ann_\d+ on "Save" \[button\] el_1; they follow it\.$/);
+    assert.match(text, /^Drew ann_\d+ on "Save" \[button\] el_1, top-left of "Untitled - Notepad"; they follow it\.$/);
     assert.equal(calls.find(c => c.op === 'find_elements').params.window, '100');
 
     const [a] = store.list();
@@ -191,7 +207,7 @@ test('an unscoped control wait warns about its cost; a top-level window wait doe
     assert.equal(/not scoped/.test(dialog.text), false);
 });
 
-test('highlight_and_wait with until: waits for the UI, then clears only its own circle', async () => {
+test('highlight_and_wait with until: waits for the UI, then swaps its circle for a check mark', async () => {
     let checks = 0;
     fakeHelper({
         // "Saved" shows up on the second check, as if the user clicked Save.
@@ -211,7 +227,8 @@ test('highlight_and_wait with until: waits for the UI, then clears only its own 
     assert.equal(isError, false, text);
     assert.match(text, /^Met: "appears" after/);
     assert.equal(checks, 2);
-    assert.equal(store.list().length, 0, 'its circle is cleared afterwards');
+    // The circle is gone; a one-second check mark confirms the step on screen.
+    assert.deepEqual(store.list().map(a => a.type), ['done']);
 });
 
 test('highlight_and_wait rejects an empty until before drawing anything', async () => {

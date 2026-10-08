@@ -58,7 +58,15 @@ const coverChecked = new Map<string, number>();
 export function toDisplayLocal(phys: Rect): { displayId: string; rect: Rect; to?: Point } {
     const tl = screen.screenToDipPoint({ x: phys.x, y: phys.y });
     const br = screen.screenToDipPoint({ x: phys.x + phys.width, y: phys.y + phys.height });
-    const display = screen.getDisplayNearestPoint(tl);
+    // The display the rect mostly overlaps, not the one nearest its top-left: a
+    // window dragged so its corner pokes onto a second monitor still belongs to
+    // the first. The overlay routes the drawing to every display it touches.
+    const display = screen.getDisplayMatching({
+        x: Math.round(tl.x),
+        y: Math.round(tl.y),
+        width: Math.max(1, Math.round(br.x - tl.x)),
+        height: Math.max(1, Math.round(br.y - tl.y))
+    });
     return {
         displayId: String(display.id),
         rect: {

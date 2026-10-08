@@ -4,7 +4,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Annotation, ClickResult, Rect, SnapshotNode, StepAnswer } from '../../../shared/types.js';
 import { rectContains } from '../../../shared/geometry.js';
 import { parseProgress } from '../../../shared/progress.js';
-import { clean, diffLines, elementLine, toSnapshotNodes } from '../../../shared/uitree.js';
+import { clean, diffLines, elementLine, toSnapshotNodes, whereIn } from '../../../shared/uitree.js';
 import { store } from '../../store.js';
 import { beginStep } from '../../steps.js';
 import { postToHud } from '../../hud.js';
@@ -136,15 +136,6 @@ const UNSCOPED_NOTE =
 
 // ------------------------------------------------------------- where things are
 
-/** "top-left", "centre", "bottom": where a rect sits inside a window, in words the user can follow. */
-function whereIn(r: Rect, win: Rect): string {
-    const fx = (r.x + r.width / 2 - win.x) / Math.max(1, win.width);
-    const fy = (r.y + r.height / 2 - win.y) / Math.max(1, win.height);
-    const h = fx < 1 / 3 ? 'left' : fx > 2 / 3 ? 'right' : '';
-    const v = fy < 1 / 3 ? 'top' : fy > 2 / 3 ? 'bottom' : '';
-    return v && h ? `${v}-${h}` : v || h || 'centre';
-}
-
 /** "40px below and 12px left of": how far a point is outside a rect, in physical px. */
 function offsetFrom(r: Rect, p: { x: number; y: number }, scale: number): string {
     const dx = p.x < r.x ? p.x - r.x : p.x > r.x + r.width ? p.x - (r.x + r.width) : 0;
@@ -157,10 +148,15 @@ function offsetFrom(r: Rect, p: { x: number; y: number }, scale: number): string
     return parts.join(' and ');
 }
 
+/**
+ * The resolver already says where the target sits when it could tell
+ * (resolveAnchor's label is "what, where"); only fill the gap when it could not.
+ */
 function circledLine(target: ResolvedAnchor, windowRef: string, windows: WindowInfo[]): string {
+    if (target.where) return `Circled ${target.label}.`;
     const win = windows.find(w => w.ref === windowRef);
-    const where = win ? `${whereIn(target.rect, win.rect)} of ${quote(win.title)}` : `in window ${windowRef}`;
-    return `Circled ${target.label}, ${where}.`;
+    const spot = win ? whereIn(target.rect, win.rect) : null;
+    return `Circled ${target.label}, ${spot && win ? `${spot} of ${quote(win.title)}` : `in window ${windowRef}`}.`;
 }
 
 /**
@@ -245,11 +241,27 @@ async function nameClick(c: ClickResult): Promise<string | null> {
     }
 }
 
+/**
+ * Display-local DIPs to global DIPs. A drawing belongs to one display but is
+ * drawn on every display it overlaps, so a click on another monitor can still
+ * land inside it; comparing in global space is what makes that count.
+ */
+function toGlobal(displayId: string, r: Rect): Rect | null {
+    const d = screen.getAllDisplays().find(x => String(x.id) === displayId);
+    return d ? { x: d.bounds.x + r.x, y: d.bounds.y + r.y, width: r.width, height: r.height } : null;
+}
+
+function clickInside(a: Annotation, c: ClickResult): boolean {
+    const box = toGlobal(a.displayId, a.rect);
+    const at = toGlobal(c.displayId, { x: c.dip.x, y: c.dip.y, width: 0, height: 0 });
+    return Boolean(box && at && rectContains(box, at));
+}
+
 /** Which of the current drawings a click landed inside. */
 function drawingsAt(c: ClickResult): string[] {
     return store
-        .forDisplay(c.displayId)
-        .filter(a => !a.hidden && a.type !== 'done' && rectContains(a.rect, c.dip))
+        .list()
+        .filter(a => !a.hidden && a.type !== 'done' && clickInside(a, c))
         .map(a => a.id);
 }
 
@@ -382,6 +394,8 @@ async function failureDigest(ctx: {
     windowTitle: string;
     start?: { id: string; nodes: SnapshotNode[] };
     circleId?: string;
+    /** The response already warns that the target is covered. */
+    warnedCovered?: boolean;
 }): Promise<string> {
     const out: string[] = [];
     let now: WindowInfo[] = [];
@@ -396,7 +410,7 @@ async function failureDigest(ctx: {
     if (front) out.push(`Foreground: ${quote(front.title)}.`);
 
     const status = await targetStatus(ctx.circleId, ctx.windowRef, ctx.windowTitle);
-    if (status) out.push(status);
+    if (status && !(ctx.warnedCovered && status.startsWith('WARNING:'))) out.push(status);
 
     let changed = false;
     if (ctx.start) {
@@ -571,16 +585,16 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
     if (target) {
         // Scrolled out, the rect is real but points at whatever is in front of
         // it now; drawing there would send the user to the wrong control.
-        const [live] = await resolveRefs([target.ref]).catch(() => []);
-        if (live?.offscreen) {
+        const [live] = target.offscreen ? [] : await resolveRefs([target.ref]).catch(() => []);
+        if (target.offscreen || live?.offscreen) {
             return result(
                 false,
-                `NOT started: ${target.label} is scrolled out of view in ${quote(windowTitle)}; call scroll_window ` +
+                `NOT started: ${target.what} is scrolled out of view in ${quote(windowTitle)}; call scroll_window ` +
                     'with its name, or ask the user to scroll.'
             );
         }
         const c = await coverageOf(windowRef, target.rect);
-        const covered = c && coveredNote(c, target.label, windowTitle);
+        const covered = c && coveredNote(c, target.what, windowTitle);
         if (covered) warnings.push(covered);
     }
 
@@ -691,7 +705,15 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
                 ? `DONE after ${Math.round((Date.now() - startedAt) / 1000)}s, but the until is NOT met: ` +
                   `${untilText(u!)}.${seenNote(req, outcome)}`
                 : waitSummary(req, outcome);
-        const digest = await failureDigest({ req, before, windowRef, windowTitle, start, circleId });
+        const digest = await failureDigest({
+            req,
+            before,
+            windowRef,
+            windowTitle,
+            start,
+            circleId,
+            warnedCovered: warnings.length > 0
+        });
         // Left up, so the user keeps the pointer while the agent decides; the
         // next step's drawing replaces it.
         const left = circleId && store.list().some(a => a.id === circleId)
@@ -723,7 +745,7 @@ async function clickVerdict(
     const circle = circleId ? store.list().find(x => x.id === circleId) : undefined;
     if (!circle) return { ok: true, text: `The user clicked at ${where}${on}.` };
 
-    if (circle.displayId !== click.displayId || !rectContains(circle.rect, click.dip)) {
+    if (!clickInside(circle, click)) {
         const scale = listDisplays().find(d => d.id === click.displayId)?.scaleFactor ?? 1;
         const off =
             circle.displayId === click.displayId
@@ -848,7 +870,9 @@ export function registerGuide(server: McpServer): void {
             inputSchema: {
                 window: z.string().describe(WINDOW),
                 ...selectorFields(),
-                prompt: z.string().describe('What the user should do; captions the circle.'),
+                // The one followability rule carried in the tool list itself:
+                // some clients drop server instructions.
+                prompt: z.string().describe('One action in the app\'s own words, e.g. "2/5 Click Export".'),
                 until: untilSchema()
                     .optional()
                     .describe(
@@ -906,9 +930,10 @@ export function registerGuide(server: McpServer): void {
         {
             title: 'Wait for the UI to reach a state',
             description:
-                'Block until a control appears, disappears or becomes enabled, in one call instead of polling ' +
-                'with screenshots. timeoutMs:0 checks once, which is how to assert state cheaply. role ' +
-                '"window" without window waits for a top-level window. Returns NOT met on timeout.',
+                'Block until a control appears, disappears, becomes enabled or changes (name, value, state; ' +
+                'with no selector, a window opening or closing), in one call instead of polling with ' +
+                'screenshots. timeoutMs:0 checks once: a cheap assertion. role "window" without window waits ' +
+                'for a top-level window.',
             inputSchema: {
                 condition: z.enum(UNTIL_CONDITIONS),
                 ...selectorFields(),

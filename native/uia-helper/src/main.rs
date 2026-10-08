@@ -23,7 +23,9 @@ use std::io::{BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 use uiautomation::UIAutomation;
+use ::windows::core::Interface;
 use ::windows::Win32::Foundation::HWND;
+use ::windows::Win32::UI::Accessibility::{IUIAutomation, IUIAutomation2};
 use ::windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 
 use model::Rect;
@@ -116,6 +118,18 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // UI Automation waits on the target app for every cross-process call. A
+    // hung app would otherwise block this single-threaded helper, and with it
+    // the anchor tracker, for as long as the app stays hung. Bounded timeouts
+    // turn that into a failed call. Older systems without IUIAutomation2 keep
+    // the defaults.
+    if let Ok(auto2) = AsRef::<IUIAutomation>::as_ref(&auto).cast::<IUIAutomation2>() {
+        unsafe {
+            let _ = auto2.SetConnectionTimeout(1000);
+            let _ = auto2.SetTransactionTimeout(4000);
+        }
+    }
+
     let mut session = Session { auto, cache: HashMap::new(), next: 0, clock: 0 };
     let ignore_pid = |req: &Request| req.ignore_pid.unwrap_or(0);
 

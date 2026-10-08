@@ -23,7 +23,7 @@ test('annotate circles the exact label, not the first substring match', async ()
     const { calls } = fakeHelper({}, desktop);
     const { text, isError } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
     assert.equal(isError, false, text);
-    assert.match(text, /on "Save" \[button\] el_3;/);
+    assert.match(text, /on "Save" \[button\] el_3, top-left of "Untitled - Notepad";/);
     assert.equal(/Also matched/.test(text), false, 'a unique exact match is not ambiguous');
     assert.ok(calls.find(c => c.op === 'find_elements').params.limit > 1, 'asks for more than the first hit');
 });
@@ -33,7 +33,7 @@ test('an ambiguous name says what else it matched', async () => {
     desktop.controls = [control('el_1', 'Save as…'), control('el_2', 'Save all', { rect: rect(150, 150, 60, 24) })];
     fakeHelper({}, desktop);
     const { text } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
-    assert.match(text, /on "Save all" \[button\] el_2;/, 'ties go to the smaller control');
+    assert.match(text, /on "Save all" \[button\] el_2, top-left of "Untitled - Notepad";/, 'ties go to the smaller control');
     assert.match(text, /Also matched "Save as…" \[button\]/);
 });
 
@@ -192,7 +192,7 @@ test('a ref from a window-scoped search anchors with a selector to recover by', 
     await call('find_ui_elements', { window: 'Notepad', name: 'Save' });
     const { text, isError } = await call('annotate', { anchor: { ref: 'el_1' }, shapes: [{ type: 'box' }] });
     assert.equal(isError, false, text);
-    assert.match(text, /on "Save" \[button\] el_1;/);
+    assert.match(text, /on "Save" \[button\] el_1, top-left of "Untitled - Notepad";/);
     assert.deepEqual(store.list()[0].anchor.selector, { window: '100', role: 'button', automationId: 'SaveBtn' });
 });
 

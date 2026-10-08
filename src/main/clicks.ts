@@ -4,7 +4,7 @@ import { physicalToImagePoint, rectContains } from '../shared/geometry.js';
 import { listDisplays } from './displays.js';
 import { hudBounds } from './hud.js';
 import { store } from './store.js';
-import { addClick, beginStep, cancelStep, currentCaptureId } from './steps.js';
+import { addClick, cancelStep, currentCaptureId } from './steps.js';
 
 /**
  * Human-in-the-loop pointing. While a click-mode step is pending the overlay
@@ -57,28 +57,4 @@ export function initClicks(): void {
 
 function round(p: Point): Point {
     return { x: Math.round(p.x), y: Math.round(p.y) };
-}
-
-/**
- * Collect clicks with the pre-steps.ts contract: resolves with the clicks,
- * rejects on cancel or a timeout with none. Kept only until the tool layer
- * formats step answers itself; new code should use beginStep().
- */
-export async function requestClicks(opts: {
-    prompt: string;
-    count: number;
-    timeoutMs: number;
-    captureId?: string;
-}): Promise<ClickResult[]> {
-    const step = beginStep({ prompt: opts.prompt, mode: 'click', count: opts.count, captureId: opts.captureId, timeoutMs: opts.timeoutMs });
-    const a = await step.answer;
-    if (a.kind === 'clicks') return a.clicks;
-    if (a.kind === 'timeout' && a.partial.length > 0) return a.partial;
-    throw new Error(
-        a.kind === 'timeout' ? `timed out after ${opts.timeoutMs}ms with no click` : 'the user cancelled the click request'
-    );
-}
-
-export function hasPendingClick(): boolean {
-    return store.getStep()?.mode === 'click';
 }

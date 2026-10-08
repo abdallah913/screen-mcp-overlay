@@ -336,8 +336,8 @@ export function registerRead(server: McpServer): void {
                     .max(4096)
                     .optional()
                     .describe(
-                        'Longest edge. Default 1568 within 1.15MP, the most any Claude model takes without ' +
-                            'rescaling; high-res models take 2576.'
+                        'Longest edge. Default 1568 within 1.15MP, which no Claude model rescales; high-res ' +
+                            'models take 2576.'
                     ),
                 grid: z.boolean().default(false).describe('Burn in a labelled coordinate grid.'),
                 returnImage: z

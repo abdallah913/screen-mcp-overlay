@@ -5,18 +5,12 @@ import { clearLog, pushMessage, replyToStep, setBusy, setMirror, streamMessage }
 import { listIdeWorkspaces, listSessionsForDir, type IdeWorkspace, type SessionChoice } from './sessions.js';
 import { sdkUnavailable } from './sdk.js';
 import { mirroring, startMirror, stopMirror } from './mirror.js';
+import { SELF_LOGGING } from './summary.js';
 
 /**
  * Owns the chat panel's conversation: one provider, one in-flight turn at a
  * time, and the translation from provider events into HUD updates.
  */
-
-/**
- * This server's tools whose content the panel already logs itself. Matched on
- * the built-in agent's server name (claude.ts) only, so another server's tool
- * of the same name is still listed.
- */
-const SELF_LOGGING = /^mcp__screen-overlay__(highlight_and_wait|wait_for_user_click|show_message)$/;
 
 const providers = new Map<string, AgentProvider>();
 let current: AgentProvider;

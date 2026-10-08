@@ -116,6 +116,14 @@ export function checkShape(s: ShapeInput, anchored: boolean): void {
     }
 }
 
+/** A step's text: its number alone, a short label as given, or "n. instruction". */
+function stepText(text: string | undefined, n: number): string {
+    const t = text?.trim();
+    if (!t) return String(n);
+    if (t.length <= 3 || /^\d{1,3}(?:[.):]\s|\s*\/\s*\d)/.test(t)) return t;
+    return `${n}. ${t}`;
+}
+
 /** Everything about an annotation that does not depend on where it lands. */
 export function baseAnnotation(s: ShapeInput, step: number, expiresAt: number | undefined): Annotation {
     return {
@@ -123,7 +131,9 @@ export function baseAnnotation(s: ShapeInput, step: number, expiresAt: number | 
         displayId: '',
         type: s.type,
         rect: { x: 0, y: 0, width: 0, height: 0 },
-        text: s.type === 'step' ? s.text ?? String(step) : s.text,
+        // A step with an instruction keeps its number in front, so the badge the
+        // renderer draws beside the caption matches the count the response gives.
+        text: s.type === 'step' ? stepText(s.text, step) : s.text,
         color: s.color ?? DEFAULT_COLORS[s.type],
         thickness: s.thickness ?? 3,
         dim: s.dim ?? 0.6,

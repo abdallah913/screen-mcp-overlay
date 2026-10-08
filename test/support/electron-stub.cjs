@@ -19,6 +19,8 @@ module.exports = {
         getPrimaryDisplay: () => display,
         getAllDisplays: () => [display],
         screenToDipPoint: p => ({ x: p.x, y: p.y }),
+        dipToScreenPoint: p => ({ x: p.x, y: p.y }),
+        getDisplayMatching: () => display,
         getDisplayNearestPoint: () => display,
         on: noop
     },

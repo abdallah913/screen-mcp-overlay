@@ -418,7 +418,8 @@ test('a click off the circle says where it was and that the app did not get it',
     const { result } = await pending('highlight_and_wait', pointed);
     addClick(click(160, 300));
     const { text } = await result;
-    assert.match(text, /^The user clicked OUTSIDE the target, at 160,300 on display 1, 118px below the circle\. The app did not receive that click/);
+    // The point is named too: here it is plain window background, no control.
+    assert.match(text, /^The user clicked OUTSIDE the target, at 160,300 on display 1, on the window "Untitled - Notepad", 118px below the circle\. The app did not receive that click/);
     assert.equal(store.list().length, 0);
 });
 
@@ -448,7 +449,18 @@ test('wait_for_user_click: complete, and which drawing each click hit', async ()
     addClick(click(500, 500));
     const { text, isError } = await result;
     assert.equal(isError, false);
-    assert.match(text, /^The user clicked:\n1\. display 1: physical 120,120, normalized 0,0 -> inside ann_x\n2\. display 1: physical 500,500, normalized 0,0$/);
+    assert.match(
+        text,
+        /^The user clicked:\n1\. display 1: physical 120,120, normalized 0,0 -> the window "Untitled - Notepad"; inside ann_x\n2\. display 1: physical 500,500, normalized 0,0 -> the window "Untitled - Notepad"$/
+    );
+});
+
+test('a click on a control comes back named and anchorable', async () => {
+    fakeHelper();
+    const { result } = await pending('wait_for_user_click', { prompt: 'Which button?' });
+    addClick(click(160, 160));
+    const { text } = await result;
+    assert.match(text, /-> "Save" \[button\] el_1 in "Untitled - Notepad"/);
 });
 
 test('wait_for_user_click: partial clicks then silence lead with the status word', async () => {

@@ -434,6 +434,9 @@ export async function findElements(opts: {
     for (const e of found) {
         if (opts.window) remember(e, opts.window);
         else liveElementRefs.add(e.ref);
+        // A hidden match names the container to open first; the agent may
+        // anchor to it, so its ref must count as live too.
+        if (e.container) liveElementRefs.add(e.container.ref);
     }
     return found;
 }
