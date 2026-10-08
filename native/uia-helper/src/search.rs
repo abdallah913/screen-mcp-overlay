@@ -289,10 +289,19 @@ fn gone_reason(top: isize) -> &'static str {
     rank::gone_reason(unsafe { IsWindow(Some(h)) }.as_bool(), unsafe { IsIconic(h) }.as_bool(), is_cloaked(h))
 }
 
-/// The element's ScrollPattern, when it scrolls vertically.
-fn vertical_scroller(el: &UIElement) -> Option<UIScrollPattern> {
-    let p: UIScrollPattern = el.get_pattern().ok()?;
-    p.is_vertically_scrollable().unwrap_or(false).then_some(p)
+/// The element's ScrollPattern, when it scrolls vertically; Err with the
+/// HRESULT when the app could not answer (rank::unreachable).
+fn vertical_scroller(el: &UIElement) -> Result<Option<UIScrollPattern>, i32> {
+    let p: UIScrollPattern = match el.get_pattern() {
+        Ok(p) => p,
+        Err(e) if rank::unreachable(e.code()) => return Err(e.code()),
+        Err(_) => return Ok(None),
+    };
+    match p.is_vertically_scrollable() {
+        Ok(v) => Ok(v.then_some(p)),
+        Err(e) if rank::unreachable(e.code()) => Err(e.code()),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Vertical scroll position 0..100, or None when it does not scroll (UIA
@@ -383,17 +392,26 @@ impl Walk {
     }
 
     /// One step of navigation, cached when possible. A failed cached call is
-    /// retried live, unless the app could not answer at all; "nothing there"
-    /// is an answer, not a failure.
+    /// retried live, unless the app could not answer at all, which ends the
+    /// walk, or the node stepped from has vanished, which ends this branch
+    /// only: a row removed or a popup closing mid-walk says nothing about the
+    /// rest of the window, and asking again would find it gone again. "Nothing
+    /// there" is an answer, not a failure.
     fn step(
         &self,
         cached: impl FnOnce(&UICacheRequest) -> uiautomation::Result<UIElement>,
         live: impl FnOnce() -> uiautomation::Result<UIElement>,
     ) -> Option<(UIElement, bool)> {
+        // Every level the walk climbs back out of asks for a next sibling;
+        // after the app stopped answering, each would wait out the timeout.
+        if self.unreachable.get() {
+            return None;
+        }
         if let Some(req) = &self.req {
             match found(cached(req)) {
                 Ok(Some(el)) => return Some((el, true)),
                 Ok(None) => return None,
+                Err(code) if rank::vanished(code) => return None,
                 Err(code) if rank::unreachable(code) => {
                     self.unreachable.set(true);
                     return None;
@@ -401,7 +419,15 @@ impl Walk {
                 Err(_) => {}
             }
         }
-        live().ok().map(|el| (el, false))
+        match found(live()) {
+            Ok(el) => el.map(|el| (el, false)),
+            Err(code) => {
+                if rank::unreachable(code) {
+                    self.unreachable.set(true);
+                }
+                None
+            }
+        }
     }
 
     /// Note on the row at `index` that `n` siblings after it were skipped.
@@ -413,10 +439,19 @@ impl Walk {
     }
 
     /// A row a collapsed run must keep: the selected or focused one, which is
-    /// usually the very row the reader is asking about.
+    /// usually the very row the reader is asking about; an expanded one, whose
+    /// children are where the user is (Explorer's 'This PC', tenth in its
+    /// pane, open on the selected drive); and one the focused control sits
+    /// inside. Cheapest first: on the uncached path each read is a call.
     fn wanted(&self, el: &UIElement, cached: bool, ctrl: i32) -> bool {
-        props::selected(el, cached) == Some(true)
-            || props::rect(el, cached).is_some_and(|r| self.focus.is(&props::name(el, cached), ctrl, &r))
+        if props::selected(el, cached) == Some(true) || rank::shows_children(props::expand_state(el, cached)) {
+            return true;
+        }
+        self.focus.known()
+            && props::rect(el, cached).is_some_and(|r| {
+                let name = props::name(el, cached);
+                self.focus.is(&name, ctrl, &r) || self.focus.inside(&name, ctrl, &r)
+            })
     }
 
     fn first_child(&self, el: &UIElement) -> Option<(UIElement, bool)> {
@@ -448,7 +483,13 @@ impl Walk {
                 if !name.is_empty() && !names.iter().any(|n| n == name) {
                     names.push(name.to_string());
                 }
-                cur = self.walker.get_next_sibling(&el).ok().map(|n| (n, false));
+                // A popup that stopped answering can leave pending nodes
+                // behind it while the window's own walk went on.
+                cur = match found(self.walker.get_next_sibling(&el)) {
+                    Ok(next) => next.map(|n| (n, false)),
+                    Err(code) if rank::unreachable(code) => return names,
+                    Err(_) => None,
+                };
             }
         }
         names
@@ -479,8 +520,9 @@ impl Session {
         if let Some(r) = req {
             match self.auto.element_from_handle_build_cache(Handle::from(raw), r) {
                 Ok(el) => return Ok((el, true)),
-                // A live retry would only wait out the same timeout again.
-                Err(e) if rank::unreachable(e.code()) => return Err(e.to_string()),
+                // A live retry would only wait out the same timeout again, or
+                // find the same closing window gone again.
+                Err(e) if rank::unreachable(e.code()) || rank::vanished(e.code()) => return Err(e.to_string()),
                 Err(_) => {}
             }
         }
@@ -547,6 +589,9 @@ impl Session {
         let tree = if scope.popup { TreeScope::Subtree } else { TreeScope::Descendants };
         // A cached call that failed because the app cannot answer is not
         // retried live: that would wait out the same timeout a second time.
+        // One that failed on a vanished element is: that can be a control
+        // removed mid-search rather than the scope itself, and the app
+        // answered quickly.
         if first_only {
             if let Some(r) = req {
                 match found(scope.root.find_first_build_cache(tree, cond, r)) {
@@ -950,7 +995,18 @@ impl Session {
         w.report_more(run.finish());
     }
 
-    pub fn describe(&mut self, window_ref: &str, max_nodes: usize, max_depth: usize) -> Result<Described, String> {
+    /// The window's rows, its open popups' first. With `ignore_focus`, focus
+    /// is not read at all: no row is marked focused or kept for holding the
+    /// focus, so two describes differ only when the window did. A 'changes'
+    /// wait compares describes, and the user clicking into the window must
+    /// not count as the change it waits for.
+    pub fn describe(
+        &mut self,
+        window_ref: &str,
+        max_nodes: usize,
+        max_depth: usize,
+        ignore_focus: bool,
+    ) -> Result<Described, String> {
         let raw = readable_window(window_ref)?;
         let req = props::request_for(&self.auto, props::DESCRIBE);
         let (root, cached) = self
@@ -961,7 +1017,7 @@ impl Session {
         let popups = if reserve > 0 { popups::popups_of(hwnd_of(raw)) } else { Vec::new() };
         let mut tops: Vec<isize> = popups.iter().map(|(h, _)| h.0 as isize).collect();
         tops.push(raw);
-        let focus = Focus::now(&self.auto, &tops);
+        let focus = if ignore_focus { Focus::none() } else { Focus::now_with_ancestors(&self.auto, &tops) };
         let mut w = Walk {
             walker,
             req,
@@ -1019,8 +1075,18 @@ impl Session {
                 if w.rows.len() == at + 1 && w.rows[at].name.trim().is_empty() {
                     w.rows.truncate(at);
                 }
-                w.truncated |= w.stopped;
+                // A call that went unanswered cuts the walk short without
+                // spending its budget.
+                w.truncated |= w.stopped || w.unreachable.get();
                 w.stopped = false;
+            }
+            // A popup's provider can disconnect as the popup closes, which
+            // reads like an app that stopped answering. The window's own walk
+            // goes ahead unless the window does not answer either: a frozen
+            // app costs one more bounded message here, not another UIA
+            // timeout.
+            if w.unreachable.get() && crate::winops::responds(hwnd_of(raw)) {
+                w.unreachable.set(false);
             }
         }
 
@@ -1028,7 +1094,7 @@ impl Session {
         w.top_rect = rect_of(hwnd_of(raw));
         w.pass(max_nodes, max_nodes, EXTRA_WALK_TIME);
         self.walk(&mut w, &root, 1);
-        let truncated = w.truncated || w.stopped;
+        let truncated = w.truncated || w.stopped || w.unreachable.get();
         // Naming what was missed means asking the app again, which an app
         // that stopped answering would make wait out the timeout per name.
         let unvisited = if truncated && !w.unreachable.get() { w.unvisited() } else { Vec::new() };
@@ -1080,6 +1146,14 @@ impl Session {
                 }
                 let (el, cached) = match req.as_ref().map(|q| entry.el.build_updated_cache(q)) {
                     Some(Ok(fresh)) => (fresh, true),
+                    // This control went away (a row deleted, a re-render),
+                    // which the app answered at once: the window's other
+                    // controls are asked as usual, and a live read would only
+                    // say the same.
+                    Some(Err(e)) if rank::vanished(e.code()) => {
+                        out.push(missing(Some(gone_reason(top))));
+                        continue;
+                    }
                     Some(Err(e)) if rank::unreachable(e.code()) => {
                         if top != 0 {
                             silent.push(top);
@@ -1120,40 +1194,61 @@ impl Session {
     /// nothing rather than as the user's answer.
     pub fn element_at_point(&mut self, x: i32, y: i32, ignore_pid: u32) -> Result<PointHit, String> {
         let ours = |pid: u32| ignore_pid != 0 && pid == ignore_pid;
+        let window_of = |top: HWND| {
+            (!top.is_invalid() && !ours(popups::pid_of(top)))
+                .then(|| WindowRef { r#ref: (top.0 as isize).to_string(), title: title_of(top) })
+        };
         // A window that is not responding would hold every call below for the
         // full timeout; it is still the window that was clicked.
         let under = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
         if !under.is_invalid() && is_hung(under) {
-            let window = (!ours(popups::pid_of(under)))
-                .then(|| WindowRef { r#ref: (under.0 as isize).to_string(), title: title_of(under) });
-            return Ok(PointHit { element: None, window });
+            return Ok(PointHit { element: None, window: window_of(under) });
         }
         let _bound = CallBound::new(&self.auto, HOT_CALL_TIMEOUT_MS);
-        let el = self
-            .auto
-            .element_from_point(Point::new(x, y))
-            .map_err(|e| format!("nothing answers at {x},{y}: {e}"))?;
-        if ours(el.get_process_id().unwrap_or(0)) {
+        let nothing = |e: uiautomation::Error| format!("nothing answers at {x},{y}: {e}");
+        // Everything reported below comes back in the hit test itself, so an
+        // app that freezes after answering it costs no further waits.
+        let req = props::request_for(&self.auto, props::AT_POINT);
+        let (el, cached) = match req.as_ref().map(|r| self.auto.element_from_point_build_cache(Point::new(x, y), r)) {
+            Some(Ok(el)) => (el, true),
+            // Asking again live would wait out the same bound.
+            Some(Err(e)) if rank::unreachable(e.code()) => return Err(nothing(e)),
+            _ => (self.auto.element_from_point(Point::new(x, y)).map_err(nothing)?, false),
+        };
+        let pid = if cached {
+            props::process_id(&el, true).unwrap_or(0)
+        } else {
+            // The first live read after the hit test. An app that cannot
+            // answer it would make each of the dozen after it wait as long,
+            // so the window at the point is all that is reported.
+            match el.get_process_id() {
+                Ok(pid) => pid,
+                Err(e) if rank::unreachable(e.code()) => {
+                    return Ok(PointHit { element: None, window: window_of(under) });
+                }
+                Err(_) => 0,
+            }
+        };
+        if ours(pid) {
             return Ok(PointHit { element: None, window: None });
         }
         // Windowless content (a browser page, a XAML island) has no handle of
         // its own; the window at the point is then the one it is drawn in.
-        let own: HWND = el.get_native_window_handle().map(Into::into).unwrap_or_default();
+        let own: HWND = props::native_window(&el, cached).unwrap_or_default();
         let at = if own.is_invalid() { unsafe { WindowFromPoint(POINT { x, y }) } } else { own };
         let top = unsafe { GetAncestor(at, GA_ROOT) };
-        let window = (!top.is_invalid() && !ours(popups::pid_of(top)))
-            .then(|| WindowRef { r#ref: (top.0 as isize).to_string(), title: title_of(top) });
+        let window = window_of(top);
         let top_raw = if window.is_some() { top.0 as isize } else { 0 };
 
-        let element = match props::rect(&el, false) {
+        let element = match props::rect(&el, cached) {
             Some(rect) => {
-                let name = props::name(&el, false);
-                let enabled = props::enabled(&el, false);
+                let name = props::name(&el, cached);
+                let enabled = props::enabled(&el, cached);
                 let top_rect = if top_raw != 0 { rect_of(top) } else { None };
-                let offscreen = props::offscreen(&el, false) || top_rect.is_some_and(|t| rank::outside(&rect, &t));
+                let offscreen = props::offscreen(&el, cached) || top_rect.is_some_and(|t| rank::outside(&rect, &t));
                 let focus = Focus::now(&self.auto, &[top_raw]);
                 let seen = Seen { name, rect, enabled, offscreen };
-                Some(self.element_info(el, false, seen, top_raw, false, &focus))
+                Some(self.element_info(el, cached, seen, top_raw, false, &focus))
             }
             None => None,
         };
@@ -1276,6 +1371,11 @@ impl Session {
     /// the window element itself. Never a search of the whole window, which
     /// in a big tree with nothing scrollable would cost seconds to find
     /// nothing.
+    ///
+    /// Every read here is a call into the app, and the client gives the whole
+    /// scroll 6 s, so the first one the app cannot answer ends the search:
+    /// each further one, the window element's included, would wait out the
+    /// same bound again.
     fn scroller_at_centre(&self, hwnd: HWND) -> Option<UIScrollPattern> {
         let rect = rect_of(hwnd)?;
         let (x, y) = (rect.x + rect.width / 2, rect.y + rect.height / 2);
@@ -1283,23 +1383,37 @@ impl Session {
         // the control there belongs to whatever covers it.
         let at = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
         if at == hwnd {
-            if let (Ok(mut el), Ok(walker)) =
-                (self.auto.element_from_point(Point::new(x, y)), self.auto.get_control_view_walker())
-            {
-                for _ in 0..PARENT_WALK {
-                    if let Some(p) = vertical_scroller(&el) {
-                        return Some(p);
-                    }
-                    let own: HWND = el.get_native_window_handle().map(Into::into).unwrap_or_default();
-                    if own == hwnd {
-                        break;
-                    }
-                    let Ok(parent) = walker.get_parent(&el) else { break };
-                    el = parent;
+            let walker = self.auto.get_control_view_walker().ok()?;
+            let mut cur = match self.auto.element_from_point(Point::new(x, y)) {
+                Ok(el) => Some(el),
+                Err(e) if rank::unreachable(e.code()) => return None,
+                Err(_) => None,
+            };
+            for _ in 0..PARENT_WALK {
+                let Some(el) = cur.take() else { break };
+                match vertical_scroller(&el) {
+                    Ok(Some(p)) => return Some(p),
+                    Ok(None) => {}
+                    Err(_) => return None,
                 }
+                let own: HWND = match el.get_native_window_handle() {
+                    Ok(h) => h.into(),
+                    Err(e) if rank::unreachable(e.code()) => return None,
+                    Err(_) => HWND::default(),
+                };
+                // The window's own element, just asked: it does not scroll.
+                if own == hwnd {
+                    return None;
+                }
+                cur = match found(walker.get_parent(&el)) {
+                    Ok(parent) => parent,
+                    Err(code) if rank::unreachable(code) => return None,
+                    Err(_) => None,
+                };
             }
         }
-        vertical_scroller(&self.auto.element_from_handle(Handle::from(hwnd.0 as isize)).ok()?)
+        let window = self.auto.element_from_handle(Handle::from(hwnd.0 as isize)).ok()?;
+        vertical_scroller(&window).ok().flatten()
     }
 
     /// Scroll a window by wheel notches, reporting the vertical position of
@@ -1309,8 +1423,17 @@ impl Session {
     /// view.
     pub fn scroll_window(&mut self, hwnd: HWND, notches: i32) -> Result<Scrolled, String> {
         // A window that is not responding gets the scroll's own error, before
-        // any UI Automation call can wait on it.
-        let scroller = if is_hung(hwnd) { None } else { self.scroller_at_centre(hwnd) };
+        // any UI Automation call can wait on it. IsHungAppWindow only trips
+        // after 5 s; one that froze a moment ago is caught by a WM_NULL round
+        // trip, and is not sent the wheel either, which could still land when
+        // the app catches up, after the agent was told it did not scroll.
+        if !crate::winops::responds(hwnd) {
+            return Err(crate::winops::not_scrolled());
+        }
+        // The reads around the scroll are best effort: one that hangs gives up
+        // well inside the client's budget, and the scroll still goes ahead.
+        let _bound = CallBound::new(&self.auto, HOT_CALL_TIMEOUT_MS);
+        let scroller = self.scroller_at_centre(hwnd);
         let before = scroller.as_ref().and_then(vertical_percent);
         crate::winops::scroll(hwnd, notches)?;
         let after = match (&scroller, before) {

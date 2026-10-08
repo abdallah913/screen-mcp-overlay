@@ -11,6 +11,7 @@ use uiautomation::core::UICacheRequest;
 use uiautomation::types::{TreeScope, UIProperty};
 use uiautomation::variants::Variant;
 use uiautomation::{UIAutomation, UIElement};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{IUIAutomationElement, UIA_PROPERTY_ID};
 use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
 
@@ -46,6 +47,25 @@ pub const FIND: &[UIProperty] = &[
     UIProperty::ToggleToggleState,
     UIProperty::SelectionItemIsSelected,
     UIProperty::ExpandCollapseExpandCollapseState,
+];
+
+/// What element_at_point reports about the one control it finds, fetched in
+/// the hit test itself. Read one by one, these were a dozen calls into an app
+/// that may have frozen after the first, each waiting out the bound.
+pub const AT_POINT: &[UIProperty] = &[
+    UIProperty::Name,
+    UIProperty::ControlType,
+    UIProperty::AutomationId,
+    UIProperty::BoundingRectangle,
+    UIProperty::IsEnabled,
+    UIProperty::IsOffscreen,
+    UIProperty::ValueValue,
+    UIProperty::IsPassword,
+    UIProperty::ToggleToggleState,
+    UIProperty::SelectionItemIsSelected,
+    UIProperty::ExpandCollapseExpandCollapseState,
+    UIProperty::ProcessId,
+    UIProperty::NativeWindowHandle,
 ];
 
 /// What suggest needs: a name and a role for every control in the window.
@@ -187,13 +207,41 @@ pub fn selected(el: &UIElement, cached: bool) -> Option<bool> {
     flag(el, UIProperty::SelectionItemIsSelected, cached)
 }
 
+pub fn process_id(el: &UIElement, cached: bool) -> Option<u32> {
+    pick(cached, || el.get_cached_process_id().map(|p| p as u32), || el.get_process_id())
+}
+
+pub fn native_window(el: &UIElement, cached: bool) -> Option<HWND> {
+    pick(cached, || el.get_cached_native_window_handle(), || el.get_native_window_handle()).map(Into::into)
+}
+
+/// UIA's control type for a window.
+const WINDOW: i32 = 50032;
+
+/// Ancestors read up from the focused control, at most: as deep as a describe
+/// walks.
+const ANCESTORS: usize = 40;
+
+/// A control as Focus knows it: name, control type and rect.
+type Ident = (String, i32, Rect);
+
 /// The focused control, read once per query rather than once per node.
 ///
 /// Identified by name, role and rect instead of comparing elements, which
 /// would be a cross-process call for every row.
-pub struct Focus(Option<(String, i32, Rect)>);
+pub struct Focus {
+    at: Option<Ident>,
+    /// The list, tree and grid rows the focused control sits inside, when
+    /// asked for (see now_with_ancestors).
+    ancestors: Vec<Ident>,
+}
 
 impl Focus {
+    /// No focus at all: nothing reads as focused, nothing is kept for it.
+    pub fn none() -> Focus {
+        Focus { at: None, ancestors: Vec::new() }
+    }
+
     /// Focus as it bears on controls in `tops` (top-level window handles; 0
     /// means anywhere on the desktop).
     ///
@@ -203,31 +251,86 @@ impl Focus {
     /// a single row. So it is read only when the foreground window is one of
     /// `tops`, and never from a window that has stopped responding.
     pub fn now(auto: &UIAutomation, tops: &[isize]) -> Focus {
+        Focus::read(auto, tops, false)
+    }
+
+    /// Focus as `now` reads it, and also the rows it sits inside: a describe
+    /// that collapses a long run of rows must not skip the one holding the
+    /// focused control, or the control the user is in never shows.
+    pub fn now_with_ancestors(auto: &UIAutomation, tops: &[isize]) -> Focus {
+        Focus::read(auto, tops, true)
+    }
+
+    fn read(auto: &UIAutomation, tops: &[isize], lineage: bool) -> Focus {
         let foreground = unsafe { GetForegroundWindow() };
         if foreground.is_invalid() {
-            return Focus(None);
+            return Focus::none();
         }
         let root = unsafe { GetAncestor(foreground, GA_ROOT) };
         let root = if root.is_invalid() { foreground } else { root };
         if !tops.iter().any(|&t| t == 0 || t == root.0 as isize) || crate::windows::is_hung(root) {
-            return Focus(None);
+            return Focus::none();
         }
         // Not the value: the focused control is often a document, whose value
         // is its whole text.
         let req = request_for(auto, &[UIProperty::Name, UIProperty::ControlType, UIProperty::BoundingRectangle]);
-        let built = req.map(|r| auto.get_focused_element_build_cache(&r));
+        let built = req.as_ref().map(|r| auto.get_focused_element_build_cache(r));
         let (el, cached) = match built {
             Some(Ok(el)) => (el, true),
-            Some(Err(e)) if rank::unreachable(e.code()) => return Focus(None),
+            Some(Err(e)) if rank::unreachable(e.code()) => return Focus::none(),
+            // Including a focused control that vanished as it was read: focus
+            // has moved on, and asking again is quick and finds where to.
             _ => match auto.get_focused_element() {
                 Ok(el) => (el, false),
-                Err(_) => return Focus(None),
+                Err(_) => return Focus::none(),
             },
         };
-        Focus(rect(&el, cached).map(|r| (name(&el, cached), control_type(&el, cached), r)))
+        let Some(r) = rect(&el, cached) else { return Focus::none() };
+        let ancestors = if lineage { rows_around(auto, &el, req.as_ref()) } else { Vec::new() };
+        Focus { at: Some((name(&el, cached), control_type(&el, cached), r)), ancestors }
+    }
+
+    /// Whether any focus was read.
+    pub fn known(&self) -> bool {
+        self.at.is_some()
     }
 
     pub fn is(&self, name: &str, ctrl: i32, rect: &Rect) -> bool {
-        self.0.as_ref().is_some_and(|(n, c, r)| n == name && *c == ctrl && r == rect)
+        self.at.as_ref().is_some_and(|(n, c, r)| n == name && *c == ctrl && r == rect)
     }
+
+    /// Whether the control is a row the focused control sits inside.
+    pub fn inside(&self, name: &str, ctrl: i32, rect: &Rect) -> bool {
+        self.ancestors.iter().any(|(n, c, r)| *c == ctrl && r == rect && n == name)
+    }
+}
+
+/// The list, tree and grid rows above `el` in the control view, up to its
+/// top-level window. Every step is a call into the app, so the first failure
+/// of any kind ends the walk: a frozen app costs one bounded wait, not one per
+/// level.
+fn rows_around(auto: &UIAutomation, el: &UIElement, req: Option<&UICacheRequest>) -> Vec<Ident> {
+    let Ok(walker) = auto.get_control_view_walker() else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut cur = el.clone();
+    for _ in 0..ANCESTORS {
+        let step = match req {
+            Some(r) => walker.get_parent_build_cache(&cur, r).map(|p| (p, true)),
+            None => walker.get_parent(&cur).map(|p| (p, false)),
+        };
+        // The desktop's parent is nothing, which also comes back as an error.
+        let Ok((parent, cached)) = step else { break };
+        let ctrl = control_type(&parent, cached);
+        // No row of a run sits above a window.
+        if ctrl == WINDOW {
+            break;
+        }
+        if rank::collapses(super::role_name(ctrl)) {
+            if let Some(r) = rect(&parent, cached) {
+                out.push((name(&parent, cached), ctrl, r));
+            }
+        }
+        cur = parent;
+    }
+    out
 }

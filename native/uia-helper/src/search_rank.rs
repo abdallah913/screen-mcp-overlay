@@ -248,6 +248,15 @@ pub fn popup_like(caption: bool, tool: bool, topmost: bool, owned: bool, titled:
     !caption && (tool || topmost || owned || !titled)
 }
 
+/// Whether a window is itself a popup rather than an app window, given
+/// whether it is popup-like (above) and a Win32 menu. Popup-like alone is not
+/// enough here: an always-on-top frameless main window passes it. App windows
+/// are what list_windows offers, titled and not tool windows, so a popup is
+/// one that is neither, or a menu.
+pub fn popup_window(like: bool, menu: bool, tool: bool, titled: bool) -> bool {
+    like && (menu || tool || !titled)
+}
+
 /// True when two rects overlap or touch, so a popup on the window's display
 /// counts and a stale one parked on another monitor does not.
 pub fn touches(a: &Rect, b: &Rect) -> bool {
@@ -309,20 +318,33 @@ pub fn gone_reason(exists: bool, minimized: bool, cloaked: bool) -> &'static str
 }
 
 /// HRESULTs that mean the app cannot answer at all, rather than that one call
-/// went wrong: UIA_E_TIMEOUT, UIA_E_ELEMENTNOTAVAILABLE, RPC_E_DISCONNECTED,
-/// CO_E_OBJNOTCONNECTED, and RPC_S_SERVER_UNAVAILABLE / RPC_S_CALL_FAILED as
-/// HRESULTs. After one of these a live retry of the same call costs another
-/// full timeout and gets the same answer.
+/// went wrong: UIA_E_TIMEOUT, RPC_E_DISCONNECTED, CO_E_OBJNOTCONNECTED, and
+/// RPC_S_SERVER_UNAVAILABLE / RPC_S_CALL_FAILED as HRESULTs. After one of
+/// these a live retry of the same call costs another full timeout and gets the
+/// same answer, and so would every other call into that app.
 pub fn unreachable(code: i32) -> bool {
-    const CODES: [u32; 6] = [0x8013_1505, 0x8004_0201, 0x8001_0108, 0x8004_01FD, 0x8007_06BA, 0x8007_06BE];
+    const CODES: [u32; 5] = [0x8013_1505, 0x8001_0108, 0x8004_01FD, 0x8007_06BA, 0x8007_06BE];
     CODES.contains(&(code as u32))
+}
+
+/// UIA_E_ELEMENTNOTAVAILABLE: this one element no longer exists (a row
+/// removed, a popup closed). The app answered, quickly, so it says nothing
+/// about the rest of its controls; but asking again about the same element
+/// gets the same answer.
+pub fn vanished(code: i32) -> bool {
+    code as u32 == 0x8004_0201
+}
+
+/// Whether an ExpandCollapseState (see state_words) shows the children.
+pub fn shows_children(expand: Option<i32>) -> bool {
+    matches!(expand, Some(1) | Some(2))
 }
 
 /// Rows of a long run of list, tree or grid rows a describe keeps before it
 /// skips the rest.
 pub const RUN_KEEP: usize = 8;
 
-fn collapses(role: &str) -> bool {
+pub fn collapses(role: &str) -> bool {
     matches!(role, "listitem" | "treeitem" | "dataitem")
 }
 
@@ -330,9 +352,9 @@ fn collapses(role: &str) -> bool {
 ///
 /// A file list of hundreds of rows used to spend the whole node budget, so the
 /// File name box and the Save button after it were never reached. Past
-/// RUN_KEEP rows of one run, siblings are skipped unwalked, except selected or
-/// focused ones, and the count skipped is reported on the last row kept
-/// before them.
+/// RUN_KEEP rows of one run, siblings are skipped unwalked, except the ones
+/// the walk wants (selected, expanded, focused or holding the focus), and the
+/// count skipped is reported on the last row kept before them.
 #[derive(Default)]
 pub struct Run {
     role: Option<&'static str>,
@@ -535,6 +557,19 @@ mod tests {
     }
 
     #[test]
+    fn only_a_real_popup_is_a_popup_target() {
+        // Win32 #32768 menu, and a WPF or XAML popup (untitled).
+        assert!(popup_window(true, true, true, false));
+        assert!(popup_window(true, false, false, false));
+        // A titled tool-window flyout.
+        assert!(popup_window(true, false, true, true));
+        // An always-on-top frameless main window: popup-like, but an app
+        // window, whose own dropdown covers its controls.
+        assert!(!popup_window(true, false, false, true));
+        assert!(!popup_window(false, false, true, false));
+    }
+
+    #[test]
     fn touching_counts_as_near() {
         let screen = r(0, 0, 1920, 1080);
         assert!(touches(&r(100, 100, 200, 300), &screen));
@@ -576,10 +611,32 @@ mod tests {
     fn timeouts_and_dead_providers_are_not_retried() {
         assert!(unreachable(0x8013_1505u32 as i32));
         assert!(unreachable(0x8001_0108u32 as i32));
-        assert!(unreachable(0x8004_0201u32 as i32));
+        assert!(unreachable(0x8004_01FDu32 as i32));
+        assert!(unreachable(0x8007_06BAu32 as i32));
+        assert!(unreachable(0x8007_06BEu32 as i32));
         // E_FAIL or "not cached" are worth a live read.
         assert!(!unreachable(0x8000_4005u32 as i32));
         assert!(!unreachable(0));
+    }
+
+    #[test]
+    fn a_vanished_element_is_not_an_unreachable_app() {
+        // One row removed or one popup closed must not end the whole walk,
+        // nor silence every other control of that window.
+        assert!(!unreachable(0x8004_0201u32 as i32));
+        assert!(vanished(0x8004_0201u32 as i32));
+        assert!(!vanished(0x8013_1505u32 as i32));
+        assert!(!vanished(0));
+    }
+
+    #[test]
+    fn expanded_and_partly_expanded_show_children() {
+        assert!(shows_children(Some(1)));
+        assert!(shows_children(Some(2)));
+        assert!(!shows_children(Some(0)));
+        // A leaf, and a control without the pattern.
+        assert!(!shows_children(Some(3)));
+        assert!(!shows_children(None));
     }
 
     /// Feeds a run of siblings through `Run`, emitting a row for each one

@@ -75,6 +75,11 @@ struct Request {
     /// chat panel, which the user can see; the overlay itself never covers).
     #[serde(default)]
     hud: Option<String>,
+    /// describe: do not read focus at all, so no row is marked focused or
+    /// kept for being (or holding) the focused control. A 'changes' wait
+    /// compares describes, and focus moving alone must not read as a change.
+    #[serde(default)]
+    ignore_focus: bool,
 }
 
 #[derive(Serialize)]
@@ -181,6 +186,7 @@ fn main() {
                     // Chromium apps bury their content ~19 levels down; a shallow
                     // default silently returns only the window chrome.
                     req.max_depth.unwrap_or(25).clamp(1, 40),
+                    req.ignore_focus,
                 );
                 reply(req.id, r);
             }

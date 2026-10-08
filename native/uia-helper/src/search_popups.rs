@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::model::Rect;
 use crate::windows::{class_of, is_cloaked, rect_of, title_of};
 
-use super::rank::{popup_like, popup_of, touches, PopupLink};
+use super::rank::{popup_like, popup_of, popup_window, touches, PopupLink};
 
 /// More than this many open popups is not a menu chain but stale windows.
 const MAX_POPUPS: usize = 8;
@@ -94,21 +94,15 @@ fn screen_of(hwnd: HWND) -> Option<Rect> {
     Some(Rect { x: m.left, y: m.top, width: m.right - m.left, height: m.bottom - m.top })
 }
 
-unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let search = &mut *(lparam.0 as *mut Search);
-    if search.found.len() >= MAX_POPUPS {
-        return BOOL(0);
-    }
-    if hwnd == search.target || !IsWindowVisible(hwnd).as_bool() || !search.pids.contains(&pid_of(hwnd)) {
-        return TRUE;
-    }
-    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+/// A window that looks like a popup by its styles alone (see popup_like), as
+/// its class and whether it has an owner; None for anything else.
+fn popup_looks(hwnd: HWND) -> Option<(String, bool)> {
+    let (style, ex) = unsafe { (GetWindowLongW(hwnd, GWL_STYLE) as u32, GetWindowLongW(hwnd, GWL_EXSTYLE) as u32) };
     // Click-through windows are decoration (shadows, our own overlay style).
     if ex & WS_EX_TRANSPARENT.0 != 0 || is_cloaked(hwnd) {
-        return TRUE;
+        return None;
     }
-    let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|o| !o.is_invalid());
+    let owned = unsafe { GetWindow(hwnd, GW_OWNER) }.is_ok_and(|o| !o.is_invalid());
     let like = popup_like(
         style & WS_CAPTION.0 == WS_CAPTION.0,
         ex & WS_EX_TOOLWINDOW.0 != 0,
@@ -117,9 +111,26 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
         !title_of(hwnd).trim().is_empty(),
     );
     let class = class_of(hwnd);
-    if !like || NEVER_POPUPS.contains(&class.as_str()) {
+    (like && !NEVER_POPUPS.contains(&class.as_str())).then_some((class, owned))
+}
+
+/// Whether a top-level window is itself a popup (a menu, a dropdown, a
+/// flyout) and not an app window (see popup_window).
+pub fn is_popup(hwnd: HWND) -> bool {
+    let Some((class, _)) = popup_looks(hwnd) else { return false };
+    let tool = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOOLWINDOW.0 != 0;
+    popup_window(true, class == MENU_CLASS, tool, !title_of(hwnd).trim().is_empty())
+}
+
+unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = &mut *(lparam.0 as *mut Search);
+    if search.found.len() >= MAX_POPUPS {
+        return BOOL(0);
+    }
+    if hwnd == search.target || !IsWindowVisible(hwnd).as_bool() || !search.pids.contains(&pid_of(hwnd)) {
         return TRUE;
     }
+    let Some((class, owned)) = popup_looks(hwnd) else { return TRUE };
     let Some(rect) = rect_of(hwnd) else { return TRUE };
     if rect.width <= 0 || rect.height <= 0 {
         return TRUE;

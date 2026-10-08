@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::model::{Coverage, PrintResult, Rect};
-use crate::search::popups::popups_of;
+use crate::search::popups::{is_popup, popups_of};
 use crate::windows::{class_of, is_cloaked, is_elevated, is_hung, rect_of, title_of};
 
 /// PW_RENDERFULLCONTENT: renders DirectComposition surfaces too, which is what
@@ -155,7 +155,7 @@ fn send_bounded(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Deliver
 /// Whether the window's thread answers at all. IsHungAppWindow only trips after
 /// 5 s of silence, so a window that froze a moment ago is caught by a WM_NULL
 /// round trip instead. A UIPI refusal says nothing about responsiveness.
-fn responds(hwnd: HWND) -> bool {
+pub fn responds(hwnd: HWND) -> bool {
     !is_hung(hwnd) && send_bounded(hwnd, WM_NULL, WPARAM(0), LPARAM(0)) != Delivery::NotResponding
 }
 
@@ -437,6 +437,12 @@ fn scroll_outcome(d: Delivery) -> Result<(), String> {
     }
 }
 
+/// The error for a scroll not sent because the window did not answer (see
+/// responds): the same words a scroll that timed out gets.
+pub fn not_scrolled() -> String {
+    scroll_outcome(Delivery::NotResponding).err().unwrap_or_default()
+}
+
 /// Scroll a window by sending it wheel notches, as a user's wheel would.
 ///
 /// Wheel messages go to the window under the cursor in normal use; sending
@@ -517,6 +523,20 @@ fn tally(samples: &[Sample]) -> (f32, bool, Vec<isize>) {
     let fraction = if seen == 0 { 0.0 } else { covered as f32 / seen as f32 };
     let centre = matches!(samples.get(CENTRE), Some(Sample::Other(_)));
     (fraction, centre, by.into_iter().map(|(h, _)| h).collect())
+}
+
+/// What a sample point that landed on top-level window `root` says, for a
+/// target window `target`. `chain` holds the other windows that count as the
+/// target: its own popups, and only while the target is itself a popup (see
+/// covered).
+fn sample_of(root: isize, target: isize, chain: &[isize], desktop: impl FnOnce() -> bool) -> Sample {
+    if root == target || chain.contains(&root) {
+        Sample::Target
+    } else if desktop() {
+        Sample::Nowhere
+    } else {
+        Sample::Other(root)
+    }
 }
 
 fn is_desktop(root: HWND) -> bool {
@@ -618,10 +638,13 @@ fn covering_name(hwnd: HWND, hud: Option<HWND>) -> String {
 /// look at rather than by summing rectangles. Windows of `ignore_pid` (ours)
 /// never count, except `hud`, the chat panel.
 ///
-/// The target's own open menus and dropdowns count as the target: a control
-/// in an open menu is drawn on that menu, and calling the menu a cover would
-/// warn on every menu step and advise bringing the window forward, which
-/// closes the menu.
+/// A control in an open popup is measured against that popup, which the
+/// caller passes as `hwnd`. While the target is a popup, its own other popups
+/// count as the target too: a submenu cascading over its parent menu is the
+/// same open menu, and calling it a cover would advise bringing the window
+/// forward, which closes the menu. A main window's own dropdown is not: an
+/// autocomplete list hanging over the circled Submit button hides it from the
+/// user like any other window, and the user would aim at the list entry.
 pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND>) -> Result<Coverage, String> {
     if !exists(hwnd) {
         return Err(CLOSED.into());
@@ -643,14 +666,13 @@ pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND
     }
 
     let ours = Ours { pid: ignore_pid, hud };
-    let own: Vec<HWND> = popups_of(target).into_iter().map(|(h, _)| h).collect();
+    let chain: Vec<isize> =
+        if is_popup(target) { popups_of(target).into_iter().map(|(h, _)| h.0 as isize).collect() } else { Vec::new() };
     let samples: Vec<Sample> = grid_points(&area)
         .into_iter()
         .map(|(x, y)| match root_at(x, y, ours) {
             None => Sample::Nowhere,
-            Some(root) if root == target || own.contains(&root) => Sample::Target,
-            Some(root) if is_desktop(root) => Sample::Nowhere,
-            Some(root) => Sample::Other(root.0 as isize),
+            Some(root) => sample_of(root.0 as isize, target.0 as isize, &chain, || is_desktop(root)),
         })
         .collect();
 
@@ -752,6 +774,33 @@ mod tests {
         assert_eq!(by, vec![7]);
 
         assert_eq!(tally(&[Sample::Nowhere; 25]), (0.0, false, vec![]));
+    }
+
+    #[test]
+    fn a_main_windows_own_dropdown_covers_its_controls() {
+        // The app's autocomplete list (5) over the circled button of its main
+        // window (1): the target is no popup, so nothing else is the target.
+        let samples: Vec<Sample> = [1, 5, 5].iter().map(|&root| sample_of(root, 1, &[], || false)).collect();
+        assert_eq!(samples, [Sample::Target, Sample::Other(5), Sample::Other(5)]);
+        let (fraction, _, by) = tally(&samples);
+        assert!(fraction > 0.5);
+        assert_eq!(by, vec![5]);
+    }
+
+    #[test]
+    fn a_submenu_over_its_parent_menu_is_the_same_menu() {
+        // Target is the parent menu (2); its cascading submenu (3) is in its
+        // chain, an unrelated window (9) is not.
+        assert_eq!(sample_of(3, 2, &[3], || false), Sample::Target);
+        assert_eq!(sample_of(2, 2, &[3], || false), Sample::Target);
+        assert_eq!(sample_of(9, 2, &[3], || false), Sample::Other(9));
+    }
+
+    #[test]
+    fn bare_desktop_says_nothing() {
+        assert_eq!(sample_of(4, 1, &[], || true), Sample::Nowhere);
+        // The target is never mistaken for the desktop, nor asked about it.
+        assert_eq!(sample_of(1, 1, &[], || panic!("asked")), Sample::Target);
     }
 
     #[test]
