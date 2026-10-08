@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { store } from '../../store.js';
 import { SHAPE_TYPES, guarded, text } from './common.js';
-import { ids, placeAnchored, placeFixed, resolveAnchor } from './anchoring.js';
+import { anchorNotes, ids, placeAnchored, placeFixed, resolveAnchor, stepRange } from './anchoring.js';
 
 /** Drawing: annotate and clear_annotations. */
 
@@ -73,11 +73,15 @@ export function registerDraw(server: McpServer): void {
                 if (args.anchor) {
                     const target = await resolveAnchor(args.anchor);
                     const created = placeAnchored(target, args.shapes, { replace: args.replace, ttlMs: args.ttlMs });
-                    return text(`Drew ${ids(created)} on ${target.label}; they follow it.${ttl}`);
+                    return text(
+                        `Drew ${ids(created)}${stepRange(created)} on ${target.what}; they follow it.${ttl}` +
+                            anchorNotes(target) +
+                            hiddenNote()
+                    );
                 }
                 const { created, display, capture } = placeFixed(args, args.shapes);
                 const from = capture ? ` (from ${capture.id})` : '';
-                return text(`Drew ${ids(created)} on display ${display.id}${from}.${ttl}`);
+                return text(`Drew ${ids(created)}${stepRange(created)} on display ${display.id}${from}.${ttl}${hiddenNote()}`);
             })
     );
 
@@ -91,8 +95,27 @@ export function registerDraw(server: McpServer): void {
         },
         async args => {
             const n = store.clear(args.ids);
-            return text(`Cleared ${n}; ${store.list().length} remain.`);
+            return text(`Cleared ${n}; ${store.list().length} remain.${hiddenNote()}`);
         }
     );
+}
 
+/** How long a target may be gone before the agent is told its drawing is not showing. */
+const HIDDEN_NOTE_MS = 5000;
+
+/**
+ * Drawings whose target has been gone for a while (window minimised or closed,
+ * control rebuilt and not yet re-found). They are kept so they come back with
+ * their target, but meanwhile the user sees nothing, and the agent believes its
+ * guidance is on screen unless something says otherwise.
+ */
+function hiddenNote(): string {
+    const now = Date.now();
+    const gone = store.list().filter(a => a.hidden && a.hiddenSince !== undefined && now - a.hiddenSince > HIDDEN_NOTE_MS);
+    if (gone.length === 0) return '';
+    const secs = Math.round((now - Math.min(...gone.map(a => a.hiddenSince!))) / 1000);
+    return (
+        `\nNote: ${ids(gone)} not showing for ${secs}s: the target is minimised, closed or gone. They come ` +
+        'back if it does; clear_annotations removes them.'
+    );
 }

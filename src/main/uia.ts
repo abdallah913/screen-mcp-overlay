@@ -2,8 +2,8 @@ import { app } from 'electron';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Rect } from '../shared/types.js';
-import { isWindowRef, matchWindow } from '../shared/windows.js';
+import type { AnchorSelector, Rect } from '../shared/types.js';
+import { isWindowRef, pickWindow } from '../shared/windows.js';
 
 /**
  * Client for the Rust UI Automation helper.
@@ -107,15 +107,27 @@ export interface ResolvedRef {
     ref: string;
     rect: Rect | null;
     offscreen?: boolean;
+    /** An element ref from a helper that has since restarted: it names nothing now. */
+    stale?: boolean;
 }
 
-type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
+type Pending = {
+    resolve: (v: unknown) => void;
+    reject: (e: Error) => void;
+    timer: NodeJS.Timeout;
+    sentAt: number;
+};
 
 let child: ChildProcessWithoutNullStreams | null = null;
 let nextId = 1;
 let carry = '';
 let unavailable: string | null = null;
 const pending = new Map<number, Pending>();
+/** When the helper last wrote anything, to tell a wedged helper from a slow queue. */
+let lastOutputAt = 0;
+let lastKillAt = 0;
+/** A wedged helper is restarted at most this often, so a broken app cannot cause a respawn loop. */
+const KILL_INTERVAL_MS = 10_000;
 
 /**
  * Element refs live in the helper's memory. If it dies they all become
@@ -124,6 +136,38 @@ const pending = new Map<number, Pending>();
  * refs the current helper issued lets callers give a real answer instead.
  */
 const liveElementRefs = new Set<string>();
+
+/**
+ * Each helper numbers its refs from el_1, so after a restart an old el_5 and a
+ * new el_5 would be different controls under one name, and a stale anchor
+ * would silently land on whatever the new helper called el_5. Refs are rebased
+ * on the way through so that every ref this process ever handed out is unique:
+ * the helper's el_N is the client's el_{N + refBase}.
+ */
+let refBase = 0;
+let highestRef = 0;
+
+/**
+ * How to find a control again from its ref: the window it was found in plus
+ * its role and either its AutomationId or its name. Filled from every
+ * window-scoped search and describe, so an anchor given as a bare {ref} can be
+ * re-found after a helper restart or a relayout instead of staying hidden.
+ * Bounded, oldest first out.
+ */
+const refSelectors = new Map<string, KnownControl>();
+const SELECTOR_LIMIT = 5000;
+
+/** What was recorded about a ref: how to find it again, and what it was called. */
+export interface KnownControl {
+    selector: AnchorSelector & { role: string };
+    name: string;
+    /**
+     * The top-level window the control actually sits in, when that is a popup
+     * of the searched window (an open menu): what coverage must be measured
+     * against, or the popup would count as covering its own items.
+     */
+    top?: string;
+}
 
 export class StaleRefError extends Error {
     constructor(ref: string) {
@@ -140,11 +184,71 @@ export function isElementRefLive(ref: string): boolean {
     return !ref.startsWith('el_') || liveElementRefs.has(ref);
 }
 
+function remember(
+    e: { ref: string; name: string; role: string; automation_id?: string; window?: string },
+    window: string
+): void {
+    liveElementRefs.add(e.ref);
+    const name = e.name.trim();
+    if (!e.automation_id && !name) return;
+    refSelectors.delete(e.ref);
+    refSelectors.set(e.ref, {
+        // An AutomationId alone, when there is one: it is exact, and a name
+        // alongside it would stop the control being found after a relabel.
+        selector: e.automation_id
+            ? { window, role: e.role, automationId: e.automation_id }
+            : { window, role: e.role, name },
+        name,
+        top: e.window
+    });
+    if (refSelectors.size > SELECTOR_LIMIT) {
+        const oldest = refSelectors.keys().next().value;
+        if (oldest !== undefined) refSelectors.delete(oldest);
+    }
+}
+
+/**
+ * What is known about the control behind a ref, if it was ever seen in a
+ * window-scoped search or describe. Survives helper restarts, unlike the ref.
+ */
+export function knownControl(ref: string): KnownControl | undefined {
+    return refSelectors.get(ref);
+}
+
+/** How to re-find the control behind a ref (see knownControl). */
+export function selectorForRef(ref: string): (AnchorSelector & { role: string }) | undefined {
+    return refSelectors.get(ref)?.selector;
+}
+
 function helperPath(): string {
     // Packaged: alongside the app under resources. Development: the cargo build.
     const packaged = join(process.resourcesPath ?? '', 'uia-helper.exe');
     if (existsSync(packaged)) return packaged;
     return join(app.getAppPath(), 'native', 'uia-helper', 'target', 'release', 'uia-helper.exe');
+}
+
+/** Rewrite every `ref: "el_N"` in a helper response into the client's numbering. */
+function rebase(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(rebase);
+    if (!value || typeof value !== 'object') return value;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+        const m = k === 'ref' && typeof v === 'string' ? /^el_(\d+)$/.exec(v) : null;
+        if (m) {
+            const n = Number(m[1]) + refBase;
+            highestRef = Math.max(highestRef, n);
+            out[k] = `el_${n}`;
+        } else {
+            out[k] = rebase(v);
+        }
+    }
+    return out;
+}
+
+/** The helper's own name for a client ref. Only live refs are ever sent, so they are this helper's. */
+function toHelperRef(ref: string): string {
+    const m = /^el_(\d+)$/.exec(ref);
+    return m ? `el_${Number(m[1]) - refBase}` : ref;
 }
 
 function handleLine(line: string): void {
@@ -160,8 +264,28 @@ function handleLine(line: string): void {
     if (!entry) return;
     pending.delete(msg.id);
     clearTimeout(entry.timer);
-    if (msg.ok) entry.resolve(msg.result);
+    if (msg.ok) entry.resolve(rebase(msg.result));
     else entry.reject(new Error(msg.error ?? 'helper error'));
+}
+
+/**
+ * Forget a helper: fail what it still owes, and drop every ref it issued.
+ * Only acts for the current helper, so a killed one exiting late cannot tear
+ * down its replacement.
+ */
+function teardown(proc: ChildProcessWithoutNullStreams, reason: string): void {
+    if (child !== proc) return;
+    // Fail every in-flight request rather than let callers hang.
+    for (const [, p] of pending) {
+        clearTimeout(p.timer);
+        p.reject(new Error(reason));
+    }
+    pending.clear();
+    // Every el_* ref died with it. Forget them so callers get a clear
+    // "re-run find_ui_elements" rather than a silent empty result.
+    liveElementRefs.clear();
+    child = null;
+    carry = '';
 }
 
 function start(): boolean {
@@ -177,38 +301,47 @@ function start(): boolean {
             'Build it with: cargo build --release --manifest-path native/uia-helper/Cargo.toml';
         return false;
     }
+    let proc: ChildProcessWithoutNullStreams;
     try {
-        child = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+        proc = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     } catch (err) {
         unavailable = `could not start the UI Automation helper: ${(err as Error).message}`;
         return false;
     }
+    child = proc;
+    refBase = highestRef;
 
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', chunk => {
+    proc.stdout.setEncoding('utf8');
+    proc.stdout.on('data', chunk => {
+        if (child !== proc) return;
+        lastOutputAt = Date.now();
         carry += chunk;
         const lines = carry.split('\n');
         carry = lines.pop() ?? '';
         for (const l of lines) handleLine(l);
     });
-    child.on('exit', () => {
-        // Fail every in-flight request rather than let callers hang.
-        for (const [, p] of pending) {
-            clearTimeout(p.timer);
-            p.reject(new Error('the UI Automation helper exited'));
-        }
-        pending.clear();
-        // Every el_* ref died with it. Forget them so callers get a clear
-        // "re-run find_ui_elements" rather than a silent empty result.
-        liveElementRefs.clear();
-        child = null;
-        carry = '';
-    });
-    child.on('error', err => {
+    proc.on('exit', () => teardown(proc, 'the UI Automation helper exited'));
+    proc.on('error', err => {
         unavailable = `UI Automation helper error: ${err.message}`;
     });
     unavailable = null;
     return true;
+}
+
+/**
+ * Called when a request times out. The helper is single-threaded, so one call
+ * into a hung application blocks everything queued behind it and every drawing
+ * on screen hides. Restart it, but only when this is the oldest request in
+ * flight and the helper has said nothing since it was sent: a resolve queued
+ * behind a legitimately slow describe times out too, and must not kill it.
+ */
+function maybeRestart(sentAt: number, isOldest: boolean): void {
+    const proc = child;
+    if (!proc || !isOldest || lastOutputAt >= sentAt) return;
+    if (Date.now() - lastKillAt < KILL_INTERVAL_MS) return;
+    lastKillAt = Date.now();
+    teardown(proc, 'the UI Automation helper stopped responding and was restarted');
+    proc.kill();
 }
 
 export type HelperTransport = (op: string, params: Record<string, unknown>) => Promise<unknown>;
@@ -227,14 +360,18 @@ function send<T>(op: string, params: Record<string, unknown> = {}, timeoutMs = 8
     if (transport) return transport(op, params) as Promise<T>;
     if (!start()) return Promise.reject(new Error(unavailable ?? 'helper unavailable'));
     const id = nextId++;
+    const sentAt = Date.now();
+    const wire = Array.isArray(params.refs) ? { ...params, refs: (params.refs as string[]).map(toHelperRef) } : params;
     return new Promise<T>((resolve, reject) => {
         const timer = setTimeout(() => {
+            const isOldest = Math.min(...pending.keys()) === id;
             pending.delete(id);
             reject(new Error(`UI Automation helper timed out after ${timeoutMs}ms`));
+            maybeRestart(sentAt, isOldest);
         }, timeoutMs);
         timer.unref?.();
-        pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
-        child!.stdin.write(`${JSON.stringify({ id, op, ...params })}\n`);
+        pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer, sentAt });
+        child!.stdin.write(`${JSON.stringify({ id, op, ...wire })}\n`);
     });
 }
 
@@ -252,17 +389,30 @@ export async function listAllWindows(): Promise<WindowInfo[]> {
     return all.filter(w => w.pid !== process.pid);
 }
 
+/** One window's details (title, flags), or undefined if it is gone. */
+export async function windowInfo(ref: string): Promise<WindowInfo | undefined> {
+    return (await listAllWindows()).find(w => w.ref === ref);
+}
+
 /**
  * Turn whatever an agent passed as a window into a ref: a ref as-is (no helper
  * round trip), otherwise a title substring or "foreground", resolved against
- * the live window list. Throws with the open windows listed when nothing
- * matches, so the agent can correct itself without a separate list_windows.
+ * the live window list. When no visible window matches, a minimised one and
+ * then one on another virtual desktop still count, and `note` says so, so the
+ * agent hears "minimized" rather than "not open". Throws with the open windows
+ * listed when nothing matches, so the agent can correct itself without a
+ * separate list_windows.
  */
-export async function resolveWindow(query: string): Promise<string> {
-    if (isWindowRef(query)) return query.trim();
-    const found = matchWindow(query, await listWindows());
+export async function resolveWindowInfo(query: string): Promise<{ ref: string; window?: WindowInfo; note?: string }> {
+    if (isWindowRef(query)) return { ref: query.trim() };
+    const found = pickWindow(query, await listAllWindows());
     if (typeof found === 'string') throw new Error(found);
-    return found.ref;
+    return { ref: found.window.ref, window: found.window, note: found.note };
+}
+
+/** resolveWindowInfo for callers that only need the ref. */
+export async function resolveWindow(query: string): Promise<string> {
+    return (await resolveWindowInfo(query)).ref;
 }
 
 export async function findElements(opts: {
@@ -281,7 +431,10 @@ export async function findElements(opts: {
         { ...rest, automation_id: automationId, include_hidden: includeHidden ?? false },
         15000
     );
-    for (const e of found) liveElementRefs.add(e.ref);
+    for (const e of found) {
+        if (opts.window) remember(e, opts.window);
+        else liveElementRefs.add(e.ref);
+    }
     return found;
 }
 
@@ -296,7 +449,11 @@ export async function describeWindow(opts: {
         { window: opts.window, max_nodes: opts.maxNodes, max_depth: opts.maxDepth },
         20000
     );
-    for (const n of described.nodes) liveElementRefs.add(n.ref);
+    // The root row is the window itself, already addressable by its own ref.
+    for (const n of described.nodes) {
+        if (n.depth > 0) remember(n, opts.window);
+        else liveElementRefs.add(n.ref);
+    }
     return described;
 }
 
@@ -328,7 +485,10 @@ export function printWindow(ref: string, path: string): Promise<{ rect: Rect; fa
 /** The control under a virtual-screen physical point, and its top-level window. Never the overlay. */
 export async function elementAtPoint(x: number, y: number): Promise<PointHit> {
     const hit = await send<PointHit>('element_at_point', { x: Math.round(x), y: Math.round(y), ignore_pid: process.pid }, 4000);
-    if (hit.element) liveElementRefs.add(hit.element.ref);
+    if (hit.element) {
+        if (hit.window) remember(hit.element, hit.window.ref);
+        else liveElementRefs.add(hit.element.ref);
+    }
     return hit;
 }
 
@@ -350,7 +510,7 @@ export async function scrollIntoView(
         { window, name: selector.name, role: selector.role, automation_id: selector.automationId },
         8000
     );
-    liveElementRefs.add(r.element.ref);
+    remember(r.element, window);
     return r;
 }
 
@@ -374,12 +534,18 @@ export function ocrImage(path: string): Promise<OcrLine[]> {
     return send<OcrLine[]>('ocr', { path }, 30000);
 }
 
-/** Re-read current rectangles. The tracker's hot path — keep the timeout short. */
-export function resolveRefs(refs: string[]): Promise<ResolvedRef[]> {
-    if (refs.length === 0) return Promise.resolve([]);
-    const stale = refs.find(r => !isElementRefLive(r));
-    if (stale) return Promise.reject(new StaleRefError(stale));
-    return send<ResolvedRef[]>('resolve', { refs }, 3000);
+/**
+ * Re-read current rectangles. The tracker's hot path — keep the timeout short.
+ *
+ * Refs from a helper that has since restarted are answered locally as stale
+ * rather than sent: the helper would reject the whole batch for one of them,
+ * and one orphaned anchor used to hide every drawing on screen that way.
+ */
+export async function resolveRefs(refs: string[]): Promise<ResolvedRef[]> {
+    const live = refs.filter(isElementRefLive);
+    const answered = live.length > 0 ? await send<ResolvedRef[]>('resolve', { refs: live }, 3000) : [];
+    const byRef = new Map(answered.map(r => [r.ref, r]));
+    return refs.map(ref => byRef.get(ref) ?? { ref, rect: null, stale: !isElementRefLive(ref) || undefined });
 }
 
 export function uiaUnavailableReason(): string | null {
@@ -387,6 +553,8 @@ export function uiaUnavailableReason(): string | null {
 }
 
 export function stopUia(): void {
-    if (child && !child.killed) child.kill();
-    child = null;
+    const proc = child;
+    if (!proc) return;
+    teardown(proc, 'the UI Automation helper was stopped');
+    if (!proc.killed) proc.kill();
 }

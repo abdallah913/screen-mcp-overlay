@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { CaptureRecord, DisplayInfo, Rect } from '../shared/types.js';
 import { clampRectToDisplay, fitScale } from '../shared/geometry.js';
+import { nearlyUniform } from '../shared/windows.js';
 import { store } from './store.js';
 import { compositeGrid } from './imageWorker.js';
 import { printWindow } from './uia.js';
@@ -34,6 +35,14 @@ export function cleanupCaptureDir(): void {
     }
 }
 
+export interface WindowCapture {
+    record: CaptureRecord;
+    /** The raw window rect the image covers, virtual-screen physical, invisible resize border included. */
+    rect: Rect;
+    /** The render is one flat colour: how PrintWindow sees GPU and DirectX surfaces. */
+    blank: boolean;
+}
+
 /**
  * Capture one window's own content, whatever is sitting on top of it.
  *
@@ -42,13 +51,17 @@ export function cleanupCaptureDir(): void {
  * pixels -- which looks correct and gets annotated over confidently. PrintWindow
  * asks the window to draw itself instead, so the result is always the window
  * that was asked for.
+ *
+ * Two ways that can still go wrong are reported rather than hidden: the window
+ * refused to render, so the helper copied the screen (`record.fallback`, and
+ * then whatever covers the window is in the image), or it rendered blank.
  */
 export async function captureWindow(opts: {
     windowRef: string;
     maxDimension: number;
     maxPixels?: number;
     grid: boolean;
-}): Promise<CaptureRecord> {
+}): Promise<WindowCapture> {
     const id = store.nextId('cap');
     const raw = join(captureDir, `${id}-raw.png`);
     const { rect, fallback } = await printWindow(opts.windowRef, raw);
@@ -67,6 +80,7 @@ export async function captureWindow(opts: {
     }
 
     const finalSize = image.getSize();
+    const blank = nearlyUniform(image.toBitmap(), finalSize.width, finalSize.height);
     const path = join(captureDir, `${id}.png`);
     let png = image.toPNG();
     if (opts.grid) png = await compositeGrid(png, gridStep(finalSize));
@@ -102,7 +116,7 @@ export async function captureWindow(opts: {
     };
     store.recordCapture(record);
     pushMessage('system', `Window captured: ${finalSize.width}x${finalSize.height}.`);
-    return record;
+    return { record, rect, blank };
 }
 
 export interface CaptureOptions {

@@ -2,16 +2,33 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CaptureRecord, DisplayInfo, Rect } from '../../../shared/types.js';
 import { DEFAULT_CAPTURE } from '../../../shared/geometry.js';
-import { elementLine, rectText } from '../../../shared/uitree.js';
-import { windowLine } from '../../../shared/windows.js';
+import { clean, elementLine, rectText } from '../../../shared/uitree.js';
+import { windowFlags, windowLine, windowOffsets } from '../../../shared/windows.js';
 import { listDisplays, resolveDisplay } from '../../displays.js';
-import { captureDisplay, captureWindow } from '../../capture.js';
-import { findElements, listWindows, occlusionOf, ocrImage, resolveRefs, resolveWindow } from '../../uia.js';
+import { captureDisplay, captureWindow, type WindowCapture } from '../../capture.js';
+import {
+    findElements,
+    listAllWindows,
+    occlusionOf,
+    ocrImage,
+    resolveRefs,
+    resolveWindowInfo,
+    type OcrLine
+} from '../../uia.js';
 import { toDisplayLocal } from '../../anchors.js';
 import { describeWindowAsText } from '../../describe.js';
+import { missHint } from './anchoring.js';
 import { WINDOW, guarded, regionField, selectorFields, text, type Result } from './common.js';
 
 /** Reading the screen: list_windows, describe_window, find_ui_elements, read_text, capture_screen. */
+
+/**
+ * OCR wants every pixel, with no area cap: downscaling is how a screenshot
+ * saves tokens, but OCR returns text rather than pixels, so shrinking only
+ * costs accuracy -- measured as badly garbled output on a 1568px-wide
+ * full-screen shot. The edge limit only bites beyond a 4K display.
+ */
+const NATIVE = 4096;
 
 /**
  * A window's rectangle as a capture region: its display, and the region in that
@@ -39,6 +56,32 @@ async function windowRegion(ref: string): Promise<{ display: DisplayInfo; region
     };
 }
 
+/**
+ * Resolve a window for reading its pixels. A minimised window has none to read,
+ * so that is an error saying how to get it back rather than a blank image.
+ */
+async function readableWindow(query: string): Promise<{ ref: string; note?: string }> {
+    const w = await resolveWindowInfo(query);
+    if (w.window?.minimized) throw new Error(w.note ?? `window ${w.ref} is minimized: focus_window restores it.`);
+    return w;
+}
+
+/**
+ * Say when "the window's pixels" are really the screen's: then anything on top
+ * of the window is in them, labelled as the window. That is the confident wrong
+ * read that rendering the window itself exists to prevent.
+ */
+async function screenPixelsWarning(window: string, why: string): Promise<string> {
+    const occ = await occlusionOf(window).catch(() => null);
+    if (occ && occ.covered > 0.02) {
+        return (
+            `\nWARNING: ${why}, so this is the screen there, and about ${Math.round(occ.covered * 100)}% of the ` +
+            `window is covered by ${occ.by.slice(0, 3).join(', ')}; those pixels are theirs. focus_window first.`
+        );
+    }
+    return `\nNote: ${why}, so this is the screen there; nothing covered the window.`;
+}
+
 function captureBody(record: CaptureRecord, source: string): string {
     // Worth a few tokens: a downscaled image is the usual reason small text is
     // unreadable, and the fix (a window or region capture) is cheap.
@@ -61,6 +104,46 @@ async function withImage(body: string, record: CaptureRecord, inline: boolean): 
     };
 }
 
+/**
+ * OCR one window, as lines whose rects are offsets from the window's visible
+ * top-left: exactly what an anchor {window} takes, so a drawing on a line
+ * follows the window instead of going stale in screen space.
+ *
+ * Reads the window's own render first, so a window behind another is still
+ * read correctly. A render that failed, fell back to the screen, or came back
+ * blank (GPU surfaces) is replaced by, or treated as, a screen crop, with a
+ * warning naming whatever covers the window.
+ */
+async function readWindow(ref: string): Promise<{ record: CaptureRecord; lines: OcrLine[]; warning: string }> {
+    const shot: WindowCapture | null = await captureWindow({ windowRef: ref, maxDimension: NATIVE, grid: false }).catch(
+        () => null
+    );
+    if (shot && !shot.blank) {
+        const [visible] = await resolveRefs([ref]);
+        const origin = visible?.rect ?? shot.rect;
+        const lines = (await ocrImage(shot.record.path)).map(l => ({
+            text: l.text,
+            rect: windowOffsets(l.rect, shot.record.imageScale, shot.rect, origin)
+        }));
+        const warning = shot.record.fallback
+            ? await screenPixelsWarning(ref, 'the window refused to render itself')
+            : '';
+        return { record: shot.record, lines, warning };
+    }
+
+    const why = shot
+        ? 'the window rendered blank (a GPU surface, which only the screen shows)'
+        : 'the window could not render itself';
+    const { display, region } = await windowRegion(ref);
+    const record = await captureDisplay({ display, region, maxDimension: NATIVE, grid: false });
+    // The crop starts at the window's visible top-left unless the display edge
+    // clipped it, so offset by wherever it really starts.
+    const lines = (await ocrImage(record.path)).map(l => ({
+        text: l.text,
+        rect: windowOffsets(l.rect, record.imageScale, record.regionPhysical, region)
+    }));
+    return { record, lines, warning: await screenPixelsWarning(ref, why) };
+}
 
 export function registerRead(server: McpServer): void {
     // ----------------------------------------------------------------- windows
@@ -76,7 +159,11 @@ export function registerRead(server: McpServer): void {
         },
         () =>
             guarded('list_windows', async () => {
-                const windows = await listWindows();
+                const all = await listAllWindows();
+                const windows = all.filter(w => !w.minimized && !w.cloaked);
+                // Listed apart, because the user cannot see them: answering "not
+                // open" for a minimised app sent agents planning around a closed one.
+                const unseen = all.filter(w => w.minimized || w.cloaked);
                 const displays = listDisplays()
                     .map(
                         d =>
@@ -87,7 +174,13 @@ export function registerRead(server: McpServer): void {
                 const list = windows.length
                     ? `${windows.length} window(s), ref WxH@x,y title:\n${windows.map(windowLine).join('\n')}`
                     : 'No visible windows.';
-                return text(`${list}\ndisplays: ${displays}`);
+                const hidden = unseen.length
+                    ? `\nnot visible (focus_window shows one): ${unseen
+                          .slice(0, 8)
+                          .map(w => `${w.ref} "${clean(w.title).slice(0, 50)}"${windowFlags(w)}`)
+                          .join(', ')}${unseen.length > 8 ? ', …' : ''}`
+                    : '';
+                return text(`${list}\ndisplays: ${displays}${hidden}`);
             })
     );
 
@@ -111,17 +204,19 @@ export function registerRead(server: McpServer): void {
             annotations: { readOnlyHint: true }
         },
         args =>
-            guarded('describe_window', async () =>
-                text(
-                    await describeWindowAsText({
-                        window: await resolveWindow(args.window),
-                        maxNodes: args.maxNodes,
-                        maxDepth: args.maxDepth,
-                        includeRects: args.includeRects,
-                        since: args.since
-                    })
-                )
-            )
+            guarded('describe_window', async () => {
+                const w = await resolveWindowInfo(args.window);
+                const body = await describeWindowAsText({
+                    window: w.ref,
+                    maxNodes: args.maxNodes,
+                    maxDepth: args.maxDepth,
+                    includeRects: args.includeRects,
+                    since: args.since,
+                    info: w.window
+                });
+                // A minimised window's describe already says so in its own words.
+                return text(w.note && !w.window?.minimized ? `Note: ${w.note}\n${body}` : body);
+            })
     );
 
     // ---------------------------------------------------------------- elements
@@ -145,20 +240,23 @@ export function registerRead(server: McpServer): void {
         },
         args =>
             guarded('find_ui_elements', async () => {
-                const found = await findElements({
-                    window: args.window ? await resolveWindow(args.window) : undefined,
-                    name: args.name,
-                    role: args.role,
-                    automationId: args.automationId,
-                    limit: args.limit
-                });
+                const w = args.window ? await resolveWindowInfo(args.window) : undefined;
+                const selector = { name: args.name, role: args.role, automationId: args.automationId };
+                const found = await findElements({ window: w?.ref, ...selector, limit: args.limit });
+                const note = w?.note ? `Note: ${w.note}\n` : '';
                 if (found.length === 0) {
-                    return text(
-                        'No matching controls. If describe_window is empty here too, the app exposes no ' +
-                            'accessibility tree: use read_text or capture_screen.'
-                    );
+                    // A scoped miss can say where the control is hiding, or what
+                    // it is probably called, instead of sending for a describe.
+                    const hint =
+                        w && (args.name || args.automationId)
+                            ? await missHint({ window: w.ref, ...selector }, w.window)
+                            : '';
+                    const fallback =
+                        ' If describe_window is empty here too, the app exposes no accessibility tree: use ' +
+                        'read_text or capture_screen.';
+                    return text(`${note}No matching controls.${hint || fallback}`);
                 }
-                return text(`${found.length} match(es):\n${found.map(elementLine).join('\n')}`);
+                return text(`${note}${found.length} match(es):\n${found.map(elementLine).join('\n')}`);
             })
     );
 
@@ -168,9 +266,8 @@ export function registerRead(server: McpServer): void {
         {
             title: 'Read text off the screen',
             description:
-                'OCR a window or region; returns each line with its rect in the pixels of the capture it ' +
-                'takes, so annotate can point at any line. For canvas, games and remote desktops, where ' +
-                'describe_window is empty.',
+                'OCR a window or region; returns each line with a rect annotate can point at. For canvas, ' +
+                'games and remote desktops, where describe_window is empty.',
             inputSchema: {
                 window: z.string().optional().describe(WINDOW),
                 display: z.string().optional().describe('Display, when not using window.'),
@@ -181,27 +278,32 @@ export function registerRead(server: McpServer): void {
         },
         args =>
             guarded('read_text', async () => {
-                let display = resolveDisplay(args.display, listDisplays());
-                let region = args.region;
-                if (args.window) ({ display, region } = await windowRegion(await resolveWindow(args.window)));
-
-                // Native resolution on purpose. Downscaling is how a screenshot
-                // saves tokens, but OCR returns text rather than pixels, so
-                // shrinking only costs accuracy -- measured as badly garbled
-                // output on a 1568px-wide full-screen shot.
-                const record = await captureDisplay({ display, region, maxDimension: 4096, grid: false });
-
                 const needle = args.contains?.toLowerCase();
-                const lines = (await ocrImage(record.path)).filter(
-                    l => !needle || l.text.toLowerCase().includes(needle)
-                );
-                if (lines.length === 0) {
+                const keep = (l: OcrLine): boolean => !needle || l.text.toLowerCase().includes(needle);
+                const none = needle
+                    ? `No line containing "${args.contains}" was recognised.`
+                    : 'No text was recognised there.';
+
+                if (args.window) {
+                    const w = await readableWindow(args.window);
+                    const { record, lines, warning } = await readWindow(w.ref);
+                    const note = w.note ? `\nNote: ${w.note}` : '';
+                    const hits = lines.filter(keep);
+                    // The warning matters most here: "no text" from the wrong pixels is not "no text".
+                    if (hits.length === 0) return text(none + warning + note);
                     return text(
-                        needle
-                            ? `No line containing "${args.contains}" was recognised.`
-                            : 'No text was recognised there.'
+                        `${hits.length} line(s) in window ${w.ref} (${record.id}). x,y are offsets from the window's ` +
+                            `top-left: annotate with anchor {window:"${w.ref}"} and these numbers so drawings follow it.\n` +
+                            hits.map(l => `${rectText(l.rect)}  ${l.text}`).join('\n') +
+                            warning +
+                            note
                     );
                 }
+
+                const display = resolveDisplay(args.display, listDisplays());
+                const record = await captureDisplay({ display, region: args.region, maxDimension: NATIVE, grid: false });
+                const lines = (await ocrImage(record.path)).filter(keep);
+                if (lines.length === 0) return text(none);
                 return text(
                     `${lines.length} line(s) in ${record.id} (${record.imageSize.width}x${record.imageSize.height}; ` +
                         'annotate in these pixels):\n' +
@@ -256,16 +358,26 @@ export function registerRead(server: McpServer): void {
                 // rectangle returns whatever is drawn there, which is the topmost
                 // window, not necessarily the one that was asked for.
                 if (args.window && !args.asRendered) {
-                    const window = await resolveWindow(args.window);
-                    const record = await captureWindow({ windowRef: window, maxDimension, maxPixels, grid: args.grid });
-                    return withImage(captureBody(record, `window ${window}`), record, args.returnImage);
+                    const w = await readableWindow(args.window);
+                    const shot = await captureWindow({ windowRef: w.ref, maxDimension, maxPixels, grid: args.grid });
+                    let warning = shot.record.fallback
+                        ? await screenPixelsWarning(w.ref, 'the window refused to render itself')
+                        : '';
+                    if (shot.blank) {
+                        warning +=
+                            '\nNote: the window rendered as one flat colour, which is how GPU and DirectX ' +
+                            'surfaces render; asRendered:true crops the screen instead.';
+                    }
+                    const note = w.note ? `\nNote: ${w.note}` : '';
+                    const body = captureBody(shot.record, `window ${w.ref}`) + warning + note;
+                    return withImage(body, shot.record, args.returnImage);
                 }
 
                 let display = resolveDisplay(args.display, listDisplays());
                 let region = args.region;
                 let warning = '';
                 if (args.window) {
-                    const window = await resolveWindow(args.window);
+                    const window = (await readableWindow(args.window)).ref;
                     const occ = await occlusionOf(window).catch(() => null);
                     if (occ && occ.covered > 0.02) {
                         warning =
@@ -280,5 +392,4 @@ export function registerRead(server: McpServer): void {
                 return withImage(captureBody(record, `display ${display.id}`) + warning, record, args.returnImage);
             })
     );
-
 }

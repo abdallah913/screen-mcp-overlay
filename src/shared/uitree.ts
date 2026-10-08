@@ -1,4 +1,4 @@
-import type { SnapshotNode } from './types.js';
+import type { Rect, SnapshotNode } from './types.js';
 
 /**
  * Pure logic for turning a UI Automation tree into text and diffing two of them.
@@ -99,6 +99,13 @@ export function displayDepths(nodes: Pick<RawNode, 'depth'>[]): number[] {
 export function structuralKeys(
     nodes: Pick<RawNode, 'depth' | 'role' | 'name' | 'automation_id'>[]
 ): string[] {
+    return structure(nodes).map(s => s.key);
+}
+
+/** Each node's key, plus its parent's path, which a collapse marker is keyed under. */
+function structure(
+    nodes: Pick<RawNode, 'depth' | 'role' | 'name' | 'automation_id'>[]
+): { key: string; parentPath: string }[] {
     const stack: { depth: number; segment: string }[] = [];
     const childCounts = new Map<string, Map<string, number>>();
 
@@ -117,16 +124,102 @@ export function structuralKeys(
         // An AutomationId is the app's own stable handle, so prefer it over the
         // display name: it survives relabelling and translation.
         const identity = n.automation_id ? `#${n.automation_id}` : clean(n.name);
-        return `${parentPath ? `${parentPath}/` : ''}${n.role}[${index}]:${identity}`;
+        return { key: `${parentPath ? `${parentPath}/` : ''}${n.role}[${index}]:${identity}`, parentPath };
     });
 }
 
-export function toSnapshotNodes(raw: RawNode[]): SnapshotNode[] {
+/**
+ * A snapshot row, or the marker standing in for a collapsed run of list rows:
+ * `more` is how many rows the marker replaces, and its ref is empty.
+ */
+export type TreeRow = SnapshotNode & { more?: number };
+
+/** Roles that come in long, uniform runs: list, tree and grid rows. */
+const RUN_ROLES = new Set(['listitem', 'treeitem', 'dataitem']);
+/** A run longer than this collapses... */
+const RUN_LIMIT = 8;
+/** ...to its first few rows plus a marker. */
+const RUN_SHOWN = 5;
+
+/** A row the user is on. Never collapsed away: it is usually the one that matters. */
+function isCurrent(n: Pick<SnapshotNode, 'state'>): boolean {
+    return /\b(selected|focused)\b/.test(n.state ?? '');
+}
+
+/**
+ * Collapse long runs of same-role list, tree and grid siblings into a marker.
+ *
+ * A file list or a settings tree can spend most of a describe on near-identical
+ * rows, burying the controls after it (a dialog's File name box, its Save
+ * button) under rows nobody asked about. The marker names the search that
+ * recovers any collapsed row, and is keyed by its parent rather than by count,
+ * so a since= diff does not churn when the list grows or shrinks.
+ */
+export function collapseRuns(nodes: TreeRow[], parentPaths: string[]): TreeRow[] {
+    // Group each node's children, in order; -1 is the top level.
+    const children = new Map<number, number[]>();
+    const stack: number[] = [];
+    nodes.forEach((n, i) => {
+        while (stack.length > 0 && nodes[stack[stack.length - 1]!]!.indent >= n.indent) stack.pop();
+        const parent = stack.length > 0 ? stack[stack.length - 1]! : -1;
+        const siblings = children.get(parent);
+        if (siblings) siblings.push(i);
+        else children.set(parent, [i]);
+        stack.push(i);
+    });
+
+    /** Index just past a node's subtree. */
+    const subtreeEnd = (i: number): number => {
+        let j = i + 1;
+        while (j < nodes.length && nodes[j]!.indent > nodes[i]!.indent) j += 1;
+        return j;
+    };
+
+    const dropped = new Set<number>();
+    /** Markers, by the index of the row they follow. */
+    const markers = new Map<number, TreeRow>();
+    for (const kids of children.values()) {
+        let start = 0;
+        while (start < kids.length) {
+            const role = nodes[kids[start]!]!.role;
+            let stop = start + 1;
+            while (stop < kids.length && nodes[kids[stop]!]!.role === role) stop += 1;
+            const run = kids.slice(start, stop);
+            start = stop;
+            if (!RUN_ROLES.has(role) || run.length <= RUN_LIMIT) continue;
+
+            const hidden = run.slice(RUN_SHOWN).filter(i => !isCurrent(nodes[i]!));
+            for (const i of hidden) for (let j = i; j < subtreeEnd(i); j += 1) dropped.add(j);
+            const first = nodes[run[0]!]!;
+            const parentPath = parentPaths[run[0]!] ?? '';
+            markers.set(subtreeEnd(run[run.length - 1]!) - 1, {
+                key: `${parentPath ? `${parentPath}/` : ''}more[${role}]`,
+                indent: first.indent,
+                name: '',
+                role,
+                enabled: true,
+                ref: '',
+                rect: first.rect,
+                more: hidden.length
+            });
+        }
+    }
+
+    const out: TreeRow[] = [];
+    nodes.forEach((n, i) => {
+        if (!dropped.has(i)) out.push(n);
+        const marker = markers.get(i);
+        if (marker) out.push(marker);
+    });
+    return out;
+}
+
+export function toSnapshotNodes(raw: RawNode[]): TreeRow[] {
     const nodes = pruneEchoes(raw);
     const depths = displayDepths(nodes);
-    const keys = structuralKeys(nodes);
-    return nodes.map((n, i) => ({
-        key: keys[i]!,
+    const shape = structure(nodes);
+    const rows: TreeRow[] = nodes.map((n, i) => ({
+        key: shape[i]!.key,
         indent: depths[i]!,
         name: clean(n.name),
         role: n.role,
@@ -135,17 +228,43 @@ export function toSnapshotNodes(raw: RawNode[]): SnapshotNode[] {
         enabled: n.enabled,
         ref: n.ref,
         rect: n.rect,
-        state: n.state,
-        offscreen: n.offscreen,
-        popup: n.popup
+        state: n.state || undefined,
+        offscreen: n.offscreen || undefined,
+        popup: n.popup || undefined
     }));
+    return collapseRuns(rows, shape.map(s => s.parentPath));
 }
 
-export function row(n: SnapshotNode, includeRects: boolean): string {
-    const parts = [`${'  '.repeat(n.indent)}${n.name || '(unnamed)'} [${n.role}]`];
+/** State words as printed: "checked focused". */
+function words(state: string | undefined): string {
+    return (state ?? '')
+        .split(',')
+        .map(w => w.trim())
+        .filter(Boolean)
+        .join(' ');
+}
+
+/** What a row is called in a diff: its name, a popup's mark, or a marker's count. */
+function title(n: TreeRow): string {
+    if (n.more !== undefined) return `… +${n.more} more`;
+    return `${n.popup ? '(popup) ' : ''}${n.name || '(unnamed)'}`;
+}
+
+export function row(n: TreeRow, includeRects: boolean): string {
+    const pad = '  '.repeat(n.indent);
+    if (n.more !== undefined) {
+        return `${pad}… +${n.more} more [${n.role}]; find_ui_elements role:${n.role} name:…`;
+    }
+    // An open menu or dropdown is its own top-level popup, gone the moment the
+    // user clicks elsewhere, so it is worth saying where a row came from.
+    const parts = [`${pad}${title(n)} [${n.role}]`];
     // A text control's value is often its name again.
     if (n.value && n.value !== n.name) parts.push(` "${n.value}"`);
+    const state = words(n.state);
+    if (state) parts.push(` ${state}`);
     if (!n.enabled) parts.push(' disabled');
+    // The rect is real but not where the user can see it: scrolled out of view.
+    if (n.offscreen) parts.push(' offscreen');
     if (n.automationId) parts.push(` id=${n.automationId}`);
     if (includeRects || n.indent === 0) parts.push(`  ${rectText(n.rect)}`);
     if (n.indent > 0) parts.push(`  ${n.ref}`);
@@ -163,15 +282,15 @@ export function elementLine(e: {
     automation_id?: string;
     enabled: boolean;
     rect: { x: number; y: number; width: number; height: number };
+    state?: string;
+    offscreen?: boolean;
 }): string {
+    const state = words(e.state);
     return (
-        `${clean(e.name) || '(unnamed)'} [${e.role}]${e.enabled ? '' : ' disabled'}` +
-        `${e.automation_id ? ` id=${e.automation_id}` : ''}  ${rectText(e.rect)}  ${e.ref}`
+        `${clean(e.name) || '(unnamed)'} [${e.role}]${state ? ` ${state}` : ''}${e.enabled ? '' : ' disabled'}` +
+        `${e.offscreen ? ' offscreen' : ''}${e.automation_id ? ` id=${e.automation_id}` : ''}  ` +
+        `${rectText(e.rect)}  ${e.ref}`
     );
-}
-
-function state(n: SnapshotNode): string {
-    return `${n.value ? `"${n.value}" ` : ''}${n.enabled ? 'enabled' : 'disabled'}`;
 }
 
 /**
@@ -180,9 +299,13 @@ function state(n: SnapshotNode): string {
 const FRAME_ONLY = new Set(['minimize', 'maximize', 'restore', 'close', 'system', 'application']);
 
 /**
- * Explain *why* a tree is thin, because the two failure modes need different
+ * Explain *why* a tree is thin, because the failure modes need different
  * fallbacks and look identical from the node list alone.
  *
+ * - Elevated window: the app runs as administrator (or is protected), and
+ *   Windows' UIPI stops a normal process reading its controls at all. Saying
+ *   "no provider" here sent agents hunting for an accessibility switch that
+ *   does not exist.
  * - Nothing below the window: no accessibility provider is attached at all.
  * - Frame only: a provider answers for the title bar but not the content.
  *   Chromium does this until accessibility is switched on; Qt does it unless the
@@ -192,21 +315,21 @@ const FRAME_ONLY = new Set(['minimize', 'maximize', 'restore', 'close', 'system'
  * content -- Chromium nests one, and treating it as real content was enough to
  * stop this firing on exactly the tree it was written for.
  */
-export function diagnoseTree(nodes: SnapshotNode[]): string | null {
+export function diagnoseTree(nodes: SnapshotNode[], window: { elevated?: boolean } = {}): string | null {
     const root = nodes[0];
     const content = nodes.filter(n => n.indent > 0);
+    const rootName = root ? root.name.trim().toLowerCase() : '';
+    const meaningful = content.filter(n => {
+        const name = n.name.trim().toLowerCase();
+        return name !== '' && name !== rootName && !FRAME_ONLY.has(name);
+    });
+    if (meaningful.length === 0 && window.elevated) return elevatedNote();
     if (content.length === 0) {
         return (
             'Only the window itself is exposed — no accessibility provider is answering for its ' +
             'content. Use read_text (OCR) for this window, or capture_screen if you need to see it.'
         );
     }
-
-    const rootName = root ? root.name.trim().toLowerCase() : '';
-    const meaningful = content.filter(n => {
-        const name = n.name.trim().toLowerCase();
-        return name !== '' && name !== rootName && !FRAME_ONLY.has(name);
-    });
     if (meaningful.length === 0) {
         return (
             'Only the window frame is exposed (title bar and a wrapper), not the application ' +
@@ -220,8 +343,61 @@ export function diagnoseTree(nodes: SnapshotNode[]): string | null {
     return null;
 }
 
+/** Why an elevated window reads as empty, and what still works on it. */
+export function elevatedNote(): string {
+    return (
+        'This window runs as administrator (or is protected), so Windows blocks reading its controls ' +
+        '(UIPI); nothing is wrong with the app. read_text (OCR) still reads it, and drawings anchored ' +
+        'to the window itself still follow it.'
+    );
+}
+
+/** State that matters in a diff. Focus moves with every click, so it is left out as churn. */
+function steady(state: string | undefined): string {
+    return words(state)
+        .split(' ')
+        .filter(w => w && w !== 'focused')
+        .join(' ');
+}
+
+/**
+ * How a row changed, naming only what differs on each side:
+ * `unchecked -> checked`, `"abc" -> "abcdef"`, `enabled -> disabled`.
+ */
+function change(old: TreeRow, n: TreeRow): string | null {
+    const before: string[] = [];
+    const after: string[] = [];
+    if ((old.value ?? '') !== (n.value ?? '')) {
+        before.push(`"${old.value ?? ''}"`);
+        after.push(`"${n.value ?? ''}"`);
+    }
+    const s0 = steady(old.state);
+    const s1 = steady(n.state);
+    if (s0 !== s1) {
+        // "selected" losing its word reads better as "not selected" than as nothing.
+        before.push(s0 || `not ${s1}`);
+        after.push(s1 || `not ${s0}`);
+    }
+    if (old.enabled !== n.enabled) {
+        before.push(old.enabled ? 'enabled' : 'disabled');
+        after.push(n.enabled ? 'enabled' : 'disabled');
+    }
+    return before.length > 0 ? `${before.join(' ')} -> ${after.join(' ')}` : null;
+}
+
+/** A new row as a diff prints it: the describe row's words, without the indent. */
+function added(n: TreeRow): string {
+    if (n.more !== undefined) return `+ ${title(n)} [${n.role}]`;
+    const value = n.value && n.value !== n.name ? ` "${n.value}"` : '';
+    const state = words(n.state);
+    return (
+        `+ ${title(n)} [${n.role}]${value}${state ? ` ${state}` : ''}${n.enabled ? '' : ' disabled'}` +
+        `${n.offscreen ? ' offscreen' : ''}  ${n.ref}`
+    );
+}
+
 /** Lines describing what changed, or null when the two snapshots match. */
-export function diffLines(before: SnapshotNode[], after: SnapshotNode[]): string[] | null {
+export function diffLines(before: TreeRow[], after: TreeRow[]): string[] | null {
     const prev = new Map(before.map(n => [n.key, n]));
     const next = new Map(after.map(n => [n.key, n]));
     const out: string[] = [];
@@ -229,13 +405,103 @@ export function diffLines(before: SnapshotNode[], after: SnapshotNode[]): string
     for (const n of after) {
         const old = prev.get(n.key);
         if (!old) {
-            out.push(`+ ${n.name || '(unnamed)'} [${n.role}] ${state(n)}  ${n.ref}`);
-        } else if (old.value !== n.value || old.enabled !== n.enabled) {
-            out.push(`~ ${n.name || '(unnamed)'} [${n.role}] ${state(old)} -> ${state(n)}  ${n.ref}`);
+            out.push(added(n));
+            continue;
         }
+        const what = change(old, n);
+        if (what) out.push(`~ ${title(n)} [${n.role}] ${what}  ${n.ref}`);
     }
     for (const n of before) {
-        if (!next.has(n.key)) out.push(`- ${n.name || '(unnamed)'} [${n.role}]`);
+        if (!next.has(n.key)) out.push(`- ${title(n)} [${n.role}]`);
     }
     return out.length > 0 ? out : null;
+}
+
+// ------------------------------------------------------------ name matching
+
+/**
+ * A label reduced to what a person reads: no case, no `&` mnemonic markers, no
+ * trailing ellipsis, and nothing after a tab (where menus put the shortcut).
+ */
+export function labelKey(s: string): string {
+    const head = s.split('\t')[0] ?? '';
+    return clean(head.replace(/&(.)/g, '$1').replace(/(\.\.\.|…)\s*$/, '')).toLowerCase();
+}
+
+/** 0 exact, 1 starts with, 2 contains, 3 not at all. */
+export function nameTier(name: string, wanted: string): number {
+    const have = labelKey(name);
+    const want = labelKey(wanted);
+    if (have === want) return 0;
+    if (have.startsWith(want)) return 1;
+    return have.includes(want) ? 2 : 3;
+}
+
+export interface Candidate {
+    name: string;
+    automation_id?: string;
+    enabled: boolean;
+    rect: Rect;
+    offscreen?: boolean;
+}
+
+const inside = (r: Rect, outer: Rect): boolean =>
+    r.x >= outer.x && r.y >= outer.y && r.x + r.width <= outer.x + outer.width && r.y + r.height <= outer.y + outer.height;
+
+/**
+ * Order matches for "the control this label names".
+ *
+ * The helper returns substring matches in tree order, so name "Save" used to
+ * circle "Save as…" or "Autosave" whenever it came first, while the caption said
+ * "Click Save". An AutomationId match comes first, then the exact label, then
+ * one that starts with it, then one that merely contains it. Ties go to the
+ * control the user can act on: enabled, in view, inside the window, and the
+ * smaller one, since a big container named like its button is rarely the target.
+ */
+export function rankMatches<T extends Candidate>(
+    matches: T[],
+    wanted: { name?: string; automationId?: string },
+    within?: Rect
+): T[] {
+    const score = (m: T): number[] => [
+        wanted.automationId && m.automation_id === wanted.automationId ? 0 : 1,
+        wanted.name ? nameTier(m.name, wanted.name) : 0,
+        m.enabled ? 0 : 1,
+        m.offscreen ? 1 : 0,
+        within && !inside(m.rect, within) ? 1 : 0,
+        m.rect.width * m.rect.height
+    ];
+    const scored = matches.map((m, i) => ({ m, s: score(m), i }));
+    scored.sort((a, b) => {
+        for (let k = 0; k < a.s.length; k += 1) if (a.s[k] !== b.s[k]) return a.s[k]! - b.s[k]!;
+        return a.i - b.i;
+    });
+    return scored.map(x => x.m);
+}
+
+/**
+ * Whether a ranked choice needs a second look: other matches exist and the
+ * first is not the only exact label among them. An exact "Save" beside "Save
+ * as…" is not ambiguous; two exact "Save"s, or only partial matches, are.
+ */
+export function isAmbiguous(ranked: Candidate[], wanted: { name?: string; automationId?: string }): boolean {
+    if (ranked.length < 2 || !wanted.name || wanted.automationId) return false;
+    const exact = ranked.filter(m => nameTier(m.name, wanted.name!) === 0).length;
+    return exact !== 1 || nameTier(ranked[0]!.name, wanted.name) !== 0;
+}
+
+/**
+ * Where a control sits in its window, in the words a person would use:
+ * "top-left", "bottom", "centre". Null when it lies outside the window.
+ */
+export function whereIn(r: Rect, win: Rect): string | null {
+    const cx = r.x + r.width / 2;
+    const cy = r.y + r.height / 2;
+    if (cx < win.x || cy < win.y || cx > win.x + win.width || cy > win.y + win.height) return null;
+    const third = (v: number, start: number, size: number): 0 | 1 | 2 =>
+        v < start + size / 3 ? 0 : v > start + (size * 2) / 3 ? 2 : 1;
+    const vertical = ['top', '', 'bottom'][third(cy, win.y, win.height)]!;
+    const horizontal = ['left', '', 'right'][third(cx, win.x, win.width)]!;
+    if (!vertical && !horizontal) return 'centre';
+    return vertical && horizontal ? `${vertical}-${horizontal}` : vertical || horizontal;
 }
