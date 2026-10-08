@@ -122,13 +122,30 @@ Just ask, in whatever agent you connected:
 - *"Walk me through exporting this as a PNG — highlight each button before I click it."*
 - *"I'm lost in these settings. Point at the one that controls autosave."*
 
-The agent draws on your screen and waits for you between steps.
+The agent draws on your screen and waits for you between steps. You keep using your apps normally: the
+circle shows where to click, and the agent notices when you've done it.
+
+While a step is waiting for you, a small **step strip** on screen (and a card in the chat panel) shows
+the instruction, how far along you are ("2 of 5") and three buttons, so you can answer the agent even
+when it's running in a terminal you aren't looking at:
+
+- **Done**: you did it. The agent checks, and moves on.
+- **Can't find it**: the agent shows you where it is, or explains another way.
+- **Skip**: move on without this step.
+
+You can also type a reply in the panel while a step is waiting; it goes straight to the agent.
 
 | Shortcut | Action |
 |---|---|
 | `Ctrl+Shift+O` | Show / hide the chat panel |
-| `Ctrl+Shift+X` | Clear everything drawn on screen |
-| `Escape` | Cancel a pending click request |
+| `Ctrl+Shift+X` | Clear everything drawn on screen and stop the current step |
+| `Ctrl+Shift+F9` | Done (only while a step is waiting) |
+| `Ctrl+Shift+F10` | Can't find it (only while a step is waiting) |
+| `Escape` | Cancel, while the agent has asked you to click somewhere |
+
+The step keys are registered only while a step is waiting, and can be changed in
+`%APPDATA%\screen-mcp-overlay\settings.json` (`stepKeys`). The tray menu also has **Read steps aloud**
+and **Sound cues**.
 
 There's also a **built-in chat panel** (bottom-right, draggable) if you'd rather not switch to a
 terminal, which can **follow** a Claude Code conversation you already have open in VS Code so you see
@@ -149,12 +166,12 @@ works the same either way.
 | `capture_screen` | Screenshot to disk. Renders a single window correctly even when covered |
 | `annotate` | Draw `box`, `highlight`, `circle`, `arrow`, `label`, `step`, `spotlight` |
 | `clear_annotations` | Remove some or all drawings |
-| `highlight_and_wait` | One walkthrough step: circle a control, wait until the user has done it, clear |
+| `highlight_and_wait` | One walkthrough step: circle a control, wait until the user has done it. Takes a whole plan too |
 | `wait_for_element` | Block until a control appears, disappears or becomes enabled |
 | `wait_for_user_click` | Ask the user to point at something, get the coordinates back |
 | `focus_window` | Bring a window to the front. Does not click or type |
-| `scroll_window` | Scroll a window to reveal content |
-| `show_message` | Post a line into the overlay panel, and optionally say it out loud |
+| `scroll_window` | Scroll a window, or bring a named control into view |
+| `show_message` | Tell the user something, say it out loud, or ask a multiple-choice question |
 
 Any `window` argument takes a ref, a **title substring** (`"Notepad"`) or `"foreground"`, so an agent
 rarely needs `list_windows` first. Drawings can be **anchored** to a window or a control
