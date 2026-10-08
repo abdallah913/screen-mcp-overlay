@@ -17,18 +17,41 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::model::Rect;
 use crate::windows::{class_of, is_cloaked, rect_of, title_of};
 
-use super::rank::{popup_like, touches};
+use super::rank::{popup_like, popup_of, touches, PopupLink};
 
 /// More than this many open popups is not a menu chain but stale windows.
 const MAX_POPUPS: usize = 8;
 
 /// Classes that are visible, captionless and same-process but never content:
-/// tooltips, and the drop shadows Windows draws under menus.
-const NEVER_POPUPS: &[&str] = &["tooltips_class32", "SysShadow"];
+/// tooltips, the drop shadows Windows draws under menus, and the shell's own
+/// surfaces (taskbars, the desktop and its icon host, the tray overflow, the
+/// taskbar's thumbnails), which share explorer.exe with every File Explorer
+/// window.
+const NEVER_POPUPS: &[&str] = &[
+    "tooltips_class32",
+    "SysShadow",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "Progman",
+    "WorkerW",
+    "NotifyIconOverflowWindow",
+    "TopLevelWindowForOverflowXamlIsland",
+    "TaskListThumbnailWnd",
+];
+
+/// The class of a Win32 menu window.
+const MENU_CLASS: &str = "#32768";
+
+/// Owner links followed when asking whether the target owns a window.
+const OWNER_HOPS: usize = 8;
 
 struct Search {
     target: HWND,
     pids: Vec<u32>,
+    /// The target's thread, and its hosted UWP content's: a Win32 menu is
+    /// created by the thread whose window opened it.
+    threads: Vec<u32>,
+    target_rect: Option<Rect>,
     screen: Option<Rect>,
     found: Vec<(HWND, Rect)>,
 }
@@ -37,6 +60,27 @@ pub fn pid_of(hwnd: HWND) -> u32 {
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     pid
+}
+
+fn thread_of(hwnd: HWND) -> u32 {
+    unsafe { GetWindowThreadProcessId(hwnd, None) }
+}
+
+/// Whether `target` owns `hwnd`, directly or up the owner chain.
+fn owned_by(hwnd: HWND, target: HWND) -> bool {
+    let mut cur = hwnd;
+    for _ in 0..OWNER_HOPS {
+        match unsafe { GetWindow(cur, GW_OWNER) } {
+            Ok(owner) if !owner.is_invalid() => {
+                if owner == target {
+                    return true;
+                }
+                cur = owner;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The monitor the window is on, as a rect.
@@ -72,7 +116,8 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
         owned,
         !title_of(hwnd).trim().is_empty(),
     );
-    if !like || NEVER_POPUPS.contains(&class_of(hwnd).as_str()) {
+    let class = class_of(hwnd);
+    if !like || NEVER_POPUPS.contains(&class.as_str()) {
         return TRUE;
     }
     let Some(rect) = rect_of(hwnd) else { return TRUE };
@@ -83,6 +128,13 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
         if !touches(&rect, screen) {
             return TRUE;
         }
+    }
+    let link = PopupLink {
+        menu_of_its_thread: class == MENU_CLASS && search.threads.contains(&thread_of(hwnd)),
+        owned: owned && owned_by(hwnd, search.target),
+    };
+    if !popup_of(link, &rect, search.target_rect.as_ref(), search.screen.as_ref()) {
+        return TRUE;
     }
     search.found.push((hwnd, rect));
     TRUE
@@ -95,16 +147,25 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
 /// the app itself, so the hosted CoreWindow's process counts too.
 pub fn popups_of(window: HWND) -> Vec<(HWND, Rect)> {
     let mut pids = vec![pid_of(window)];
+    let mut threads = vec![thread_of(window)];
     if let Ok(core) = unsafe { FindWindowExW(Some(window), None, w!("Windows.UI.Core.CoreWindow"), None) } {
         let hosted = pid_of(core);
         if hosted != 0 && !pids.contains(&hosted) {
             pids.push(hosted);
         }
+        threads.push(thread_of(core));
     }
     if pids[0] == 0 {
         return Vec::new();
     }
-    let mut search = Search { target: window, pids, screen: screen_of(window), found: Vec::new() };
+    let mut search = Search {
+        target: window,
+        pids,
+        threads,
+        target_rect: rect_of(window),
+        screen: screen_of(window),
+        found: Vec::new(),
+    };
     // EnumWindows reports an error when the callback stops it early, which is
     // how the cap works; whatever was collected is still the answer.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize)) };

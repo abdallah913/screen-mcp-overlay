@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::model::{Coverage, PrintResult, Rect};
+use crate::search::popups::popups_of;
 use crate::windows::{class_of, is_cloaked, is_elevated, is_hung, rect_of, title_of};
 
 /// PW_RENDERFULLCONTENT: renders DirectComposition surfaces too, which is what
@@ -512,7 +513,7 @@ fn tally(samples: &[Sample]) -> (f32, bool, Vec<isize>) {
         }
     }
     // A stable sort keeps first-met order among equals.
-    by.sort_by(|a, b| b.1.cmp(&a.1));
+    by.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
     let fraction = if seen == 0 { 0.0 } else { covered as f32 / seen as f32 };
     let centre = matches!(samples.get(CENTRE), Some(Sample::Other(_)));
     (fraction, centre, by.into_iter().map(|(h, _)| h).collect())
@@ -527,8 +528,25 @@ fn contains(r: &Rect, x: i32, y: i32) -> bool {
     x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height
 }
 
+/// Which of our own windows can cover a target: none but the chat panel.
+#[derive(Clone, Copy)]
+struct Ours {
+    pid: u32,
+    hud: Option<HWND>,
+}
+
+impl Ours {
+    /// One of our windows that never covers anything: the overlay is drawn
+    /// for the user on top of their apps, so counting it would report every
+    /// target as covered. The chat panel is opaque, and a target under it
+    /// really is out of sight.
+    fn ignored(&self, hwnd: HWND) -> bool {
+        self.pid != 0 && pid_of(hwnd) == self.pid && Some(hwnd) != self.hud
+    }
+}
+
 /// Whether a window can hide what is beneath it from the user's eyes.
-fn can_cover(hwnd: HWND, ignore_pid: u32) -> bool {
+fn can_cover(hwnd: HWND, ours: Ours) -> bool {
     let shown = unsafe {
         IsWindowVisible(hwnd).as_bool()
             && !IsIconic(hwnd).as_bool()
@@ -536,16 +554,17 @@ fn can_cover(hwnd: HWND, ignore_pid: u32) -> bool {
             // hit-tested, matching what WindowFromPoint skips.
             && GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 == 0
     };
-    shown && !is_cloaked(hwnd) && !(ignore_pid != 0 && pid_of(hwnd) == ignore_pid)
+    shown && !is_cloaked(hwnd) && !ours.ignored(hwnd)
 }
 
-/// The top-level window that owns what is drawn at a point, never one of ours.
+/// The top-level window that owns what is drawn at a point, never one of ours
+/// but the chat panel.
 ///
 /// WindowFromPoint already skips click-through windows, which is what our
-/// overlay is outside click mode. When it still lands on one of our windows
-/// (the overlay in click mode, the chat panel), the Z order below that window
-/// is walked for the first one that contains the point.
-pub fn root_at(x: i32, y: i32, ignore_pid: u32) -> Option<HWND> {
+/// overlay is outside click mode. When it still lands on one of our ignored
+/// windows (the overlay in click mode), the Z order below that window is
+/// walked for the first one that contains the point.
+fn root_at(x: i32, y: i32, ours: Ours) -> Option<HWND> {
     let pt = POINT { x, y };
     unsafe {
         if MonitorFromPoint(pt, MONITOR_DEFAULTTONULL).is_invalid() {
@@ -557,22 +576,29 @@ pub fn root_at(x: i32, y: i32, ignore_pid: u32) -> Option<HWND> {
         }
         let root = GetAncestor(hit, GA_ROOT);
         let mut root = if root.is_invalid() { hit } else { root };
-        if !(ignore_pid != 0 && pid_of(root) == ignore_pid) {
+        if !ours.ignored(root) {
             return Some(root);
         }
         loop {
             root = GetWindow(root, GW_HWNDNEXT).ok().filter(|h| !h.is_invalid())?;
-            if can_cover(root, ignore_pid) && rect_of(root).is_some_and(|r| contains(&r, x, y)) {
+            if can_cover(root, ours) && rect_of(root).is_some_and(|r| contains(&r, x, y)) {
                 return Some(root);
             }
         }
     }
 }
 
+/// What the chat panel is called when it covers a target. Its window title is
+/// the app's name, which would read as some other program.
+const HUD_NAME: &str = "the overlay's chat panel";
+
 /// A name the user would recognise for a covering window. Menus and dropdowns
 /// have no title of their own, so they take their owner's ("a popup of Paint"
 /// reads better than a class name).
-fn covering_name(hwnd: HWND) -> String {
+fn covering_name(hwnd: HWND, hud: Option<HWND>) -> String {
+    if Some(hwnd) == hud {
+        return HUD_NAME.to_string();
+    }
     let title = title_of(hwnd);
     if !title.trim().is_empty() {
         return title;
@@ -589,8 +615,14 @@ fn covering_name(hwnd: HWND) -> String {
 
 /// How much of `rect` (virtual-screen physical; the whole window when None) is
 /// hidden behind other top-level windows, measured at the points the user would
-/// look at rather than by summing rectangles. Our own windows never count.
-pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, _hud: Option<HWND>) -> Result<Coverage, String> {
+/// look at rather than by summing rectangles. Windows of `ignore_pid` (ours)
+/// never count, except `hud`, the chat panel.
+///
+/// The target's own open menus and dropdowns count as the target: a control
+/// in an open menu is drawn on that menu, and calling the menu a cover would
+/// warn on every menu step and advise bringing the window forward, which
+/// closes the menu.
+pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND>) -> Result<Coverage, String> {
     if !exists(hwnd) {
         return Err(CLOSED.into());
     }
@@ -610,11 +642,13 @@ pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, _hud: Option<HWN
         return Err("that area is empty".into());
     }
 
+    let ours = Ours { pid: ignore_pid, hud };
+    let own: Vec<HWND> = popups_of(target).into_iter().map(|(h, _)| h).collect();
     let samples: Vec<Sample> = grid_points(&area)
         .into_iter()
-        .map(|(x, y)| match root_at(x, y, ignore_pid) {
+        .map(|(x, y)| match root_at(x, y, ours) {
             None => Sample::Nowhere,
-            Some(root) if root == target => Sample::Target,
+            Some(root) if root == target || own.contains(&root) => Sample::Target,
             Some(root) if is_desktop(root) => Sample::Nowhere,
             Some(root) => Sample::Other(root.0 as isize),
         })
@@ -623,7 +657,7 @@ pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, _hud: Option<HWN
     let (fraction, centre_covered, by) = tally(&samples);
     let mut names: Vec<String> = Vec::new();
     for h in by {
-        let name = covering_name(HWND(h as *mut std::ffi::c_void));
+        let name = covering_name(HWND(h as *mut std::ffi::c_void), hud);
         if !names.contains(&name) {
             names.push(name);
         }

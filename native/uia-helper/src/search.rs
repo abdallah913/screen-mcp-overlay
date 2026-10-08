@@ -1,31 +1,34 @@
 //! UI Automation queries: searching, describing and re-resolving controls.
 
 #[path = "search_popups.rs"]
-mod popups;
+pub mod popups;
 #[path = "search_props.rs"]
 mod props;
 #[path = "search_rank.rs"]
 mod rank;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use uiautomation::core::{UICacheRequest, UICondition};
-use uiautomation::patterns::UIScrollItemPattern;
-use uiautomation::types::{Handle, Point, TreeScope, UIProperty};
+use uiautomation::patterns::{UIScrollItemPattern, UIScrollPattern};
+use uiautomation::types::{Handle, Point, ScrollAmount, TreeScope, UIProperty};
 use uiautomation::variants::Variant;
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
+use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, POINT};
-use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, IsIconic, IsWindowVisible, WindowFromPoint, GA_ROOT};
+use windows::Win32::UI::Accessibility::{IUIAutomation, IUIAutomation2};
+use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, IsIconic, IsWindow, IsWindowVisible, WindowFromPoint, GA_ROOT};
 
 use crate::model::{
     ContainerInfo, Described, DescribedNode, ElementInfo, PointHit, Rect, Resolved, ScrollIntoView, Scrolled,
     Suggestion, WindowRef,
 };
-use crate::windows::{rect_of, title_of};
+use crate::windows::{is_cloaked, is_hung, rect_of, title_of};
 
 use props::Focus;
-use rank::Rank;
+use rank::{Nudge, Rank};
 
 /// Every UIA control type, under the short name agents use for it.
 ///
@@ -146,6 +149,22 @@ const EXTRA_WALK_TIME: Duration = Duration::from_millis(400);
 const UNVISITED_NAMES: usize = 5;
 const UNVISITED_READS: usize = 20;
 
+/// UI Automation's per-call timeout in the ops the client gives least time:
+/// a whole resolve batch gets 3 s and element_at_point 4 s, and an overrun
+/// restarts the helper, losing every ref. A call into a window that has just
+/// frozen must fail well inside that, rather than at the bound the helper
+/// sets for everything else.
+const HOT_CALL_TIMEOUT_MS: u32 = 1000;
+
+/// Scroll steps scroll_into_view takes toward a control that cannot scroll
+/// itself into view, at most.
+const SCROLL_STEPS: usize = 15;
+
+/// How long a wheel scroll gets to finish animating before its new position
+/// is read, and how often the position is polled meanwhile.
+const SCROLL_SETTLE: Duration = Duration::from_millis(400);
+const SCROLL_POLL: Duration = Duration::from_millis(50);
+
 /// A cached element, the tick it was last used, and the top-level window it
 /// was found in (0 when unknown): its rect is judged against that window's.
 pub struct Entry {
@@ -212,7 +231,7 @@ fn parse_window(w: &str) -> Result<isize, String> {
 /// with the real reason instead of failing slowly with a misleading one.
 fn readable_window(w: &str) -> Result<isize, String> {
     let raw = parse_window(w)?;
-    if crate::windows::is_hung(hwnd_of(raw)) {
+    if is_hung(hwnd_of(raw)) {
         return Err(format!(
             "window {w} is not responding, so its controls cannot be read until it recovers"
         ));
@@ -220,15 +239,100 @@ fn readable_window(w: &str) -> Result<isize, String> {
     Ok(raw)
 }
 
-/// Ok(None) when a navigation or search found nothing, Err when the call
-/// itself failed. UIA reports "no such element" as a null result, which
-/// windows-rs turns into an error with an S_OK code.
-fn found(r: uiautomation::Result<UIElement>) -> Result<Option<UIElement>, ()> {
+/// Holds UI Automation's per-call timeout at a tighter bound while it lives,
+/// and puts the previous one back after. Never loosens it, and does nothing
+/// without IUIAutomation2 (older systems keep the defaults, as in main).
+struct CallBound {
+    auto2: Option<IUIAutomation2>,
+    was: u32,
+}
+
+impl CallBound {
+    fn new(auto: &UIAutomation, ms: u32) -> CallBound {
+        let auto2 = AsRef::<IUIAutomation>::as_ref(auto).cast::<IUIAutomation2>().ok();
+        let was = auto2.as_ref().and_then(|a| unsafe { a.TransactionTimeout() }.ok());
+        match (auto2, was) {
+            (Some(a), Some(was)) if was > ms && unsafe { a.SetTransactionTimeout(ms) }.is_ok() => {
+                CallBound { auto2: Some(a), was }
+            }
+            _ => CallBound { auto2: None, was: 0 },
+        }
+    }
+}
+
+impl Drop for CallBound {
+    fn drop(&mut self) {
+        if let Some(a) = &self.auto2 {
+            let _ = unsafe { a.SetTransactionTimeout(self.was) };
+        }
+    }
+}
+
+/// Ok(None) when a navigation or search found nothing, Err with the HRESULT
+/// when the call itself failed. UIA reports "no such element" as a null
+/// result, which windows-rs turns into an error with an S_OK code.
+fn found(r: uiautomation::Result<UIElement>) -> Result<Option<UIElement>, i32> {
     match r {
         Ok(el) => Ok(Some(el)),
         Err(e) if e.code() == 0 => Ok(None),
-        Err(_) => Err(()),
+        Err(e) => Err(e.code()),
     }
+}
+
+/// Why a target's top-level window shows nothing of it (see
+/// rank::gone_reason); "gone" when the window is unknown.
+fn gone_reason(top: isize) -> &'static str {
+    if top == 0 {
+        return "gone";
+    }
+    let h = hwnd_of(top);
+    rank::gone_reason(unsafe { IsWindow(Some(h)) }.as_bool(), unsafe { IsIconic(h) }.as_bool(), is_cloaked(h))
+}
+
+/// The element's ScrollPattern, when it scrolls vertically.
+fn vertical_scroller(el: &UIElement) -> Option<UIScrollPattern> {
+    let p: UIScrollPattern = el.get_pattern().ok()?;
+    p.is_vertically_scrollable().unwrap_or(false).then_some(p)
+}
+
+/// Vertical scroll position 0..100, or None when it does not scroll (UIA
+/// reports -1 then).
+fn vertical_percent(p: &UIScrollPattern) -> Option<f64> {
+    p.get_vertical_scroll_percent().ok().filter(|v| (0.0..=100.0).contains(v))
+}
+
+/// One scroll step along an axis: a page while far off, a line once a page
+/// has overshot.
+fn scroll_amount(n: Nudge, can: bool, fine: bool) -> ScrollAmount {
+    match (n, can, fine) {
+        (Nudge::Stay, _, _) | (_, false, _) => ScrollAmount::NoAmount,
+        (Nudge::Back, true, false) => ScrollAmount::LargeDecrement,
+        (Nudge::Back, true, true) => ScrollAmount::SmallDecrement,
+        (Nudge::Forward, true, false) => ScrollAmount::LargeIncrement,
+        (Nudge::Forward, true, true) => ScrollAmount::SmallIncrement,
+    }
+}
+
+fn reversed(before: Nudge, now: Nudge) -> bool {
+    matches!((before, now), (Nudge::Back, Nudge::Forward) | (Nudge::Forward, Nudge::Back))
+}
+
+/// The scroll position once a wheel scroll has finished. Apps that animate
+/// one report the old position for a moment and then pass through values in
+/// between, so it is polled until it has left `before` and holds still, or
+/// the settle time is up.
+fn settled_percent(p: &UIScrollPattern, before: f64) -> Option<f64> {
+    let deadline = Instant::now() + SCROLL_SETTLE;
+    let mut last = vertical_percent(p);
+    while Instant::now() < deadline {
+        std::thread::sleep(SCROLL_POLL);
+        let now = vertical_percent(p);
+        if now == last && now != Some(before) {
+            break;
+        }
+        last = now;
+    }
+    last
 }
 
 /// The state of one describe walk.
@@ -238,9 +342,14 @@ struct Walk {
     max_depth: usize,
     rows: Vec<DescribedNode>,
     row_limit: usize,
+    /// Visits in the current pass, and the pass's budget (see
+    /// rank::walk_spent).
     visits: usize,
     max_nodes: usize,
     deadline: Instant,
+    /// The app stopped answering: every further call would wait out the
+    /// same timeout, so the walk ends here.
+    unreachable: Cell<bool>,
     /// The current pass ran out of budget.
     stopped: bool,
     /// Some pass ran out of budget.
@@ -250,6 +359,9 @@ struct Walk {
     /// Popup tops already listed, by rect and control type, so a toolkit that
     /// also shows them inside the window does not list them twice.
     listed: Vec<(Rect, i32)>,
+    /// The described window, and the top-level window being walked: the same
+    /// except while walking one of its popups.
+    home: isize,
     top: isize,
     top_rect: Option<Rect>,
     focus: Focus,
@@ -257,11 +369,22 @@ struct Walk {
 
 impl Walk {
     fn spent(&self) -> bool {
-        rank::walk_spent(self.rows.len(), self.row_limit, self.visits, self.max_nodes, Instant::now() > self.deadline)
+        let overtime = Instant::now() > self.deadline;
+        self.unreachable.get() || rank::walk_spent(self.rows.len(), self.row_limit, self.visits, self.max_nodes, overtime)
+    }
+
+    /// Start a pass with a budget of its own: up to `row_limit` rows in all,
+    /// `nodes` visits before `time` runs out (ten times that at most).
+    fn pass(&mut self, row_limit: usize, nodes: usize, time: Duration) {
+        self.row_limit = row_limit;
+        self.max_nodes = nodes;
+        self.visits = 0;
+        self.deadline = Instant::now() + time;
     }
 
     /// One step of navigation, cached when possible. A failed cached call is
-    /// retried live; "nothing there" is an answer, not a failure.
+    /// retried live, unless the app could not answer at all; "nothing there"
+    /// is an answer, not a failure.
     fn step(
         &self,
         cached: impl FnOnce(&UICacheRequest) -> uiautomation::Result<UIElement>,
@@ -271,10 +394,29 @@ impl Walk {
             match found(cached(req)) {
                 Ok(Some(el)) => return Some((el, true)),
                 Ok(None) => return None,
-                Err(()) => {}
+                Err(code) if rank::unreachable(code) => {
+                    self.unreachable.set(true);
+                    return None;
+                }
+                Err(_) => {}
             }
         }
         live().ok().map(|el| (el, false))
+    }
+
+    /// Note on the row at `index` that `n` siblings after it were skipped.
+    fn report_more(&mut self, report: Option<(usize, usize)>) {
+        let Some((index, n)) = report else { return };
+        if let Some(row) = self.rows.get_mut(index) {
+            row.more = Some(row.more.unwrap_or(0) + n);
+        }
+    }
+
+    /// A row a collapsed run must keep: the selected or focused one, which is
+    /// usually the very row the reader is asking about.
+    fn wanted(&self, el: &UIElement, cached: bool, ctrl: i32) -> bool {
+        props::selected(el, cached) == Some(true)
+            || props::rect(el, cached).is_some_and(|r| self.focus.is(&props::name(el, cached), ctrl, &r))
     }
 
     fn first_child(&self, el: &UIElement) -> Option<(UIElement, bool)> {
@@ -335,8 +477,11 @@ impl Session {
     /// The window's element, with its properties cached when possible.
     fn element_for(&self, raw: isize, req: Option<&UICacheRequest>) -> Result<(UIElement, bool), String> {
         if let Some(r) = req {
-            if let Ok(el) = self.auto.element_from_handle_build_cache(Handle::from(raw), r) {
-                return Ok((el, true));
+            match self.auto.element_from_handle_build_cache(Handle::from(raw), r) {
+                Ok(el) => return Ok((el, true)),
+                // A live retry would only wait out the same timeout again.
+                Err(e) if rank::unreachable(e.code()) => return Err(e.to_string()),
+                Err(_) => {}
             }
         }
         self.auto.element_from_handle(Handle::from(raw)).map(|el| (el, false)).map_err(|e| e.to_string())
@@ -400,39 +545,46 @@ impl Session {
         // A popup's own top node can be the thing asked for (role "menu");
         // the window's never is.
         let tree = if scope.popup { TreeScope::Subtree } else { TreeScope::Descendants };
+        // A cached call that failed because the app cannot answer is not
+        // retried live: that would wait out the same timeout a second time.
         if first_only {
             if let Some(r) = req {
-                if let Ok(el) = found(scope.root.find_first_build_cache(tree, cond, r)) {
-                    return Ok((el.into_iter().collect(), true));
+                match found(scope.root.find_first_build_cache(tree, cond, r)) {
+                    Ok(el) => return Ok((el.into_iter().collect(), true)),
+                    Err(code) if rank::unreachable(code) => return Err(format!("search failed: error {code:#x}")),
+                    Err(_) => {}
                 }
             }
             return Ok((scope.root.find_first(tree, cond).ok().into_iter().collect(), false));
         }
         if let Some(r) = req {
-            if let Ok(all) = scope.root.find_all_build_cache(tree, cond, r) {
-                return Ok((all, true));
+            match scope.root.find_all_build_cache(tree, cond, r) {
+                Ok(all) => return Ok((all, true)),
+                Err(e) if rank::unreachable(e.code()) => return Err(format!("search failed: {e}")),
+                Err(_) => {}
             }
         }
         scope.root.find_all(tree, cond).map(|all| (all, false)).map_err(|e| format!("search failed: {e}"))
     }
 
-    pub fn find_elements(
-        &mut self,
-        window_ref: Option<&str>,
+    /// The controls in `scopes` that meet the condition and match the name or
+    /// id, in tree order. With `first_only`, only the first scope with a
+    /// match is searched, and only for its first match. Unnamed controls are
+    /// dropped from a listing unless `keep_unnamed`.
+    #[allow(clippy::too_many_arguments)]
+    fn candidates(
+        &self,
+        scopes: &[Scope],
+        cond: &UICondition,
+        req: Option<&UICacheRequest>,
         name: Option<&str>,
-        role: Option<&str>,
         automation_id: Option<&str>,
-        limit: usize,
-        include_hidden: bool,
-    ) -> Result<Vec<ElementInfo>, String> {
-        let scopes = self.scopes(window_ref)?;
-        let cond = self.role_condition(role)?;
-        let req = props::request_for(&self.auto, props::FIND);
-        let first_only = limit == 1 && name.is_none() && automation_id.is_none() && !include_hidden;
-
+        first_only: bool,
+        keep_unnamed: bool,
+    ) -> Result<Vec<Candidate>, String> {
         let mut candidates: Vec<Candidate> = Vec::new();
         for (i, scope) in scopes.iter().enumerate() {
-            let (all, cached) = match self.find_in(scope, &cond, req.as_ref(), first_only) {
+            let (all, cached) = match self.find_in(scope, cond, req, first_only) {
                 Ok(f) => f,
                 // A popup can close mid-search; only the window itself
                 // failing is an error.
@@ -455,11 +607,7 @@ impl Session {
                             Some(t) => (t, el_name),
                             None => continue,
                         },
-                        // Unnamed matches are noise in a listing, but
-                        // find_first returns exactly one element; discarding
-                        // it would report "no such control" while named ones
-                        // exist.
-                        None if !first_only && el_name.trim().is_empty() => continue,
+                        None if !keep_unnamed && el_name.trim().is_empty() => continue,
                         None => (0, el_name),
                     }
                 };
@@ -470,16 +618,46 @@ impl Session {
                 break;
             }
         }
+        Ok(candidates)
+    }
 
-        let (best, hidden) = if name.is_some() {
+    pub fn find_elements(
+        &mut self,
+        window_ref: Option<&str>,
+        name: Option<&str>,
+        role: Option<&str>,
+        automation_id: Option<&str>,
+        limit: usize,
+        include_hidden: bool,
+    ) -> Result<Vec<ElementInfo>, String> {
+        let scopes = self.scopes(window_ref)?;
+        let cond = self.role_condition(role)?;
+        let req = props::request_for(&self.auto, props::FIND);
+        // Asking for any one control of a role (a wait for one to appear).
+        // Unnamed matches are noise in a listing, but here any match answers
+        // the question, and discarding one would report "no such control"
+        // while it is right there.
+        let lone = limit == 1 && name.is_none() && automation_id.is_none() && !include_hidden;
+        let candidates = self.candidates(&scopes, &cond, req.as_ref(), name, automation_id, lone, lone)?;
+
+        let (mut best, mut hidden) = if name.is_some() {
             self.rank_matches(candidates, &scopes, limit)
         } else {
             self.listing(candidates, &scopes, limit)
         };
+        if lone && best.is_empty() && !hidden.is_empty() {
+            // find_first returns the first match in tree order, shown or not.
+            // When that one has no rect (an item of a closed menu, a row on
+            // an unselected tab), a visible match further on would never be
+            // seen, and a wait for one would never end.
+            let all = self.candidates(&scopes, &cond, req.as_ref(), None, None, false, true)?;
+            (best, hidden) = self.listing(all, &scopes, limit);
+        }
         let mut out: Vec<ElementInfo> = Vec::new();
         if !best.is_empty() {
             // Read only when there is something to report: it is a call or three.
-            let focus = Focus::now(&self.auto);
+            let tops: Vec<isize> = scopes.iter().map(|s| s.top).collect();
+            let focus = Focus::now(&self.auto, &tops);
             for m in best {
                 let scope = &scopes[m.scope];
                 out.push(self.element_info(m.el, m.cached, m.seen, scope.top, scope.popup, &focus));
@@ -697,7 +875,7 @@ impl Session {
             value,
             rect,
             popup,
-            window: None,
+            window: (w.top != w.home).then(|| w.top.to_string()),
             more: None,
         }
     }
@@ -731,29 +909,45 @@ impl Session {
 
     /// Depth-first walk of the control view under `parent`, stopping when the
     /// walk's budget is spent and remembering the first node it never reached
-    /// at each level.
+    /// at each level. Long runs of list, tree and grid rows are cut short
+    /// here (rank::Run), so the budget reaches what comes after them.
     fn walk(&mut self, w: &mut Walk, parent: &UIElement, depth: usize) {
         if depth > w.max_depth {
             return;
         }
+        let mut run = rank::Run::default();
         let mut next = w.first_child(parent);
         while let Some((el, cached)) = next {
             if w.spent() {
                 w.stopped = true;
                 w.pending.push((depth, el, cached));
-                return;
+                break;
             }
-            if self.visit(w, &el, cached, depth) {
-                self.walk(w, &el, depth + 1);
+            let ctrl = props::control_type(&el, cached);
+            let (skip, report) = run.skip(role_name(ctrl), || w.wanted(&el, cached, ctrl));
+            w.report_more(report);
+            if skip {
+                // Skipping still cost the step to it.
+                w.visits += 1;
+            } else {
+                let at = w.rows.len();
+                let open = self.visit(w, &el, cached, depth);
+                if w.rows.len() > at {
+                    run.kept(at);
+                }
+                if open {
+                    self.walk(w, &el, depth + 1);
+                }
             }
             next = w.next_sibling(&el);
             if w.stopped {
                 if let Some((el, cached)) = next {
                     w.pending.push((depth, el, cached));
                 }
-                return;
+                break;
             }
         }
+        w.report_more(run.finish());
     }
 
     pub fn describe(&mut self, window_ref: &str, max_nodes: usize, max_depth: usize) -> Result<Described, String> {
@@ -763,7 +957,11 @@ impl Session {
             .element_for(raw, req.as_ref())
             .map_err(|e| format!("no window for ref '{window_ref}': {e}"))?;
         let walker = self.auto.get_control_view_walker().map_err(|e| e.to_string())?;
-        let focus = Focus::now(&self.auto);
+        let reserve = rank::popup_reserve(max_nodes);
+        let popups = if reserve > 0 { popups::popups_of(hwnd_of(raw)) } else { Vec::new() };
+        let mut tops: Vec<isize> = popups.iter().map(|(h, _)| h.0 as isize).collect();
+        tops.push(raw);
+        let focus = Focus::now(&self.auto, &tops);
         let mut w = Walk {
             walker,
             req,
@@ -773,10 +971,12 @@ impl Session {
             visits: 0,
             max_nodes,
             deadline: Instant::now() + EXTRA_WALK_TIME,
+            unreachable: Cell::new(false),
             stopped: false,
             truncated: false,
             pending: Vec::new(),
             listed: Vec::new(),
+            home: raw,
             top: raw,
             top_rect: rect_of(hwnd_of(raw)),
             focus,
@@ -791,18 +991,20 @@ impl Session {
 
         // Open popups go right after the window's own row, within a reserve,
         // so a big window cannot crowd out the menu the user just opened.
-        let reserve = rank::popup_reserve(max_nodes);
-        if reserve > 0 {
+        // They also walk on a budget of their own, visits and time, so a big
+        // or slow popup made of unnamed wrappers cannot leave the window's
+        // walk spent before it starts.
+        if !popups.is_empty() {
             let limit = w.rows.len() + reserve;
-            for (h, prect) in popups::popups_of(hwnd_of(raw)) {
-                if w.rows.len() >= limit || w.spent() {
+            w.pass(limit, reserve, EXTRA_WALK_TIME / 2);
+            for (h, prect) in popups {
+                if w.spent() {
                     break;
                 }
                 let top = h.0 as isize;
                 let Ok((pel, pcached)) = self.element_for(top, w.req.as_ref()) else { continue };
                 w.top = top;
                 w.top_rect = Some(prect);
-                w.row_limit = limit;
                 let at = w.rows.len();
                 if let Some(rect) = props::rect(&pel, pcached) {
                     w.listed.push((rect, props::control_type(&pel, pcached)));
@@ -824,10 +1026,12 @@ impl Session {
 
         w.top = raw;
         w.top_rect = rect_of(hwnd_of(raw));
-        w.row_limit = max_nodes;
+        w.pass(max_nodes, max_nodes, EXTRA_WALK_TIME);
         self.walk(&mut w, &root, 1);
         let truncated = w.truncated || w.stopped;
-        let unvisited = if truncated { w.unvisited() } else { Vec::new() };
+        // Naming what was missed means asking the app again, which an app
+        // that stopped answering would make wait out the timeout per name.
+        let unvisited = if truncated && !w.unreachable.get() { w.unvisited() } else { Vec::new() };
         Ok(Described { nodes: w.rows, truncated, unvisited })
     }
 
@@ -836,33 +1040,76 @@ impl Session {
     ///
     /// Each element costs one call: its rect and offscreen flag come back in
     /// the same cache refresh, falling back to two live reads.
+    ///
+    /// The client gives a whole batch a few seconds, and restarts the helper
+    /// (losing every ref) when it overruns. So each call gets a tight timeout,
+    /// no call is made into a window that is not responding, and once a
+    /// window times out its other refs in the batch are not asked either:
+    /// each would wait out the same timeout.
     pub fn resolve(&mut self, refs: &[String]) -> Vec<Resolved> {
+        let _bound = CallBound::new(&self.auto, HOT_CALL_TIMEOUT_MS);
         self.clock += 1;
         let now = self.clock;
         let req = props::request_for(&self.auto, props::PLACE);
-        refs.iter()
-            .map(|r| {
-                if let Some(entry) = self.cache.get_mut(r) {
-                    entry.used = now;
-                    let (el, cached) = match req.as_ref().and_then(|q| entry.el.build_updated_cache(q).ok()) {
-                        Some(fresh) => (fresh, true),
-                        None => (entry.el.clone(), false),
-                    };
-                    let rect = props::rect(&el, cached);
-                    let offscreen = rect.is_some_and(|rc| {
-                        props::offscreen(&el, cached)
-                            || (entry.top != 0 && rect_of(hwnd_of(entry.top)).is_some_and(|t| rank::outside(&rc, &t)))
-                    });
-                    Resolved { r#ref: r.clone(), rect, offscreen, reason: None }
-                } else if let Ok(raw) = r.parse::<isize>() {
-                    let hwnd = hwnd_of(raw);
-                    let shown = unsafe { IsWindowVisible(hwnd) }.as_bool() && !unsafe { IsIconic(hwnd) }.as_bool();
-                    Resolved { r#ref: r.clone(), rect: if shown { rect_of(hwnd) } else { None }, offscreen: false, reason: None }
-                } else {
-                    Resolved { r#ref: r.clone(), rect: None, offscreen: false, reason: None }
+        let mut silent: Vec<isize> = Vec::new();
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let missing = |reason: Option<&str>| Resolved {
+                r#ref: r.clone(),
+                rect: None,
+                reason: reason.map(str::to_string),
+                offscreen: false,
+            };
+            if let Some(entry) = self.cache.get_mut(r) {
+                entry.used = now;
+                let top = entry.top;
+                if top != 0 && (silent.contains(&top) || is_hung(hwnd_of(top))) {
+                    // Not gone, so no reason: the window is still there and
+                    // its controls come back when it answers again.
+                    if !silent.contains(&top) {
+                        silent.push(top);
+                    }
+                    out.push(missing(None));
+                    continue;
                 }
-            })
-            .collect()
+                // A window on another desktop keeps its controls' rects, but
+                // drawing at them would mark whatever is on this one.
+                if top != 0 && is_cloaked(hwnd_of(top)) {
+                    out.push(missing(Some("other-desktop")));
+                    continue;
+                }
+                let (el, cached) = match req.as_ref().map(|q| entry.el.build_updated_cache(q)) {
+                    Some(Ok(fresh)) => (fresh, true),
+                    Some(Err(e)) if rank::unreachable(e.code()) => {
+                        if top != 0 {
+                            silent.push(top);
+                        }
+                        out.push(missing(None));
+                        continue;
+                    }
+                    _ => (entry.el.clone(), false),
+                };
+                let rect = props::rect(&el, cached);
+                let offscreen = rect.is_some_and(|rc| {
+                    props::offscreen(&el, cached)
+                        || (top != 0 && rect_of(hwnd_of(top)).is_some_and(|t| rank::outside(&rc, &t)))
+                });
+                let reason = rect.is_none().then(|| gone_reason(top).to_string());
+                out.push(Resolved { r#ref: r.clone(), rect, reason, offscreen });
+            } else if let Ok(raw) = r.parse::<isize>() {
+                let hwnd = hwnd_of(raw);
+                let shown = unsafe { IsWindowVisible(hwnd) }.as_bool()
+                    && !unsafe { IsIconic(hwnd) }.as_bool()
+                    && !is_cloaked(hwnd);
+                out.push(match rect_of(hwnd).filter(|_| shown) {
+                    Some(rect) => Resolved { r#ref: r.clone(), rect: Some(rect), reason: None, offscreen: false },
+                    None => missing(Some(gone_reason(raw))),
+                });
+            } else {
+                out.push(missing(Some("gone")));
+            }
+        }
+        out
     }
 
     /// The control under a virtual-screen physical point, and its top-level
@@ -872,11 +1119,20 @@ impl Session {
     /// but the chat panel is not: a point on the panel must come back as
     /// nothing rather than as the user's answer.
     pub fn element_at_point(&mut self, x: i32, y: i32, ignore_pid: u32) -> Result<PointHit, String> {
+        let ours = |pid: u32| ignore_pid != 0 && pid == ignore_pid;
+        // A window that is not responding would hold every call below for the
+        // full timeout; it is still the window that was clicked.
+        let under = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
+        if !under.is_invalid() && is_hung(under) {
+            let window = (!ours(popups::pid_of(under)))
+                .then(|| WindowRef { r#ref: (under.0 as isize).to_string(), title: title_of(under) });
+            return Ok(PointHit { element: None, window });
+        }
+        let _bound = CallBound::new(&self.auto, HOT_CALL_TIMEOUT_MS);
         let el = self
             .auto
             .element_from_point(Point::new(x, y))
             .map_err(|e| format!("nothing answers at {x},{y}: {e}"))?;
-        let ours = |pid: u32| ignore_pid != 0 && pid == ignore_pid;
         if ours(el.get_process_id().unwrap_or(0)) {
             return Ok(PointHit { element: None, window: None });
         }
@@ -895,7 +1151,7 @@ impl Session {
                 let enabled = props::enabled(&el, false);
                 let top_rect = if top_raw != 0 { rect_of(top) } else { None };
                 let offscreen = props::offscreen(&el, false) || top_rect.is_some_and(|t| rank::outside(&rect, &t));
-                let focus = Focus::now(&self.auto);
+                let focus = Focus::now(&self.auto, &[top_raw]);
                 let seen = Seen { name, rect, enabled, offscreen };
                 Some(self.element_info(el, false, seen, top_raw, false, &focus))
             }
@@ -904,9 +1160,10 @@ impl Session {
         Ok(PointHit { element, window })
     }
 
-    /// Bring a control into view with ScrollItemPattern. A view change, like
-    /// scroll_window: it moves the content, never the pointer, and never acts
-    /// on the control.
+    /// Bring a control into view with ScrollItemPattern, or failing that by
+    /// stepping the nearest scrollable container toward it. A view change,
+    /// like scroll_window: it moves the content, never the pointer, and never
+    /// acts on the control.
     pub fn scroll_into_view(
         &mut self,
         window_ref: &str,
@@ -940,14 +1197,20 @@ impl Session {
             return Err(format!("{what} went away before it could be scrolled"));
         };
         let (el, top) = (entry.el.clone(), entry.top);
-        let item: UIScrollItemPattern = el.get_pattern().map_err(|_| {
-            format!(
-                "\"{}\" [{}] cannot scroll itself into view (it has no ScrollItemPattern); \
-                 scroll_window with notches scrolls the window instead",
-                best.name, best.role
-            )
-        })?;
-        item.scroll_into_view().map_err(|e| format!("could not scroll \"{}\" into view: {e}", best.name))?;
+        let scrolled = match el.get_pattern::<UIScrollItemPattern>() {
+            Ok(item) => {
+                item.scroll_into_view().map_err(|e| format!("could not scroll \"{}\" into view: {e}", best.name))?;
+                true
+            }
+            Err(_) => self.step_into_view(&el).ok_or_else(|| {
+                format!(
+                    "\"{}\" [{}] cannot scroll itself into view (it has no ScrollItemPattern), and no \
+                     scrollable container around it could be stepped toward it; scroll_window with notches \
+                     scrolls the window instead",
+                    best.name, best.role
+                )
+            })?,
+        };
         // The rect and the offscreen flag are what scrolling changed.
         if let Some(rect) = props::rect(&el, false) {
             best.offscreen = props::offscreen(&el, false) || rect_of(hwnd_of(top)).is_some_and(|t| rank::outside(&rect, &t));
@@ -955,18 +1218,136 @@ impl Session {
             best.hidden = None;
             best.container = None;
         }
-        Ok(ScrollIntoView { scrolled: true, element: best })
+        Ok(ScrollIntoView { scrolled, element: best })
     }
 
-    /// Scroll a window by wheel notches, reporting what moved.
+    /// Step the nearest scrollable ancestor of `el` toward it until its centre
+    /// is inside that container, as a user's clicks on the scroll bar would
+    /// (ScrollPattern, never input). Some(whether anything moved), or None
+    /// when there is no rect to aim at or nothing to scroll.
+    ///
+    /// Page steps first, since a page never carries an item that is less than
+    /// a page away past the edge; an axis whose direction flips has
+    /// overshot, and continues a line at a time. A step that leaves the item
+    /// where it was means the container is at the end of its range.
+    fn step_into_view(&self, el: &UIElement) -> Option<bool> {
+        props::rect(el, false)?;
+        let walker = self.auto.get_control_view_walker().ok()?;
+        let mut cur = walker.get_parent(el).ok();
+        let mut found: Option<(UIElement, UIScrollPattern)> = None;
+        for _ in 0..PARENT_WALK {
+            let Some(parent) = cur else { break };
+            if let Ok(p) = parent.get_pattern::<UIScrollPattern>() {
+                if p.is_vertically_scrollable().unwrap_or(false) || p.is_horizontally_scrollable().unwrap_or(false) {
+                    found = Some((parent, p));
+                    break;
+                }
+            }
+            cur = walker.get_parent(&parent).ok();
+        }
+        let (container, scroller) = found?;
+        let can = (
+            scroller.is_horizontally_scrollable().unwrap_or(false),
+            scroller.is_vertically_scrollable().unwrap_or(false),
+        );
+        let mut fine = (false, false);
+        let mut last = (Nudge::Stay, Nudge::Stay);
+        let mut moved = false;
+        for _ in 0..SCROLL_STEPS {
+            let (Some(item), Some(view)) = (props::rect(el, false), props::rect(&container, false)) else { break };
+            let (h, v) = rank::nudge(&item, &view);
+            fine.0 |= reversed(last.0, h);
+            fine.1 |= reversed(last.1, v);
+            let step = (scroll_amount(h, can.0, fine.0), scroll_amount(v, can.1, fine.1));
+            if step == (ScrollAmount::NoAmount, ScrollAmount::NoAmount) || scroller.scroll(step.0, step.1).is_err() {
+                break;
+            }
+            if props::rect(el, false) == Some(item) {
+                break;
+            }
+            moved = true;
+            last = (h, v);
+        }
+        Some(moved)
+    }
+
+    /// The scrolling element a wheel at the window's centre moves: the
+    /// nearest ancestor of the control there that scrolls vertically, else
+    /// the window element itself. Never a search of the whole window, which
+    /// in a big tree with nothing scrollable would cost seconds to find
+    /// nothing.
+    fn scroller_at_centre(&self, hwnd: HWND) -> Option<UIScrollPattern> {
+        let rect = rect_of(hwnd)?;
+        let (x, y) = (rect.x + rect.width / 2, rect.y + rect.height / 2);
+        // Only when the window itself is what shows at its centre; otherwise
+        // the control there belongs to whatever covers it.
+        let at = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
+        if at == hwnd {
+            if let (Ok(mut el), Ok(walker)) =
+                (self.auto.element_from_point(Point::new(x, y)), self.auto.get_control_view_walker())
+            {
+                for _ in 0..PARENT_WALK {
+                    if let Some(p) = vertical_scroller(&el) {
+                        return Some(p);
+                    }
+                    let own: HWND = el.get_native_window_handle().map(Into::into).unwrap_or_default();
+                    if own == hwnd {
+                        break;
+                    }
+                    let Ok(parent) = walker.get_parent(&el) else { break };
+                    el = parent;
+                }
+            }
+        }
+        vertical_scroller(&self.auto.element_from_handle(Handle::from(hwnd.0 as isize)).ok()?)
+    }
+
+    /// Scroll a window by wheel notches, reporting the vertical position of
+    /// what it scrolled before and after, so a scroll that moved nothing (an
+    /// app that ignores wheel messages sent to it, a list already at its end)
+    /// can say so instead of sending the agent off to re-read an unchanged
+    /// view.
     pub fn scroll_window(&mut self, hwnd: HWND, notches: i32) -> Result<Scrolled, String> {
-        crate::winops::scroll(hwnd, notches).map(|_| Scrolled { scrolled: true, before: None, after: None })
+        // A window that is not responding gets the scroll's own error, before
+        // any UI Automation call can wait on it.
+        let scroller = if is_hung(hwnd) { None } else { self.scroller_at_centre(hwnd) };
+        let before = scroller.as_ref().and_then(vertical_percent);
+        crate::winops::scroll(hwnd, notches)?;
+        let after = match (&scroller, before) {
+            (Some(p), Some(b)) => settled_percent(p, b),
+            _ => None,
+        };
+        Ok(Scrolled { scrolled: true, before, after })
     }
 
-    /// Collapsed expandable controls in a window (menus, combo boxes, tree
-    /// nodes): where a control that matched nothing may be hiding.
-    pub fn collapsed(&mut self, _window_ref: &str, _limit: usize) -> Result<Vec<ElementInfo>, String> {
-        Err("collapsed is not implemented yet".into())
+    /// Collapsed expandable controls in a window and its open popups (menus,
+    /// menu items with submenus, combo boxes, tree nodes, split buttons):
+    /// where a control that matched nothing may be hiding. Named ones only,
+    /// since an unnamed one cannot be pointed out, in tree order with
+    /// on-screen ones first.
+    pub fn collapsed(&mut self, window_ref: &str, limit: usize) -> Result<Vec<ElementInfo>, String> {
+        let scopes = self.scopes(Some(window_ref))?;
+        // ExpandCollapseState 0 is Collapsed. Controls without the pattern
+        // have no such state and never match.
+        let cond = self
+            .auto
+            .create_property_condition(UIProperty::ExpandCollapseExpandCollapseState, Variant::from(0i32), None)
+            .map_err(|e| e.to_string())?;
+        let req = props::request_for(&self.auto, props::FIND);
+        let candidates = self.candidates(&scopes, &cond, req.as_ref(), None, None, false, false)?;
+        let (shown, _) = self.listing(candidates, &scopes, limit);
+        if shown.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tops: Vec<isize> = scopes.iter().map(|s| s.top).collect();
+        let focus = Focus::now(&self.auto, &tops);
+        Ok(shown
+            .into_iter()
+            .map(|m| {
+                let scope = &scopes[m.scope];
+                self.element_info(m.el, m.cached, m.seen, scope.top, scope.popup, &focus)
+            })
+            .collect())
     }
 
     /// Names in the window closest to one that matched nothing, best first.

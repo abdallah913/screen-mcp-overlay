@@ -254,6 +254,154 @@ pub fn touches(a: &Rect, b: &Rect) -> bool {
     a.x <= b.x + b.width && b.x <= a.x + a.width && a.y <= b.y + b.height && b.y <= a.y + a.height
 }
 
+fn overlap_area(a: &Rect, b: &Rect) -> i64 {
+    let w = (a.x + a.width).min(b.x + b.width) - a.x.max(b.x);
+    let h = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
+    if w <= 0 || h <= 0 {
+        0
+    } else {
+        i64::from(w) * i64::from(h)
+    }
+}
+
+/// What ties a popup-like window of the target's process to the target.
+#[derive(Clone, Copy, Debug)]
+pub struct PopupLink {
+    /// A Win32 menu (#32768) created by the target's own thread. Menus have no
+    /// owner, but only the thread whose window opened one can create it.
+    pub menu_of_its_thread: bool,
+    /// The target is its owner, directly or up the owner chain.
+    pub owned: bool,
+}
+
+/// Whether a popup-like window really belongs to the target.
+///
+/// Popup-like is not enough on its own. File Explorer windows share
+/// explorer.exe with the taskbar and the desktop, which are captionless,
+/// untitled and topmost too, and were searched as an open menu of every
+/// Explorer window. A real popup is the target's own menu, a window it owns,
+/// or one drawn over it. Overlap is strict: a maximised window only abuts the
+/// taskbar. Nothing that covers most of the display is a popup: that is the
+/// desktop or a shell surface.
+pub fn popup_of(link: PopupLink, rect: &Rect, target: Option<&Rect>, screen: Option<&Rect>) -> bool {
+    if let Some(s) = screen {
+        let area = i64::from(s.width) * i64::from(s.height);
+        if area > 0 && overlap_area(rect, s) * 4 >= area * 3 {
+            return false;
+        }
+    }
+    link.menu_of_its_thread || link.owned || target.is_some_and(|t| overlap_area(rect, t) > 0)
+}
+
+/// Why a target has no rect, judged from its top-level window: "closed",
+/// "minimized", "other-desktop" (cloaked), or "gone" when the window is fine
+/// and the control itself went away.
+pub fn gone_reason(exists: bool, minimized: bool, cloaked: bool) -> &'static str {
+    if !exists {
+        "closed"
+    } else if minimized {
+        "minimized"
+    } else if cloaked {
+        "other-desktop"
+    } else {
+        "gone"
+    }
+}
+
+/// HRESULTs that mean the app cannot answer at all, rather than that one call
+/// went wrong: UIA_E_TIMEOUT, UIA_E_ELEMENTNOTAVAILABLE, RPC_E_DISCONNECTED,
+/// CO_E_OBJNOTCONNECTED, and RPC_S_SERVER_UNAVAILABLE / RPC_S_CALL_FAILED as
+/// HRESULTs. After one of these a live retry of the same call costs another
+/// full timeout and gets the same answer.
+pub fn unreachable(code: i32) -> bool {
+    const CODES: [u32; 6] = [0x8013_1505, 0x8004_0201, 0x8001_0108, 0x8004_01FD, 0x8007_06BA, 0x8007_06BE];
+    CODES.contains(&(code as u32))
+}
+
+/// Rows of a long run of list, tree or grid rows a describe keeps before it
+/// skips the rest.
+pub const RUN_KEEP: usize = 8;
+
+fn collapses(role: &str) -> bool {
+    matches!(role, "listitem" | "treeitem" | "dataitem")
+}
+
+/// Collapses long runs of same-role siblings while a describe walks them.
+///
+/// A file list of hundreds of rows used to spend the whole node budget, so the
+/// File name box and the Save button after it were never reached. Past
+/// RUN_KEEP rows of one run, siblings are skipped unwalked, except selected or
+/// focused ones, and the count skipped is reported on the last row kept
+/// before them.
+#[derive(Default)]
+pub struct Run {
+    role: Option<&'static str>,
+    seen: usize,
+    /// Index of the last row emitted for this run.
+    row: Option<usize>,
+    skipped: usize,
+}
+
+impl Run {
+    /// Whether to skip the next sibling, which has `role`. `wanted` is asked
+    /// only when the answer would otherwise be yes. A count to report, as
+    /// (row index, skipped), comes back whenever a stretch of skipped
+    /// siblings ends.
+    pub fn skip(&mut self, role: &'static str, wanted: impl FnOnce() -> bool) -> (bool, Option<(usize, usize)>) {
+        if !(collapses(role) && self.role == Some(role)) {
+            let report = self.finish();
+            *self = Run { role: collapses(role).then_some(role), seen: 1, row: None, skipped: 0 };
+            return (false, report);
+        }
+        self.seen += 1;
+        // With no row kept yet there is nowhere to say what was skipped.
+        if self.seen > RUN_KEEP && self.row.is_some() && !wanted() {
+            self.skipped += 1;
+            return (true, None);
+        }
+        (false, self.finish())
+    }
+
+    /// The sibling just visited emitted the row at `index`.
+    pub fn kept(&mut self, index: usize) {
+        if self.role.is_some() {
+            self.row = Some(index);
+        }
+    }
+
+    /// The count still to report when the walk leaves these siblings.
+    pub fn finish(&mut self) -> Option<(usize, usize)> {
+        let report = self.row.filter(|_| self.skipped > 0).map(|r| (r, self.skipped));
+        self.skipped = 0;
+        report
+    }
+}
+
+/// Which way one axis must scroll to bring an item into a viewport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Nudge {
+    Stay,
+    Back,
+    Forward,
+}
+
+fn nudge_axis(start: i32, len: i32, view_start: i32, view_len: i32) -> Nudge {
+    let centre = start + len / 2;
+    if centre < view_start {
+        Nudge::Back
+    } else if centre >= view_start + view_len {
+        Nudge::Forward
+    } else {
+        Nudge::Stay
+    }
+}
+
+/// Horizontal and vertical scroll directions that bring `item`'s centre into
+/// `view`, the scrolling container's rect.
+pub fn nudge(item: &Rect, view: &Rect) -> (Nudge, Nudge) {
+    (nudge_axis(item.x, item.width, view.x, view.width), nudge_axis(item.y, item.height, view.y, view.height))
+}
+
 /// Whether a describe walk must stop before visiting another node.
 ///
 /// Only emitted rows count against `row_limit`: unnamed wrappers are dropped
@@ -393,6 +541,107 @@ mod tests {
         assert!(touches(&r(1920, 0, 200, 300), &screen));
         assert!(!touches(&r(1930, 0, 200, 300), &screen));
         assert!(!touches(&r(-3000, -3000, 20, 20), &screen));
+    }
+
+    #[test]
+    fn a_popup_must_belong_to_the_target() {
+        let screen = r(0, 0, 1920, 1080);
+        let explorer = r(0, 0, 1920, 1032);
+        let none = PopupLink { menu_of_its_thread: false, owned: false };
+        // The taskbar of the same explorer.exe only abuts a maximised window.
+        assert!(!popup_of(none, &r(0, 1032, 1920, 48), Some(&explorer), Some(&screen)));
+        // A dropdown drawn over the window belongs to it.
+        assert!(popup_of(none, &r(300, 200, 200, 300), Some(&explorer), Some(&screen)));
+        // A submenu cascading past the window's edge is still its own menu.
+        let small = r(100, 100, 400, 300);
+        let menu = PopupLink { menu_of_its_thread: true, owned: false };
+        assert!(popup_of(menu, &r(520, 120, 200, 300), Some(&small), Some(&screen)));
+        assert!(!popup_of(none, &r(520, 120, 200, 300), Some(&small), Some(&screen)));
+        let owned = PopupLink { menu_of_its_thread: false, owned: true };
+        assert!(popup_of(owned, &r(520, 120, 200, 300), Some(&small), Some(&screen)));
+        // The desktop's icon host covers the display, whatever links it has.
+        assert!(!popup_of(menu, &screen, Some(&explorer), Some(&screen)));
+        assert!(!popup_of(none, &r(0, 0, 1920, 1032), Some(&explorer), Some(&screen)));
+    }
+
+    #[test]
+    fn a_missing_target_says_why() {
+        assert_eq!(gone_reason(false, true, true), "closed");
+        assert_eq!(gone_reason(true, true, true), "minimized");
+        assert_eq!(gone_reason(true, false, true), "other-desktop");
+        assert_eq!(gone_reason(true, false, false), "gone");
+    }
+
+    #[test]
+    fn timeouts_and_dead_providers_are_not_retried() {
+        assert!(unreachable(0x8013_1505u32 as i32));
+        assert!(unreachable(0x8001_0108u32 as i32));
+        assert!(unreachable(0x8004_0201u32 as i32));
+        // E_FAIL or "not cached" are worth a live read.
+        assert!(!unreachable(0x8000_4005u32 as i32));
+        assert!(!unreachable(0));
+    }
+
+    /// Feeds a run of siblings through `Run`, emitting a row for each one
+    /// visited, and returns the visited indices and the reported counts.
+    fn walk_run(roles: &[&'static str], wanted: &[usize]) -> (Vec<usize>, Vec<(usize, usize)>) {
+        let mut run = Run::default();
+        let mut visited = Vec::new();
+        let mut reports = Vec::new();
+        for (i, role) in roles.iter().enumerate() {
+            let (skip, report) = run.skip(role, || wanted.contains(&i));
+            reports.extend(report);
+            if !skip {
+                visited.push(i);
+                run.kept(i);
+            }
+        }
+        reports.extend(run.finish());
+        (visited, reports)
+    }
+
+    #[test]
+    fn long_runs_keep_eight_rows_and_count_the_rest() {
+        let mut roles = vec!["listitem"; 30];
+        roles.push("edit");
+        roles.push("button");
+        let (visited, reports) = walk_run(&roles, &[]);
+        assert_eq!(visited, [0, 1, 2, 3, 4, 5, 6, 7, 30, 31]);
+        assert_eq!(reports, [(7, 22)]);
+    }
+
+    #[test]
+    fn selected_rows_survive_the_collapse() {
+        let roles = vec!["listitem"; 20];
+        let (visited, reports) = walk_run(&roles, &[12]);
+        assert_eq!(visited, [0, 1, 2, 3, 4, 5, 6, 7, 12]);
+        assert_eq!(reports, [(7, 4), (12, 7)]);
+    }
+
+    #[test]
+    fn short_runs_and_other_roles_are_untouched() {
+        let roles = ["listitem", "listitem", "button", "button", "button", "button", "button", "button", "button",
+            "button", "button", "button"];
+        let (visited, reports) = walk_run(&roles, &[]);
+        assert_eq!(visited.len(), roles.len());
+        assert!(reports.is_empty());
+        // A role change starts a new run.
+        let mut mixed = vec!["treeitem"; 9];
+        mixed.extend(vec!["listitem"; 9]);
+        let (visited, reports) = walk_run(&mixed, &[]);
+        assert_eq!(visited.len(), 16);
+        assert_eq!(reports, [(7, 1), (16, 1)]);
+    }
+
+    #[test]
+    fn nudges_point_toward_the_item() {
+        let view = r(0, 100, 400, 300);
+        assert_eq!(nudge(&r(10, 150, 100, 20), &view), (Nudge::Stay, Nudge::Stay));
+        assert_eq!(nudge(&r(10, 900, 100, 20), &view), (Nudge::Stay, Nudge::Forward));
+        assert_eq!(nudge(&r(10, 20, 100, 20), &view), (Nudge::Stay, Nudge::Back));
+        assert_eq!(nudge(&r(600, 150, 100, 20), &view), (Nudge::Forward, Nudge::Stay));
+        // Half past the bottom edge: the centre decides.
+        assert_eq!(nudge(&r(10, 390, 100, 30), &view), (Nudge::Stay, Nudge::Forward));
     }
 
     #[test]
