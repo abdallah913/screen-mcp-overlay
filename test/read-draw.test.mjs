@@ -221,6 +221,114 @@ test('steps added with replace:false carry on numbering', async () => {
     assert.deepEqual(store.list().map(a => a.text), ['1', '2', '3', '4']);
 });
 
+test('captioned steps added with replace:false carry on numbering', async () => {
+    fakeHelper();
+    const first = await call('annotate', {
+        space: 'physical',
+        shapes: [{ type: 'step', x: 0, y: 0, width: 30, height: 30, text: 'Open the File menu' }]
+    });
+    assert.match(first.text, /\(step 1\)/);
+    const more = await call('annotate', {
+        space: 'physical',
+        replace: false,
+        shapes: [
+            { type: 'step', x: 50, y: 0, width: 30, height: 30, text: 'Click Save' },
+            { type: 'step', x: 90, y: 0, width: 30, height: 30, text: '3/3 Name the file' }
+        ]
+    });
+    assert.match(more.text, /\(steps 2-3\)/);
+    assert.deepEqual(store.list().map(a => a.text), ['1. Open the File menu', '2. Click Save', '3/3 Name the file']);
+});
+
+// --- misses, popups and dead refs ---------------------------------------------------
+
+test('a miss with nothing hidden names the closed menus and lists it may be in', async () => {
+    fakeHelper({
+        suggest: () => [],
+        collapsed: () => [
+            control('el_30', 'File', { role: 'menuitem', state: 'collapsed' }),
+            control('el_31', 'Font size', { role: 'combobox', state: 'collapsed' })
+        ]
+    });
+    const { text, isError } = await call('annotate', { anchor: { window: 'Notepad', name: 'Page setup' }, shapes: [{ type: 'box' }] });
+    assert.equal(isError, true);
+    assert.match(text, /It may be inside a closed menu or list: "File" \[menuitem\] el_30, "Font size" \[combobox\] el_31\. describe_window/);
+});
+
+test('a row from an open popup is measured against the popup, not covered by it', async () => {
+    const desktop = fakeDesktop();
+    desktop.tree.push(
+        { depth: 1, ref: 'el_21', name: 'File', role: 'menu', popup: true, window: '900', enabled: true, rect: rect(100, 120, 200, 300) },
+        { depth: 2, ref: 'el_22', name: 'Save As', role: 'menuitem', enabled: true, rect: rect(110, 200, 180, 24) }
+    );
+    desktop.controls.push({ ref: 'el_22', name: 'Save As', role: 'menuitem', enabled: true, rect: rect(110, 200, 180, 24) });
+    const { calls } = fakeHelper(
+        {
+            covered: p =>
+                p.window === '900'
+                    ? { fraction: 0, centre_covered: false, by: [] }
+                    : { fraction: 1, centre_covered: true, by: ['a popup of Notepad'] }
+        },
+        desktop
+    );
+    await call('describe_window', { window: 'Notepad' });
+    const { text, isError } = await call('annotate', { anchor: { ref: 'el_22' }, shapes: [{ type: 'circle' }] });
+    assert.equal(isError, false, text);
+    assert.match(text, /"Save As" \[menuitem\] el_22, in a popup of "Untitled - Notepad"/);
+    assert.equal(/WARNING/.test(text), false, text);
+    assert.equal(calls.filter(c => c.op === 'covered').at(-1).params.window, '900');
+});
+
+test('a dead ref whose selector now matches several look-alikes is not guessed', async () => {
+    const desktop = fakeDesktop();
+    desktop.controls = [control('el_40', 'Remove'), control('el_52', 'Remove', { rect: rect(150, 190, 80, 24) })];
+    fakeHelper({}, desktop);
+    await call('find_ui_elements', { window: 'Notepad', name: 'Remove' });
+    // The app rebuilt its rows: the old refs name nothing, and two new look-alikes exist.
+    desktop.controls.splice(0, 2, control('el_60', 'Remove'), control('el_61', 'Remove', { rect: rect(150, 190, 80, 24) }));
+    const { text, isError } = await call('annotate', { anchor: { ref: 'el_52' }, shapes: [{ type: 'circle' }] });
+    assert.equal(isError, true);
+    assert.match(text, /anchor el_52 no longer resolves, and 2 controls now match "Remove": look it up again/);
+    assert.equal(store.list().length, 0);
+});
+
+// --- scrolling and hidden drawings ---------------------------------------------------
+
+test('scroll_window says how far the view moved', async () => {
+    fakeHelper({ scroll_window: () => ({ scrolled: true, before: 0, after: 31.4 }) });
+    const { text } = await call('scroll_window', { window: 'Notepad', notches: -3 });
+    assert.equal(text, 'Scrolled -3 notch(es): moved 0%->31%. Re-read to see the new content.');
+});
+
+test('scroll_window says when nothing moved', async () => {
+    fakeHelper({ scroll_window: () => ({ scrolled: true, before: 100, after: 100 }) });
+    const { text } = await call('scroll_window', { window: 'Notepad', notches: -3 });
+    assert.match(text, /^Scrolled -3 notch\(es\), but nothing moved \(still at 100%\): it is already at the end, or the app ignores wheel messages/);
+});
+
+test('scroll_window without a position to compare keeps the plain report', async () => {
+    fakeHelper();
+    const { text } = await call('scroll_window', { window: 'Notepad', notches: 2 });
+    assert.match(text, /^Scrolled 2 notch\(es\)\. Re-read to see the new content; some apps ignore wheel messages/);
+});
+
+test('a drawing hidden for a while is reported with why', async () => {
+    fakeHelper();
+    await call('annotate', {
+        anchor: { window: 'Notepad', name: 'Save' },
+        shapes: [{ type: 'circle' }, { type: 'arrow', x: 0, y: 0, toX: 9, toY: 9 }]
+    });
+    const [circle, arrow] = store.list();
+    store.applyTracking([
+        { id: circle.id, displayId: circle.displayId, rect: circle.rect, hidden: true, hiddenReason: 'minimized' },
+        { id: arrow.id, displayId: arrow.displayId, rect: arrow.rect, hidden: true, hiddenReason: 'gone' }
+    ]);
+    for (const a of store.list()) a.hiddenSince = Date.now() - 12_000;
+    const { text } = await call('clear_annotations', { ids: ['ann_none'] });
+    assert.match(text, new RegExp(`Note: ${circle.id} not showing for 12s: its window is minimised \\(focus_window restores it\\)\\.`));
+    assert.match(text, new RegExp(`Note: ${arrow.id} not showing for 12s: the control is gone`));
+});
+
 // --- questions ---------------------------------------------------------------------
 
 /** Answer the pending step once a tool has opened one. */

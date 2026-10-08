@@ -2,7 +2,8 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { elementLine } from '../../../shared/uitree.js';
 import { windowBlocker } from '../../../shared/windows.js';
-import { postToHud, speak } from '../../hud.js';
+import { hasLocalVoice, postToHud, speak } from '../../hud.js';
+import { settings } from '../../settings.js';
 import { beginStep } from '../../steps.js';
 import { focusWindow, resolveWindowInfo, scrollIntoView, scrollWindow } from '../../uia.js';
 import { answerText } from './answers.js';
@@ -77,11 +78,8 @@ export function registerAct(server: McpServer): void {
                     return text(r.scrolled ? `Scrolled into view: ${line}` : `Already in view: ${line}`);
                 }
 
-                await scrollWindow(w.ref, args.notches);
-                return text(
-                    `Scrolled ${args.notches} notch(es). Re-read to see the new content; some apps ignore ` +
-                        'wheel messages unless the pointer is over them.'
-                );
+                const r = await scrollWindow(w.ref, args.notches);
+                return text(scrollReport(args.notches, r.before, r.after));
             })
     );
 
@@ -102,9 +100,9 @@ export function registerAct(server: McpServer): void {
         },
         async (args, extra) => {
             postToHud(args.text, args.level);
-            const unspoken = args.speak && !speak(args.text, 1);
+            const unspoken = args.speak && !speak(args.text, settings().speechRate) ? whyUnspoken() : undefined;
             if (!args.options?.length) {
-                if (unspoken) return text('Shown, but not spoken: the overlay panel is not running.');
+                if (unspoken) return text(`Shown, but not spoken: ${unspoken}.`);
                 return text(args.speak ? 'Shown and spoken.' : 'Shown.');
             }
 
@@ -122,7 +120,37 @@ export function registerAct(server: McpServer): void {
             });
             const answer = await step.answer;
             const said = answerText(answer, Date.now() - started) ?? 'The question ended without an answer.';
-            return text(unspoken ? `${said}\n(Not spoken: the overlay panel is not running.)` : said);
+            return text(unspoken ? `${said}\n(Not spoken: ${unspoken}.)` : said);
         }
     );
+}
+
+/** Why the panel could not say something aloud: the two causes have different fixes. */
+function whyUnspoken(): string {
+    return hasLocalVoice() === false
+        ? 'no local voice is installed (Windows Settings > Time & language > Speech adds one)'
+        : 'the overlay panel is not running';
+}
+
+/**
+ * What a wheel scroll did, from the scroll position before and after. Some
+ * apps ignore wheel messages unless the pointer is over them, and a list
+ * already at its end cannot move; "Scrolled 3 notches" said neither, and the
+ * agent re-read an unchanged window expecting new content.
+ */
+function scrollReport(notches: number, before?: number, after?: number): string {
+    if (before === undefined || after === undefined) {
+        return (
+            `Scrolled ${notches} notch(es). Re-read to see the new content; some apps ignore wheel messages ` +
+            'unless the pointer is over them.'
+        );
+    }
+    const pct = (v: number): string => `${Math.round(v)}%`;
+    if (Math.round(before) === Math.round(after)) {
+        return (
+            `Scrolled ${notches} notch(es), but nothing moved (still at ${pct(after)}): it is already at the end, ` +
+            'or the app ignores wheel messages without the pointer over it. Ask the user to scroll.'
+        );
+    }
+    return `Scrolled ${notches} notch(es): moved ${pct(before)}->${pct(after)}. Re-read to see the new content.`;
 }

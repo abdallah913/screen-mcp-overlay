@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { Annotation } from '../../../shared/types.js';
 import { store } from '../../store.js';
 import { SHAPE_TYPES, guarded, text } from './common.js';
 import { anchorNotes, ids, placeAnchored, placeFixed, resolveAnchor, stepRange } from './anchoring.js';
@@ -103,19 +104,34 @@ export function registerDraw(server: McpServer): void {
 /** How long a target may be gone before the agent is told its drawing is not showing. */
 const HIDDEN_NOTE_MS = 5000;
 
+/** Why a drawing is not showing, in the words the agent passes on, with what fixes it. */
+const HIDDEN_WHY: Record<NonNullable<Annotation['hiddenReason']> | 'unknown', string> = {
+    minimized: 'its window is minimised (focus_window restores it)',
+    closed: 'its window was closed',
+    'other-desktop': 'its window is on another virtual desktop (focus_window fetches it)',
+    gone: 'the control is gone, e.g. its menu or dialog closed',
+    unknown: 'the target is minimised, closed or gone'
+};
+
 /**
  * Drawings whose target has been gone for a while (window minimised or closed,
  * control rebuilt and not yet re-found). They are kept so they come back with
  * their target, but meanwhile the user sees nothing, and the agent believes its
- * guidance is on screen unless something says otherwise.
+ * guidance is on screen unless something says otherwise. Each reason gets its
+ * own line, since each has a different fix.
  */
 function hiddenNote(): string {
     const now = Date.now();
     const gone = store.list().filter(a => a.hidden && a.hiddenSince !== undefined && now - a.hiddenSince > HIDDEN_NOTE_MS);
     if (gone.length === 0) return '';
-    const secs = Math.round((now - Math.min(...gone.map(a => a.hiddenSince!))) / 1000);
-    return (
-        `\nNote: ${ids(gone)} not showing for ${secs}s: the target is minimised, closed or gone. They come ` +
-        'back if it does; clear_annotations removes them.'
-    );
+    const byReason = new Map<keyof typeof HIDDEN_WHY, Annotation[]>();
+    for (const a of gone) {
+        const reason = a.hiddenReason ?? 'unknown';
+        byReason.set(reason, [...(byReason.get(reason) ?? []), a]);
+    }
+    const lines = [...byReason].map(([reason, list]) => {
+        const secs = Math.round((now - Math.min(...list.map(a => a.hiddenSince!))) / 1000);
+        return `Note: ${ids(list)} not showing for ${secs}s: ${HIDDEN_WHY[reason]}.`;
+    });
+    return `\n${lines.join('\n')} They come back with their target; clear_annotations removes them.`;
 }

@@ -1,6 +1,6 @@
 import { describeWindow, windowInfo, type Described, type WindowInfo } from './uia.js';
 import { store } from './store.js';
-import { clean, diagnoseTree, diffLines, elevatedNote, row, toSnapshotNodes } from '../shared/uitree.js';
+import { clean, collapseRuns, diagnoseTree, diffLines, elevatedNote, row, toSnapshotNodes } from '../shared/uitree.js';
 /**
  * Renders a window's accessible tree as compact indented text, and diffs it
  * against an earlier snapshot when asked.
@@ -83,6 +83,8 @@ export async function describeWindowAsText(opts: DescribeOptions): Promise<strin
         );
     }
 
+    // The snapshot keeps every row and only the printed text collapses long
+    // lists, so a later since= diff still sees a change inside a collapsed row.
     const snapshotNodes = toSnapshotNodes(nodes);
     const id = store.recordSnapshot({
         id: store.nextId('snap'),
@@ -102,7 +104,7 @@ export async function describeWindowAsText(opts: DescribeOptions): Promise<strin
     const note = diagnosis ? `\n\nNOTE: ${diagnosis}` : '';
 
     const full =
-        snapshotNodes.map(n => row(n, opts.includeRects ?? false)).join('\n') +
+        collapseRuns(snapshotNodes).map(n => row(n, opts.includeRects ?? false)).join('\n') +
         truncationNote(described) +
         `\nsnapshotId: ${id}` +
         note;
