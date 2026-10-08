@@ -70,6 +70,8 @@ export interface DescribedNode {
     popup?: boolean;
     /** Last kept item of a long same-role run: how many more siblings the walk skipped. */
     more?: number;
+    /** Rows inside an open popup: the popup's own ref, not the described window. */
+    window?: string;
 }
 
 export interface Described {

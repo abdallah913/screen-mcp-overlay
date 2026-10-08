@@ -290,6 +290,16 @@ export function startMcpServer(preferredPort: number, host = '127.0.0.1'): Promi
             }
 
             if (url.pathname === '/mcp') {
+                // Stateless: each request gets a fresh server that can never push
+                // on a standalone stream, so there is no GET stream to open and no
+                // session to DELETE. Answering them used to park a GET for as long
+                // as a client stayed connected, which counted as an active request
+                // and kept idle drawings from ever fading. The SDK client treats
+                // 405 as "no stream".
+                if (req.method === 'GET' || req.method === 'DELETE') {
+                    res.writeHead(405, { allow: 'POST' }).end();
+                    return;
+                }
                 if (!tokenMatches(suppliedToken(req, url), settings().token)) {
                     res.writeHead(401, { 'content-type': 'application/json' });
                     res.end(
