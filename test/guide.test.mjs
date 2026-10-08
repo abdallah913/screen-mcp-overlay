@@ -980,3 +980,30 @@ test('a blocked step reports progress to a client that asked for it', async () =
     assert.match((await result).content[0].text, /^SKIPPED/);
     await client.close();
 });
+
+// --- coverage is measured where the target lives ---------------------------------
+
+test('a menu item is measured against its own open menu, not the app window under it', async () => {
+    const asked = [];
+    const inMenu = { ...save, window: '500' };
+    fakeHelper({
+        find_elements: p => (p.name === 'Save' ? [inMenu] : []),
+        covered: p => {
+            asked.push(p.window);
+            return { fraction: 0, centre_covered: false, by: [] };
+        }
+    });
+    await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'appears', name: 'Saved' }, timeoutMs: 1000 });
+    assert.ok(asked.length > 0, 'coverage was checked');
+    assert.ok(asked.every(w => w === '500'), `measured against ${asked.join(', ')}`);
+});
+
+test('when the chat panel is what covers the target, the advice is to move the panel', async () => {
+    fakeHelper({
+        find_elements: finder(() => [saved]),
+        covered: () => ({ fraction: 0.9, centre_covered: true, by: ["the overlay's chat panel"] })
+    });
+    const { text } = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
+    assert.match(text, /behind "the overlay's chat panel"; ask the user to drag the chat panel aside or hide it with Ctrl\+Shift\+O\./);
+    assert.equal(/focus_window \{window/.test(text), false);
+});

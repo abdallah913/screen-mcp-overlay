@@ -139,13 +139,14 @@ You can also type a reply in the panel while a step is waiting; it goes straight
 |---|---|
 | `Ctrl+Shift+O` | Show / hide the chat panel |
 | `Ctrl+Shift+X` | Clear everything drawn on screen and stop the current step |
-| `Ctrl+Shift+F9` | Done (only while a step is waiting) |
-| `Ctrl+Shift+F10` | Can't find it (only while a step is waiting) |
+| `Ctrl+Shift+F9` | Done (only while the agent is waiting for you to do a step) |
+| `Ctrl+Shift+F10` | Can't find it (same) |
 | `Escape` | Cancel, while the agent has asked you to click somewhere |
 
-The step keys are registered only while a step is waiting, and can be changed in
-`%APPDATA%\screen-mcp-overlay\settings.json` (`stepKeys`). The tray menu also has **Read steps aloud**
-and **Sound cues**.
+The step keys are registered only while a step is waiting, so they never take those keys from your other
+apps, and can be changed or turned off (`""` or `null`) in
+`%APPDATA%\screen-mcp-overlay\settings.json` (`stepKeys`). The panel's card also has **Show me**, which
+points at the target again. The tray menu has **Read steps aloud** and **Sound cues**.
 
 There's also a **built-in chat panel** (bottom-right, draggable) if you'd rather not switch to a
 terminal, which can **follow** a Claude Code conversation you already have open in VS Code so you see

@@ -1,5 +1,5 @@
 import type { SnapshotNode } from '../shared/types.js';
-import { toSnapshotNodes } from '../shared/uitree.js';
+import { toSnapshotNodes, type TreeRow } from '../shared/uitree.js';
 import {
     describeWindow,
     findElements,
@@ -175,7 +175,9 @@ export function controlSignature(matches: Pick<ElementInfo, 'name' | 'value' | '
 export function treeSignature(nodes: SnapshotNode[]): string {
     return nodes
         .filter(n => n.role !== 'text' && !/(^|\/)(statusbar|progressbar)\[/.test(n.key))
-        .map(n => `${n.key}|${n.enabled ? 1 : 0}|${n.state ?? ''}|${n.value ?? ''}`)
+        // A list growing past the helper's cut changes only the count of rows
+        // it skipped, so that count is part of the signature.
+        .map(n => `${n.key}|${n.enabled ? 1 : 0}|${n.state ?? ''}|${n.value ?? ''}|${(n as TreeRow).unread ?? ''}`)
         .join('\n');
 }
 

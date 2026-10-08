@@ -15,6 +15,7 @@ import {
     coverage,
     describeWindow,
     elementAtPoint,
+    knownControl,
     listAllWindows,
     resolveRefs,
     resolveWindow,
@@ -237,15 +238,26 @@ function goneWhy(reason: Annotation['hiddenReason'], windowTitle: string): strin
 function coveredNote(c: Coverage, what: string, windowTitle: string): string | null {
     const by = c.by.filter(t => clean(t) !== '');
     if (by.length === 0 || !(c.centre_covered || c.fraction >= 0.5)) return null;
-    return (
-        `WARNING: ${what} is ${Math.round(c.fraction * 100)}% behind ${by.slice(0, 2).map(quote).join(', ')}; ` +
-        `focus_window {window:${JSON.stringify(windowTitle)}} brings it forward.`
-    );
+    // Raising the app would not help when our own panel is what is on top,
+    // and the agent cannot move it: only the user can.
+    const fix = by.every(t => t === PANEL)
+        ? 'ask the user to drag the chat panel aside or hide it with Ctrl+Shift+O.'
+        : `focus_window {window:${JSON.stringify(windowTitle)}} brings it forward.`;
+    return `WARNING: ${what} is ${Math.round(c.fraction * 100)}% behind ${by.slice(0, 2).map(quote).join(', ')}; ${fix}`;
 }
 
-async function coverageOf(windowRef: string, rect: Rect): Promise<Coverage | null> {
+/** How the helper names the chat panel when it is what covers a target. */
+const PANEL = "the overlay's chat panel";
+
+/**
+ * Coverage of a control, measured against the top-level window it actually
+ * lives in: a menu item's own open menu, not the app window under it, or
+ * every menu step would warn that the item is behind its menu.
+ */
+async function coverageOf(windowRef: string, rect: Rect, controlRef?: string): Promise<Coverage | null> {
+    const top = (controlRef && knownControl(controlRef)?.top) || windowRef;
     try {
-        return await coverage(windowRef, rect);
+        return await coverage(top, rect);
     } catch {
         // Best effort: a failed read must not cost the step.
         return null;
@@ -275,7 +287,7 @@ async function targetStatus(circleId: string | undefined, windowRef: string, win
         return '';
     }
     if (!rect) return 'The circled control is not on screen now.';
-    const c = await coverageOf(windowRef, rect);
+    const c = await coverageOf(windowRef, rect, circle.anchor.ref);
     const covered = c && coveredNote(c, 'the circled control', windowTitle);
     if (covered) return covered;
     if (c && c.fraction > 0.2) {
@@ -831,7 +843,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
                     'with its name, or ask the user to scroll.'
             );
         }
-        const c = await coverageOf(windowRef, target.rect);
+        const c = await coverageOf(target.top ?? windowRef, target.rect);
         const covered = c && coveredNote(c, target.what, windowTitle);
         if (covered) {
             warnings.push(covered);
@@ -1055,7 +1067,7 @@ async function clickVerdict(
     // the user saw under the circle was that window.
     if (circle.anchor) {
         const [live] = await resolveRefs([circle.anchor.ref]).catch(() => []);
-        const c = live?.rect ? await coverageOf(windowRef, live.rect) : null;
+        const c = live?.rect ? await coverageOf(windowRef, live.rect, circle.anchor.ref) : null;
         const by = c?.centre_covered ? c.by.find(t => clean(t) !== '') : undefined;
         if (by !== undefined) {
             return {

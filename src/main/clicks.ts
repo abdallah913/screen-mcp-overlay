@@ -4,7 +4,7 @@ import { physicalToImagePoint, rectContains } from '../shared/geometry.js';
 import { listDisplays } from './displays.js';
 import { hudBounds } from './hud.js';
 import { store } from './store.js';
-import { addClick, cancelStep, currentCaptureId } from './steps.js';
+import { addClick, cancelStep, currentCaptureId, currentStep } from './steps.js';
 
 /**
  * Human-in-the-loop pointing. While a click-mode step is pending the overlay
@@ -17,8 +17,18 @@ import { addClick, cancelStep, currentCaptureId } from './steps.js';
  * while a blocking tool call works everywhere.
  */
 
+/**
+ * Whether a message from the overlay is about the step pending now. The overlay
+ * names the step it was showing; a click or Escape aimed at a step that has
+ * just been replaced must not answer the new one.
+ */
+function forCurrentStep(id: unknown): boolean {
+    return typeof id === 'string' && id === currentStep()?.id;
+}
+
 export function initClicks(): void {
-    ipcMain.on('overlay:click', (_e, payload: { displayId: string; dip: Point }) => {
+    ipcMain.on('overlay:click', (_e, payload: { id?: unknown; displayId: string; dip: Point }) => {
+        if (!payload || !forCurrentStep(payload.id)) return;
         const display = listDisplays().find(d => d.id === payload.displayId);
         if (!display) return;
         // The panel is raised above the overlay while a click is pending, so a
@@ -50,8 +60,8 @@ export function initClicks(): void {
         addClick(result);
     });
 
-    ipcMain.on('overlay:cancel-click', () => {
-        cancelStep('esc');
+    ipcMain.on('overlay:cancel-click', (_e, payload: { id?: unknown }) => {
+        if (forCurrentStep(payload?.id)) cancelStep('esc');
     });
 }
 

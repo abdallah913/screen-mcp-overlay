@@ -233,8 +233,11 @@ What makes a step trustworthy:
   and a control-level `until` is checked before drawing: already true returns `NOT started` (pick a
   state the user's action changes), or `Already done` when the target is gone too.
 - **`changes`** waits for a control's name, value or state to change, or, with no selector, for a
-  window to open or close. `until.value` matches a value or a state word (`checked`, `expanded`), so
-  "tick Dark mode" can be confirmed.
+  window to open or close. Focus moving is not a change (a click focuses things), and neither is a
+  window being minimised or restored. `until.value` matches a value or a state word (`checked`,
+  `expanded`), so "tick Dark mode" can be confirmed.
+- **A check that could not run is not a "no".** When the final check fails (the app hung, the helper
+  restarted), the result says the `until` could not be checked rather than reporting NOT met.
 - **The result says what changed.** An `After:` block lists windows opened or closed since the step
   began, the actionable rows of a new dialog (capped, with a snapshotId), or a capped diff of the step's
   window, so the agent rarely needs a describe_window between steps. A step that is NOT met gets a digest
@@ -246,7 +249,8 @@ What makes a step trustworthy:
   defaults to whatever the last `until` matched, and the plan stops at the first step that is not met,
   with one line per step.
 - **A prompt that starts with `n/N`** ("2/5 Click Export") is progress: the overlay and the panel show
-  it as a pill. A convention rather than a parameter, so it costs nothing in the tool list.
+  it as a pill, and the last step, once met, shows "All N steps done". A convention rather than a
+  parameter, so it costs nothing in the tool list.
 
 Every outcome names what was circled and where (`Circled "Export" [button], top-left of "Paint"`), and
 a step clears only its own drawings.
@@ -301,7 +305,11 @@ forwarded mouse moves against its rectangle, and the main process lets that one 
 while the pointer is over it, with a timer that restores click-through if the pointer leaves unseen. The
 step keys are registered only while a step is pending, and only the ones that registered are shown.
 Escape is grabbed only in click mode: during a watched step the user is in their app, where Escape
-closes dialogs.
+closes dialogs. The Done and Can't-find-it keys are grabbed only during watched steps, for the same
+reason in reverse: a click request or a question is answered by pointing or choosing. Messages from the
+overlay name the step they were shown for, so a click meant for a step that was just replaced never
+answers the new one. The panel card's **Show me** replays the ping on the target and re-reads the
+prompt.
 
 A step always resolves, never rejects, and every result leads with a status word the server
 instructions teach: `Met`, `NOT met`, `NOT started`, `DONE`, `STUCK`, `SKIPPED`, `REPLIED`, `CHOSE`,
@@ -312,8 +320,10 @@ STUCK says whether the target is hidden, scrolled away or covered.
 
 A step also ends when the client gives up. The MCP request's abort signal (Esc in Claude Code, a client
 timeout) ends it at once instead of leaving the overlay waiting, which in click mode used to mean every
-click on every monitor was swallowed until the timeout. Long waits send progress notifications, so a
-client that resets its timeout on progress keeps the call alive. A newer step supersedes an older one,
+click on every monitor was swallowed until the timeout. Long waits send a progress notification every
+10 s when the client asked for progress, so a client that resets its timeout on progress keeps the call
+alive. The endpoint answers GET with 405: a stateless server never pushes, and a parked GET stream
+counted as an active request for as long as a client stayed connected. A newer step supersedes an older one,
 and Ctrl+Shift+X clears the screen and ends the step.
 
 `wait_for_user_click` names what the user pointed at (`-> "Export As…" [menuitem] el_44 in "Paint"`)
@@ -354,10 +364,15 @@ through UI Automation's ElementFromPoint, so a correction needs no describe and 
 - **Menus and dropdowns are separate windows.** Win32 menus, WPF and XAML flyouts and most dropdowns
   are top-level popups of the app's process, outside a search rooted at the app's window, so step 2 of
   almost every walkthrough ("click File", then "Save as") stalled for the full timeout. Searches and
-  describes now look in the window's visible same-process popups first.
+  describes now look in the window's visible same-process popups first. A popup has to belong to the
+  window: a menu created by its thread, a window it owns, or one strictly overlapping it. Shell windows
+  (the taskbar, the desktop) never count, which matters for Explorer, whose process owns both. A
+  control in a popup is measured for coverage against that popup, and the window's own menus never
+  count as covering it.
 - **describe_window's budget counts the rows it prints**, not the unnamed wrappers it walked past, and
   it says when it stopped and which subtrees it never reached. Long lists are cut short in the walk
-  itself, with a count, so the budget reaches the buttons after them. Rows carry state words
+  itself (eight rows of a run, plus any selected or focused one, then a count of the rest), so the
+  budget reaches the buttons after them. Open popups get their own share of the budget. Rows carry state words
   (`checked`, `expanded`, `selected`, `focused`), and the diff reports them
   (`~ Dark mode [checkbox] unchecked -> checked`).
 - **Window blockers have names.** A minimised window can still be named by title, with a note. One on
@@ -366,8 +381,9 @@ through UI Automation's ElementFromPoint, so a correction needs no describe and 
 - **read_text reads the window it was asked about**, rendered by PrintWindow as capture_screen does,
   and falls back to a screen crop with a warning when the render fails or comes back blank.
 - **Fewer cross-process calls.** Property reads are batched with UI Automation cache requests (with a
-  live read on any error), and bounded connection and transaction timeouts stop a hung app from wedging
-  the single-threaded helper.
+  live read on any error, but not after a timeout or a dead provider), and bounded connection and
+  transaction timeouts stop a hung app from wedging the single-threaded helper. The anchor tracker's
+  calls are held to one second, under its own deadline, and skip a window Windows reports as hung.
 
 ## Anchored annotations — drawings that follow their target
 
