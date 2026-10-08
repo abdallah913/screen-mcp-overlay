@@ -9,16 +9,20 @@ import {
     localPart,
     nearestIsHere,
     opensDownward,
+    overStrip,
     overlapArea,
     parseUserAnswer,
     placeCaptions,
     ringShape,
     routeTo,
     shapeBounds,
+    showsStrip,
     stepBadge,
     stripProgress,
+    takesMouse,
     timeLeft,
     visibleFraction,
+    waitingNote,
     wrapText
 } from '../dist-test/layout.js';
 import { DEFAULT_COLORS, contrastRatio, parseColor, relativeLuminance, textOn } from '../dist-test/palette.js';
@@ -225,9 +229,72 @@ test('edge pointers sit inside the view and point out toward the target', () => 
 
 test('the lead display holds the step target, else the primary', () => {
     const step = { targetIds: ['a1'] };
-    assert.equal(leadDisplay(step, [ann({ displayId: 'd2', hidden: true })], 'd1'), 'd2', 'a hidden target still leads');
-    assert.equal(leadDisplay(step, [], 'd1'), 'd1');
-    assert.equal(leadDisplay(null, [ann()], 'd1'), 'd1');
+    const live = new Set(['d1', 'd2']);
+    assert.equal(leadDisplay(step, [ann({ displayId: 'd2', hidden: true })], 'd1', live), 'd2', 'a hidden target still leads');
+    assert.equal(leadDisplay(step, [], 'd1', live), 'd1');
+    assert.equal(leadDisplay(null, [ann()], 'd1', live), 'd1');
+});
+
+test('a target whose display was unplugged does not take the strip with it', () => {
+    const step = { targetIds: ['a1', 'a2'] };
+    const gone = ann({ displayId: 'd2', hidden: true });
+    assert.equal(leadDisplay(step, [gone], 'd1', new Set(['d1'])), 'd1', 'back to the primary');
+    const second = ann({ id: 'a2', displayId: 'd3' });
+    assert.equal(leadDisplay(step, [gone, second], 'd1', new Set(['d1', 'd3'])), 'd3', 'or the next target that is still on a display');
+});
+
+test('the strip shows on the lead, and on every display for a click with no target', () => {
+    const watch = { mode: 'watch', targetIds: ['a1'] };
+    assert.equal(showsStrip(watch, true), true);
+    assert.equal(showsStrip(watch, false), false);
+    assert.equal(showsStrip({ mode: 'click', targetIds: ['a1'] }, false), false, 'a circled click points from the other displays');
+    assert.equal(showsStrip({ mode: 'click', targetIds: [] }, false), true, 'every display takes the click, so every one explains it');
+    assert.equal(showsStrip(null, true), false);
+});
+
+test('while every step target is hidden, the strip says what it is waiting for', () => {
+    const step = { targetIds: ['a1'] };
+    const anchored = (label, over = {}) => ann({ hidden: true, anchor: { kind: 'element', ref: 'el_3', label, fit: true, pad: 8 }, ...over });
+    const element = '"Save" [button] el_3, top-left of "Untitled - Notepad"';
+
+    assert.equal(
+        waitingNote(step, [anchored(element, { hiddenReason: 'minimized' })]),
+        'Waiting for “Untitled - Notepad” to come back: it was minimised. Restore it to carry on.'
+    );
+    assert.match(waitingNote(step, [anchored(element, { hiddenReason: 'closed' })]), /“Untitled - Notepad”.*closed/);
+    assert.match(waitingNote(step, [anchored(element, { hiddenReason: 'other-desktop' })]), /another virtual desktop/);
+    assert.match(
+        waitingNote(step, [anchored('window 0x1A2B "Paint"', { hiddenReason: 'minimized' })]),
+        /^Waiting for “Paint”/,
+        'a window anchor names its own title'
+    );
+    // A menu that closed: the window is still there, so the control is named.
+    assert.match(waitingNote(step, [anchored('"Save As…" [menuitem] el_9, in a popup of "Notepad"')]), /^Waiting for “Save As…” to come back: it is no longer on screen/);
+    assert.match(waitingNote(step, [anchored('[button] el_4', { hiddenReason: 'closed' })]), /^Waiting for the app/);
+    assert.match(waitingNote(step, [anchored('[button] el_4')]), /^Waiting for the target/);
+
+    assert.equal(waitingNote(step, [ann()]), undefined, 'a visible target needs no note');
+    assert.equal(waitingNote({ targetIds: ['a1', 'a2'] }, [anchored(element), ann({ id: 'a2' })]), undefined, 'one target still showing is enough');
+    assert.equal(waitingNote({ targetIds: [] }, [anchored(element)]), undefined, 'a step without a target');
+    assert.equal(waitingNote(null, [anchored(element)]), undefined);
+});
+
+test('an overlay takes the mouse only with a live page, while picking or hovered', () => {
+    assert.equal(takesMouse({ live: true, picking: false, hovered: false }), false, 'click-through by default');
+    assert.equal(takesMouse({ live: true, picking: true, hovered: false }), true);
+    assert.equal(takesMouse({ live: true, picking: false, hovered: true }), true);
+    // A crashed or hung page would be an invisible sheet swallowing the click step's clicks.
+    assert.equal(takesMouse({ live: false, picking: true, hovered: true }), false);
+});
+
+test('the pointer is over a strip given in its display local DIPs, with slack', () => {
+    const origin = { x: 1920, y: 0 };
+    const strip = { x: 700, y: 24, width: 500, height: 80 };
+    assert.equal(overStrip({ x: 2700, y: 60 }, origin, strip), true);
+    assert.equal(overStrip({ x: 2617, y: 60 }, origin, strip), true, 'within the slack of its left edge');
+    assert.equal(overStrip({ x: 700 + 20, y: 60 }, origin, strip), false, 'the same local point on another display');
+    assert.equal(overStrip({ x: 2700, y: 200 }, origin, strip), false);
+    assert.equal(overStrip({ x: 2700, y: 60 }, origin, null), false, 'no strip shown');
 });
 
 test('the chat panel is excluded only where it overlaps a display', () => {

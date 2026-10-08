@@ -63,6 +63,12 @@ body.picking #c { cursor: crosshair; }
     align-self: center;
     border-radius: 50%;
     background: #ff2d95;
+}
+
+/* Blink only while the strip is shown. A hidden strip is only visibility:hidden,
+   and Chromium keeps running animations there, so an unconditional blink kept
+   every overlay painting at the display's refresh rate with nothing on screen. */
+#strip.visible #strip-dot {
     animation: blink 1.2s ease-in-out infinite;
 }
 
@@ -93,6 +99,15 @@ body.picking #c { cursor: crosshair; }
     font-size: 12px;
     font-variant-numeric: tabular-nums;
 }
+
+/* The target went away mid-step: say what the step is waiting for. */
+#strip-wait {
+    color: #ffd60a;
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+#strip-wait:empty { display: none; }
 
 #strip-actions {
     display: flex;
@@ -142,6 +157,6 @@ body.picking #c { cursor: crosshair; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    #strip-dot { animation: none; }
+    #strip.visible #strip-dot { animation: none; }
     #strip { transition: none; }
 }
