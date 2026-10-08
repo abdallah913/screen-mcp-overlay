@@ -1,4 +1,6 @@
-import { findElements, listWindows, type ElementInfo } from './uia.js';
+import type { SnapshotNode } from '../shared/types.js';
+import { toSnapshotNodes } from '../shared/uitree.js';
+import { describeWindow, findElements, listWindows, type ElementInfo, type WindowInfo } from './uia.js';
 
 /**
  * Blocking waits on UI state.
@@ -17,7 +19,7 @@ import { findElements, listWindows, type ElementInfo } from './uia.js';
  * that, but it changes nothing about the token cost this exists to solve.
  */
 
-export type WaitCondition = 'appears' | 'disappears' | 'enabled';
+export type WaitCondition = 'appears' | 'disappears' | 'enabled' | 'changes';
 
 export interface WaitRequest {
     condition: WaitCondition;
@@ -25,53 +27,106 @@ export interface WaitRequest {
     name?: string;
     role?: string;
     automationId?: string;
+    /** A value substring or a state word (checked, expanded, …) the match must carry. */
+    value?: string;
     timeoutMs: number;
     pollMs: number;
+    /**
+     * Top-level windows that were already open when the step began. A window
+     * wait counts only windows outside it: otherwise "a window appeared" is true
+     * the moment any window is open, and the step confirms before the user acts.
+     */
+    baseline?: Set<string>;
+    /** Stop at once: the request went away, or the user answered the step. */
+    signal?: AbortSignal;
+    /** Check once more right now, then return: the user says they are done. */
+    lastCheck?: AbortSignal;
+    /** Asked between checks; a reason ends the wait unmet. */
+    giveUp?: () => string | null;
 }
 
 export interface WaitOutcome {
     met: boolean;
     waitedMs: number;
-    /** The control that satisfied the condition, for `appears` and `enabled`. */
+    /** The control that satisfied the condition, for `appears`, `enabled` and `changes`. */
     element?: ElementInfo;
     /** How many times the tree was searched, so cost is visible. */
     polls: number;
+    /**
+     * Why an unmet wait ended before its timeout: the window it searched
+     * closed, the caller stopped it, the user asked for a last check, or
+     * `giveUp` said so (`reason`).
+     */
+    ended?: 'window-closed' | 'aborted' | 'last-check' | 'gave-up';
+    reason?: string;
+    /** Met because the searched window itself closed (a `disappears` or `changes` wait). */
+    windowClosed?: boolean;
+    /**
+     * Unmet: the closest the last check came. A control that is there but
+     * disabled, or lacks the value; a window that was already open.
+     */
+    seen?: ElementInfo;
 }
 
-function satisfied(condition: WaitCondition, matches: ElementInfo[]): ElementInfo | null | false {
-    switch (condition) {
+/**
+ * Whether a control carries the wanted value. A state word must match a whole
+ * word, or "checked" would match "unchecked"; a value matches as a
+ * case-insensitive substring, which is how typing steps are confirmed.
+ */
+export function valueMatches(e: Pick<ElementInfo, 'value' | 'state'>, want: string | undefined): boolean {
+    const w = want?.trim().toLowerCase();
+    if (!w) return true;
+    if (e.state?.split(',').some(s => s.trim().toLowerCase() === w)) return true;
+    return (e.value ?? '').toLowerCase().includes(w);
+}
+
+function satisfied(req: WaitRequest, all: ElementInfo[]): ElementInfo | null | false {
+    const matches = all.filter(m => valueMatches(m, req.value));
+    switch (req.condition) {
         case 'appears':
             return matches[0] ?? false;
-        case 'enabled': {
-            const usable = matches.find(m => m.enabled);
-            return usable ?? false;
-        }
+        case 'enabled':
+            return matches.find(m => m.enabled) ?? false;
         case 'disappears':
             // Nothing to return: success is the absence of a match.
             return matches.length === 0 ? null : false;
+        case 'changes':
+            return false;
     }
 }
 
 /**
- * One check of the current state.
- *
  * Waiting on a top-level window goes through the window list rather than the
  * accessibility tree. An unscoped UIA descendant search costs seconds across a
  * busy desktop, which made detection latency worse than the thing being waited
- * for; EnumWindows answers the same question in milliseconds.
+ * for; EnumWindows answers the same question in milliseconds. With no selector
+ * and no window, "changes" means the window list too: something opened or closed.
  */
-async function probe(req: WaitRequest): Promise<ElementInfo[]> {
-    const wantsWindow = req.role === 'window' && !req.window && !req.automationId;
-    if (wantsWindow) {
-        const needle = req.name?.toLowerCase();
-        return (await listWindows())
-            .filter(w => !needle || w.title.toLowerCase().includes(needle))
-            .map(w => ({ ref: w.ref, name: w.title, role: 'window', rect: w.rect, enabled: true }));
-    }
+export function isTopLevelWait(
+    req: Pick<WaitRequest, 'condition' | 'window' | 'name' | 'role' | 'automationId'>
+): boolean {
+    if (req.window || req.automationId) return false;
+    return req.role === 'window' || (req.condition === 'changes' && !req.name && !req.role);
+}
+
+function hasSelector(req: WaitRequest): boolean {
+    return Boolean(req.name || req.role || req.automationId);
+}
+
+const asElement = (w: WindowInfo): ElementInfo => ({
+    ref: w.ref,
+    name: w.title,
+    role: 'window',
+    rect: w.rect,
+    enabled: true
+});
+
+function controlMatches(req: WaitRequest): Promise<ElementInfo[]> {
     // "Any control of this role appeared" can short-circuit on the first match,
     // which turns a whole-tree walk into an early exit. "enabled" cannot: the
-    // first match may be a disabled one while an enabled one exists.
-    const firstWillDo = req.condition === 'appears' && !req.name && !req.automationId;
+    // first match may be a disabled one while an enabled one exists, and nor
+    // can a value filter, which is applied here rather than in the helper.
+    const firstWillDo = req.condition === 'appears' && !req.name && !req.automationId && !req.value;
     return findElements({
         window: req.window,
         name: req.name,
@@ -81,36 +136,200 @@ async function probe(req: WaitRequest): Promise<ElementInfo[]> {
     });
 }
 
-export async function waitForElement(req: WaitRequest): Promise<WaitOutcome> {
-    const started = Date.now();
-    let polls = 0;
+/** What a selected control looks like, for "changes": gone counts as a change. */
+function controlSignature(matches: ElementInfo[]): string {
+    const m = matches[0];
+    return m ? JSON.stringify([m.name, m.value ?? '', m.enabled, m.state ?? '']) : '';
+}
 
-    for (;;) {
-        polls += 1;
-        let matches: ElementInfo[] = [];
-        try {
-            matches = await probe(req);
-        } catch (err) {
-            // A transient helper failure should not end the wait early, but a
-            // permanent one (missing binary) would spin forever, so surface it.
-            if (Date.now() - started > req.timeoutMs) {
-                throw err;
-            }
-        }
+/**
+ * Rows of a window that a user action changes, for an unselected "changes".
+ * Text rows and anything in a status bar or progress bar are left out: clocks,
+ * caret positions and progress churn constantly with no user action, and
+ * would end the wait before the user did anything.
+ */
+export function treeSignature(nodes: SnapshotNode[]): string {
+    return nodes
+        .filter(n => n.role !== 'text' && !/(^|\/)(statusbar|progressbar)\[/.test(n.key))
+        .map(n => `${n.key}|${n.enabled ? 1 : 0}|${n.state ?? ''}|${n.value ?? ''}`)
+        .join('\n');
+}
 
-        const result = satisfied(req.condition, matches);
-        if (result !== false) {
-            return {
-                met: true,
-                waitedMs: Date.now() - started,
-                element: result ?? undefined,
-                polls
+/** Small: a "changes" check re-reads the window every poll, and the tracker shares the helper. */
+const CHANGES_MAX_NODES = 80;
+const CHANGES_MIN_POLL_MS = 1000;
+
+/**
+ * One check: `hit` is the satisfying control (null when success has no
+ * control, false when unmet); `seen` is the closest an unmet check came.
+ */
+interface Probe {
+    hit: ElementInfo | null | false;
+    seen?: ElementInfo;
+}
+
+type Check = (() => Promise<Probe>) & { slow?: boolean };
+
+const refList = (refs: Iterable<string>): string => [...refs].sort().join(',');
+
+/** The first window in `windows` that is not in the comma-joined `before`. */
+function opened(windows: WindowInfo[], before: string): Probe {
+    const known = new Set(before.split(','));
+    const fresh = windows.find(w => !known.has(w.ref));
+    return { hit: fresh ? asElement(fresh) : null };
+}
+
+/**
+ * Build the per-poll check for a request. "changes" needs memory between polls
+ * (what things looked like at the start), so a check is a closure, not a pure
+ * function of one probe.
+ */
+function makeCheck(req: WaitRequest): Check {
+    if (req.condition !== 'changes') {
+        if (isTopLevelWait(req)) {
+            const needle = req.name?.toLowerCase();
+            const counted = req.condition === 'appears' || req.condition === 'enabled';
+            return async () => {
+                const named = (await listWindows()).filter(w => !needle || w.title.toLowerCase().includes(needle));
+                // A window that was hidden when the step began is not in the
+                // baseline, so it still counts as new when it is shown.
+                const fresh = counted ? named.filter(w => !req.baseline?.has(w.ref)) : named;
+                const hit = satisfied(req, fresh.map(asElement));
+                return { hit, seen: hit === false && named[0] ? asElement(named[0]) : undefined };
             };
         }
+        return async () => {
+            const all = await controlMatches(req);
+            const hit = satisfied(req, all);
+            return { hit, seen: hit === false ? all[0] : undefined };
+        };
+    }
 
-        if (Date.now() - started >= req.timeoutMs) {
-            return { met: false, waitedMs: Date.now() - started, polls };
+    if (isTopLevelWait(req) || (!req.window && !hasSelector(req))) {
+        let before = req.baseline ? refList(req.baseline) : undefined;
+        return async () => {
+            const windows = await listWindows();
+            const now = refList(windows.map(w => w.ref));
+            before ??= now;
+            return now === before ? { hit: false } : opened(windows, before);
+        };
+    }
+
+    if (hasSelector(req)) {
+        let before: string | undefined;
+        return async () => {
+            const matches = await controlMatches(req);
+            const now = controlSignature(matches);
+            before ??= now;
+            return { hit: now === before ? false : (matches[0] ?? null) };
+        };
+    }
+
+    // A whole window, unselected: a debounced diff of its tree, plus the
+    // window list so a dialog it opens counts. The debounce wants the same
+    // changed tree twice in a row, so a redraw in progress does not count.
+    let tree: string | undefined;
+    let pending: string | undefined;
+    let windows = req.baseline ? refList(req.baseline) : undefined;
+    const check: Check = async () => {
+        const listed = await listWindows();
+        const now = refList(listed.map(w => w.ref));
+        windows ??= now;
+        if (now !== windows) return opened(listed, windows);
+        const { nodes } = await describeWindow({ window: req.window!, maxNodes: CHANGES_MAX_NODES });
+        const sig = treeSignature(toSnapshotNodes(nodes));
+        tree ??= sig;
+        if (sig === tree) {
+            pending = undefined;
+            return { hit: false };
         }
-        await new Promise(r => setTimeout(r, req.pollMs));
+        if (pending === sig) return { hit: null };
+        pending = sig;
+        return { hit: false };
+    };
+    check.slow = true;
+    return check;
+}
+
+/** A closed window fails every scoped search with this; anything else is a hiccup. */
+function isWindowGone(err: unknown): boolean {
+    return /no window for ref/i.test((err as Error | undefined)?.message ?? '');
+}
+
+/** Consecutive failed checks after which the failure is the answer. */
+const MAX_FAILURES = 3;
+
+/** Resolve after `ms`, or as soon as any of the signals fires. */
+function pause(ms: number, signals: (AbortSignal | undefined)[]): Promise<void> {
+    const live = signals.filter((s): s is AbortSignal => Boolean(s));
+    if (live.some(s => s.aborted)) return Promise.resolve();
+    return new Promise(resolve => {
+        const done = (): void => {
+            clearTimeout(timer);
+            for (const s of live) s.removeEventListener('abort', done);
+            resolve();
+        };
+        const timer = setTimeout(done, ms);
+        for (const s of live) s.addEventListener('abort', done, { once: true });
+    });
+}
+
+/** Settle with `p`, or with `undefined` as soon as `signal` fires. */
+function unlessAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T | undefined> {
+    if (!signal) return p;
+    // The helper call cannot be withdrawn; if the signal wins, let it finish unobserved.
+    p.catch(() => {});
+    if (signal.aborted) return Promise.resolve(undefined);
+    let onAbort!: () => void;
+    const aborted = new Promise<undefined>(r => {
+        onAbort = () => r(undefined);
+        signal.addEventListener('abort', onAbort, { once: true });
+    });
+    return Promise.race([p, aborted]).finally(() => signal.removeEventListener('abort', onAbort));
+}
+
+export async function waitForElement(req: WaitRequest): Promise<WaitOutcome> {
+    const started = Date.now();
+    const check = makeCheck(req);
+    const pollMs = check.slow ? Math.max(req.pollMs, CHANGES_MIN_POLL_MS) : req.pollMs;
+    const elapsed = (): number => Date.now() - started;
+    let polls = 0;
+    let failures = 0;
+    let succeeded = 0;
+    let seen: ElementInfo | undefined;
+
+    for (;;) {
+        if (req.signal?.aborted) return { met: false, waitedMs: elapsed(), polls, ended: 'aborted' };
+        const last = Boolean(req.lastCheck?.aborted);
+        polls += 1;
+
+        let hit: ElementInfo | null | false = false;
+        try {
+            const probe = await unlessAborted(check(), req.signal);
+            if (probe === undefined) return { met: false, waitedMs: elapsed(), polls, ended: 'aborted' };
+            hit = probe.hit;
+            seen = probe.seen;
+            failures = 0;
+            succeeded += 1;
+        } catch (err) {
+            // Never judge a condition on a failed check: an empty result from
+            // a helper timeout used to read as "disappears: met".
+            if (req.window && isWindowGone(err)) {
+                return req.condition === 'disappears' || req.condition === 'changes'
+                    ? { met: true, waitedMs: elapsed(), polls, windowClosed: true }
+                    : { met: false, waitedMs: elapsed(), polls, ended: 'window-closed' };
+            }
+            failures += 1;
+            // A transient helper failure should not end the wait, but a
+            // persistent one (a hung app, a missing binary) is the answer.
+            if (failures >= MAX_FAILURES || (succeeded === 0 && elapsed() >= req.timeoutMs)) throw err;
+        }
+
+        if (hit !== false) return { met: true, waitedMs: elapsed(), element: hit ?? undefined, polls };
+        if (last) return { met: false, waitedMs: elapsed(), polls, ended: 'last-check', seen };
+        if (elapsed() >= req.timeoutMs) return { met: false, waitedMs: elapsed(), polls, seen };
+        const reason = req.giveUp?.();
+        if (reason) return { met: false, waitedMs: elapsed(), polls, ended: 'gave-up', reason, seen };
+        await pause(Math.min(pollMs, req.timeoutMs - elapsed()), [req.signal, req.lastCheck]);
     }
 }
