@@ -55,6 +55,53 @@ export function choiceForKey(step: StepView, key: string): number | null {
     return index < Math.min(MAX_KEYED, step.options?.length ?? 0) ? index : null;
 }
 
+/** The parts of a keydown the panel's keys depend on. */
+export interface KeyPress {
+    key: string;
+    ctrlKey: boolean;
+    altKey: boolean;
+    metaKey: boolean;
+    isComposing: boolean;
+}
+
+/**
+ * What a key does in the panel. `inBox`: the reply box has focus.
+ * - `hide`: Escape puts the panel away, whatever has focus.
+ * - `choice`: a number key picks an option, but never from inside the reply
+ *   box, where "2 of them are open" would otherwise be sent as option 2.
+ * - `type`: while a question is pending and the box does not have focus (the
+ *   card took it for the number keys), a key that starts a reply (a character,
+ *   a paste, an IME or dead-key composition) moves focus to the box first.
+ *   Focusing it during keydown lets this same key land there; left on the
+ *   card, a paste or a composition went nowhere.
+ */
+export function panelKey(
+    step: StepView | null,
+    e: KeyPress,
+    inBox: boolean
+): { kind: 'hide' } | { kind: 'choice'; index: number } | { kind: 'type' } | null {
+    if (e.key === 'Escape' && !e.isComposing) return { kind: 'hide' };
+    if (inBox || !step || step.mode !== 'choice') return null;
+    const paste = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'v';
+    if (paste || e.isComposing || e.key === 'Process' || e.key === 'Dead') return { kind: 'type' };
+    if (e.ctrlKey || e.altKey || e.metaKey) return null;
+    const index = choiceForKey(step, e.key);
+    if (index !== null) return { kind: 'choice', index };
+    return e.key.length === 1 && e.key !== ' ' ? { kind: 'type' } : null;
+}
+
+/**
+ * Whether a step update should give the reply box back the focus: the card
+ * hid, or a step that is not a question arrived. Only a question moves focus
+ * off the box (onto the card, for its number keys); when the card hides, the
+ * focus falls to <body>, and as the window keeps OS focus no focus event
+ * comes to put it back.
+ */
+export function returnsFocus(prev: StepView | null, next: StepView | null): boolean {
+    if (!next) return prev !== null;
+    return next.id !== prev?.id && next.mode !== 'choice';
+}
+
 /** The prompt without its "n/N " prefix, and the progress it carried. */
 export function stepHeading(step: StepView): { prompt: string; progress: string | null } {
     const parsed = parseProgress(step.prompt);

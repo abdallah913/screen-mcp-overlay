@@ -128,7 +128,13 @@ export interface AnchorSpec {
     kind: 'window' | 'element';
     /** Opaque handle from the UI Automation helper. */
     ref: string;
+    /**
+     * What the target is called, as the user sees it: the control's name, or
+     * a window anchor's title. Empty when it has none; never a ref.
+     */
     label: string;
+    /** The title of the window the target is in (a window anchor's own), to tell the user what a step waits for. */
+    app?: string;
     /** Snap to the anchor's own rectangle rather than using `offset`. */
     fit: boolean;
     /** Physical pixels to grow a fitted rectangle by, so the box frames the target. */

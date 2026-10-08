@@ -1,10 +1,11 @@
 import type { AppStatus, HudMessage, StepView } from '../../shared/types.js';
 import {
     type CardAnswer,
-    choiceForKey,
     clickProgress,
     heldReplyNote,
     keysHint,
+    panelKey,
+    returnsFocus,
     sameText,
     stepButtons,
     stepHeading,
@@ -253,6 +254,7 @@ function logStep(s: StepView): void {
 }
 
 window.hudApi.onStep(next => {
+    const prev = step;
     const fresh = next !== null && next.id !== step?.id;
     if (fresh) logStep(next);
     step = next;
@@ -262,7 +264,19 @@ window.hudApi.onStep(next => {
     // focus, so an empty box gives focus up to the card; typing still goes
     // to the box (see the keydown handler).
     if (fresh && next.mode === 'choice' && document.activeElement === input && !input.value.trim()) card.focus();
+    else if (returnsFocus(prev, next)) refocusInput();
 });
+
+/**
+ * Give the reply box the focus the card had, or that fell to <body> when the
+ * card hid. Focus the user put elsewhere is left alone, and so is text they
+ * selected in the log, which focusing the box would clear.
+ */
+function refocusInput(): void {
+    const at = document.activeElement;
+    const loose = (!at || at === document.body) && document.getSelection()?.isCollapsed !== false;
+    if (!input.disabled && (card.contains(at) || loose)) input.focus();
+}
 
 window.hudApi.onStepEnded(({ id, outcome }) => {
     const body = stepEntries.get(id);
@@ -350,21 +364,17 @@ cardShow.addEventListener('click', () => {
     if (step) window.hudApi.showMe(step.id);
 });
 
-// Number keys pick an option while the panel has focus, but never from inside
-// the reply box: a reply such as "2 of them are open" would otherwise be sent
-// as the choice of option 2.
+// The panel's keys, wherever focus is: the box's own handler only sends.
 document.addEventListener('keydown', e => {
-    if (!step || step.mode !== 'choice' || e.ctrlKey || e.altKey || e.metaKey) return;
-    if (document.activeElement === input) return;
-    const index = choiceForKey(step, e.key);
-    if (index !== null) {
+    const k = panelKey(step, e, document.activeElement === input);
+    if (k?.kind === 'hide') {
+        window.hudApi.hide();
+    } else if (k?.kind === 'choice') {
         e.preventDefault();
-        answer({ kind: 'choice', index });
-        return;
+        answer({ kind: 'choice', index: k.index });
+    } else if (k?.kind === 'type' && !input.disabled) {
+        input.focus();
     }
-    // Any other character starts a typed reply. Focusing the box during
-    // keydown lets this same keystroke land in it.
-    if (e.key.length === 1 && e.key !== ' ' && !input.disabled) input.focus();
 });
 
 // Bringing the panel forward while a step is pending is reaching for the reply
@@ -473,7 +483,6 @@ input.addEventListener('keydown', e => {
         e.preventDefault();
         submit(false);
     }
-    if (e.key === 'Escape') window.hudApi.hide();
 });
 
 function resizeInput(): void {

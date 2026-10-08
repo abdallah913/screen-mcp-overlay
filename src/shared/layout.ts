@@ -168,10 +168,9 @@ const AWAY: Record<NonNullable<Annotation['hiddenReason']>, string> = {
  * "Waiting for “Notepad” to come back: it was minimised. Restore it to carry on."
  *
  * A minimised, closed or other-desktop target took its window with it, so the
- * window is named; one that is simply gone (a menu that closed) is named itself.
- * Both come from the anchor's label, which quotes the control's name first and
- * its window's title last: `"Save" [button] el_3, top-left of "Notepad"`, or
- * `window 0x1A2B "Notepad"`.
+ * window is named; one that is simply gone (a menu that closed) is named itself,
+ * else its window. Names come from the anchor's own fields, never its ref: a
+ * user has no idea what "el_3" or "0x1A2B" is.
  */
 export function waitingNote(step: StepView | null, annotations: Annotation[]): string | undefined {
     if (!step) return undefined;
@@ -179,24 +178,9 @@ export function waitingNote(step: StepView | null, annotations: Annotation[]): s
     if (targets.length === 0 || targets.some(a => !a.hidden)) return undefined;
     const a = targets[0]!;
     const reason = a.hiddenReason ?? 'gone';
-    const label = a.anchor?.label ?? '';
-    const name = reason === 'gone' ? controlName(label) ?? windowTitle(label) : windowTitle(label);
+    const name = (reason === 'gone' ? a.anchor?.label || a.anchor?.app : a.anchor?.app)?.trim();
     const subject = name ? `“${name}”` : reason === 'gone' ? 'the target' : 'the app';
     return `Waiting for ${subject} to come back: ${AWAY[reason]}`;
-}
-
-/** The window title an anchor label ends with, if it names one. */
-function windowTitle(label: string): string | undefined {
-    if (!label.endsWith('"')) return undefined;
-    const window = /^window \S+ "(.+)"$/.exec(label);
-    if (window) return window[1];
-    const at = label.lastIndexOf(' of "');
-    return at >= 0 && at + 5 < label.length - 1 ? label.slice(at + 5, -1) : undefined;
-}
-
-/** The control name an element anchor's label starts with. */
-function controlName(label: string): string | undefined {
-    return /^"(.+?)" (?:\[[^\]]*\] )?\S+(?:, |$)/.exec(label)?.[1];
 }
 
 /**
@@ -578,6 +562,19 @@ export function overStrip(p: Point, origin: Point, strip: Rect | null, slack = 6
 }
 
 /**
+ * Whether a renderer tells main that the pointer is (or is not) over its strip.
+ * `sent` is what it last told main, or null when it cannot know what main
+ * believes: main hovers a strip that docks under a resting pointer by itself,
+ * so after a new strip rect the next answer always goes, or leaving the strip
+ * would go unsaid and the clicks beside it would be eaten. "Over" is repeated
+ * every 200 ms while it holds: main's failsafe may have restored click-through
+ * behind the renderer's back (a pointer that jumped monitors).
+ */
+export function reportsHover(sent: boolean | null, over: boolean, sinceSentMs: number): boolean {
+    return over !== sent || (over && sinceSentMs > 200);
+}
+
+/**
  * Validate an answer arriving from a renderer. The step code trusts its input,
  * and a renderer is the least trusted thing in the process.
  */
@@ -597,4 +594,35 @@ export function parseUserAnswer(x: unknown): UserAnswer | null {
         default:
             return null;
     }
+}
+
+// ------------------------------------------------------------- sound cues
+
+/** What an overlay has already chimed for. */
+export interface CuesHeard {
+    stepId: string | null;
+    done: Set<string>;
+}
+
+/**
+ * Which cues a frame calls for: the start tone for a new step (the lead display
+ * only, or every monitor chimes), the done tone for a new check mark on its
+ * home display. `heard` is null on a page's first frame. A page reloaded after
+ * a crash, or opened for a monitor plugged in mid-step, is only learning what
+ * is already on screen; chiming then replayed a step that began long ago and
+ * every check mark since, every 10 s for a page in a crash loop.
+ */
+export function stepCues(
+    heard: CuesHeard | null,
+    f: Pick<OverlayFrame, 'step' | 'annotations' | 'displayId' | 'cues' | 'lead'>
+): { start: boolean; done: boolean; heard: CuesHeard } {
+    const stepId = f.step?.id ?? null;
+    const done = new Set(f.annotations.filter(a => a.type === 'done' && a.displayId === f.displayId).map(a => a.id));
+    const now = { stepId, done };
+    if (!heard || !f.cues) return { start: false, done: false, heard: now };
+    return {
+        start: f.lead && stepId !== null && stepId !== heard.stepId,
+        done: [...done].some(id => !heard.done.has(id)),
+        heard: now
+    };
 }

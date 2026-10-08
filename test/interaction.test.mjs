@@ -347,6 +347,38 @@ test('number keys pick only options that exist', () => {
     assert.equal(card.choiceForKey(view(), '1'), null, 'not outside a choice');
 });
 
+test('Escape hides the panel wherever the focus is, and a reply started on the card lands in the box', () => {
+    const choice = view({ mode: 'choice', options: ['PNG', 'JPEG'] });
+    const key = (k, over = {}) => ({ key: k, ctrlKey: false, altKey: false, metaKey: false, isComposing: false, ...over });
+    const onCard = (e, s = choice) => card.panelKey(s, e, false);
+
+    assert.deepEqual(onCard(key('Escape')), { kind: 'hide' });
+    assert.deepEqual(card.panelKey(choice, key('Escape'), true), { kind: 'hide' }, 'from the box too, handled once');
+    assert.deepEqual(card.panelKey(null, key('Escape'), false), { kind: 'hide' }, 'with no step');
+    assert.equal(card.panelKey(choice, key('Escape', { isComposing: true }), true), null, 'Escape that cancels a composition');
+
+    assert.deepEqual(onCard(key('2')), { kind: 'choice', index: 1 });
+    assert.deepEqual(onCard(key('v', { ctrlKey: true })), { kind: 'type' }, 'a paste goes to the box');
+    assert.deepEqual(onCard(key('V', { metaKey: true })), { kind: 'type' });
+    assert.deepEqual(onCard(key('Process')), { kind: 'type' }, 'so does an IME composition');
+    assert.deepEqual(onCard(key('Dead')), { kind: 'type' });
+    assert.deepEqual(onCard(key('a')), { kind: 'type' });
+    assert.equal(onCard(key('c', { ctrlKey: true })), null, 'copying from the card');
+    assert.equal(onCard(key(' ')), null);
+    assert.equal(card.panelKey(choice, key('2'), true), null, 'typing "2 of them" in the box');
+    assert.equal(onCard(key('v', { ctrlKey: true }), view()), null, 'not outside a question');
+});
+
+test('the reply box gets the focus back when the card hides or a non-question arrives', () => {
+    const choice = view({ mode: 'choice', options: ['PNG', 'JPEG'] });
+    assert.equal(card.returnsFocus(choice, null), true, 'the question was answered');
+    assert.equal(card.returnsFocus(choice, view({ id: 'step_2' })), true, 'a watch step replaced it');
+    assert.equal(card.returnsFocus(null, view()), true);
+    assert.equal(card.returnsFocus(view(), view({ collected: 1 })), false, 'the same step, updated');
+    assert.equal(card.returnsFocus(choice, view({ id: 'step_2', mode: 'choice', options: ['A'] })), false, 'the next question keeps the card');
+    assert.equal(card.returnsFocus(null, null), false);
+});
+
 test('the card shows progress apart from the prompt, and the time left', () => {
     assert.deepEqual(card.stepHeading(view()), { prompt: 'Click Export', progress: '2/5' });
     assert.deepEqual(card.stepHeading(view({ prompt: 'Open it', progress: { n: 1, of: 3 } })), {

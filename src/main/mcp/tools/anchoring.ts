@@ -175,6 +175,10 @@ export interface ResolvedAnchor {
     covered?: string;
     /** The window it was found in, for the hints a response gives. */
     window?: string;
+    /** What the user knows it as: the control's own name, or a window's title. Unset when it has none. */
+    name?: string;
+    /** The title of the window it is in (a window's own), for the user. */
+    app?: string;
     /**
      * The open popup (menu, dropdown) it sits in, when it is in one: the
      * top-level window its coverage and clicks are measured against, or the
@@ -309,6 +313,7 @@ async function windowAnchor(query: string): Promise<ResolvedAnchor> {
         );
     }
     const what = `window ${ref}${info ? ` "${clean(info.title)}"` : ''}`;
+    const title = info ? clean(info.title) || undefined : undefined;
     const covered = await coverage(ref).then(coverVerdict).catch(() => null);
     return {
         kind: 'window',
@@ -317,6 +322,8 @@ async function windowAnchor(query: string): Promise<ResolvedAnchor> {
         label: what,
         what,
         window: ref,
+        name: title,
+        app: title,
         covered: covered ?? undefined,
         windowNote: resolved.note
     };
@@ -358,6 +365,8 @@ async function described(
         offscreen: found.offscreen || undefined,
         covered: covered ?? undefined,
         window,
+        name: name || undefined,
+        app: info ? clean(info.title) || undefined : undefined,
         top: found.window,
         windowNote: extra.windowNote
     };
@@ -474,7 +483,12 @@ export function placeAnchored(
             anchor: {
                 kind: anchor.kind,
                 ref: anchor.ref,
-                label: anchor.selector?.name ?? anchor.ref,
+                // The user reads this (the strip's waiting note, a pointer's
+                // caption), so it is a name or nothing. An automationId
+                // selector, a bare ref and a window carry no selector name,
+                // and falling back to the ref put "el_3" on screen.
+                label: anchor.name ?? anchor.selector?.name ?? '',
+                app: anchor.app,
                 fit,
                 pad: s.pad ?? 4,
                 offset: fit

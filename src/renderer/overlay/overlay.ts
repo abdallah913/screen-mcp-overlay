@@ -13,15 +13,18 @@ import {
     offScreenText,
     opensDownward,
     placeCaptions,
+    reportsHover,
     ringShape,
     shapeBounds,
     sideToward,
     stepBadge,
+    stepCues,
     stripProgress,
     timeLeft,
     wrapText,
     centre,
     type CaptionRequest,
+    type CuesHeard,
     type OverlayFrame
 } from '../../shared/layout.js';
 
@@ -325,8 +328,8 @@ function badgeRect(a: Annotation): Rect {
 
 let stripKey = '';
 let stripTimer: number | null = null;
-/** What we last told main about the pointer being over the strip. */
-let hoverSent = false;
+/** What we last told main about the pointer being over the strip; null: not known (see sendStrip). */
+let hoverSent: boolean | null = false;
 let stripSent: string | null = null;
 
 function button(label: string, key: string | undefined, onClick: () => void, primary = false): HTMLButtonElement {
@@ -417,20 +420,18 @@ function sendStrip(rect: Rect | null): void {
     const key = rect ? `${rect.x},${rect.y},${rect.width},${rect.height}` : null;
     if (key === stripSent) return;
     stripSent = key;
+    // Main hovers a strip that lands under a resting pointer by itself, so
+    // what it believes may no longer be what we last said.
+    hoverSent = null;
     api.stripRect(rect);
 }
 
 let hoverSentAt = 0;
 
-/**
- * Tell main whether the pointer is over the strip. "Over" is repeated every
- * 200 ms while it holds: main's failsafe may have restored click-through
- * behind our back (a pointer that jumped monitors), and a pointer coming
- * straight back onto the strip would otherwise never re-enable it.
- */
+/** Tell main whether the pointer is over the strip (see reportsHover). */
 function setHover(over: boolean): void {
     const now = performance.now();
-    if (over === hoverSent && !(over && now - hoverSentAt > 200)) return;
+    if (!reportsHover(hoverSent, over, now - hoverSentAt)) return;
     hoverSent = over;
     hoverSentAt = now;
     api.hoverUi(over);
@@ -547,8 +548,8 @@ function scheduleReping(): void {
 // ----------------------------------------------------------------- sound cues
 
 let audio: AudioContext | null = null;
-let lastStepId: string | null = null;
-const heardDone = new Set<string>();
+/** Null until this page's first frame, which only records what is on screen (see stepCues). */
+let heard: CuesHeard | null = null;
 
 /**
  * A short two-note cue: rising for "new step", higher for "done". Played by
@@ -578,15 +579,10 @@ function tone(kind: 'start' | 'done'): void {
 }
 
 function playCues(f: OverlayFrame): void {
-    const stepId = f.step?.id ?? null;
-    if (stepId && stepId !== lastStepId && f.cues && f.lead) tone('start');
-    lastStepId = stepId;
-
-    // The check mark that replaces a met step's circle: chime on its home display.
-    const done = f.annotations.filter(a => a.type === 'done' && a.displayId === f.displayId);
-    if (done.some(a => !heardDone.has(a.id)) && f.cues) tone('done');
-    heardDone.clear();
-    for (const a of done) heardDone.add(a.id);
+    const cues = stepCues(heard, f);
+    heard = cues.heard;
+    if (cues.start) tone('start');
+    if (cues.done) tone('done');
 }
 
 // ------------------------------------------------------------------- state

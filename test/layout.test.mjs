@@ -13,11 +13,13 @@ import {
     overlapArea,
     parseUserAnswer,
     placeCaptions,
+    reportsHover,
     ringShape,
     routeTo,
     shapeBounds,
     showsStrip,
     stepBadge,
+    stepCues,
     stripProgress,
     takesMouse,
     timeLeft,
@@ -254,29 +256,33 @@ test('the strip shows on the lead, and on every display for a click with no targ
 
 test('while every step target is hidden, the strip says what it is waiting for', () => {
     const step = { targetIds: ['a1'] };
-    const anchored = (label, over = {}) => ann({ hidden: true, anchor: { kind: 'element', ref: 'el_3', label, fit: true, pad: 8 }, ...over });
-    const element = '"Save" [button] el_3, top-left of "Untitled - Notepad"';
+    // Shaped like what placeAnchored stores: a name or nothing as the label, the window's title as app.
+    const anchored = (anchor, over = {}) => ann({ hidden: true, anchor: { kind: 'element', ref: 'el_3', fit: true, pad: 8, ...anchor }, ...over });
+    const save = { label: 'Save', app: 'Untitled - Notepad', selector: { window: '0x1A2B', name: 'Save' } };
 
     assert.equal(
-        waitingNote(step, [anchored(element, { hiddenReason: 'minimized' })]),
+        waitingNote(step, [anchored(save, { hiddenReason: 'minimized' })]),
         'Waiting for “Untitled - Notepad” to come back: it was minimised. Restore it to carry on.'
     );
-    assert.match(waitingNote(step, [anchored(element, { hiddenReason: 'closed' })]), /“Untitled - Notepad”.*closed/);
-    assert.match(waitingNote(step, [anchored(element, { hiddenReason: 'other-desktop' })]), /another virtual desktop/);
+    assert.match(waitingNote(step, [anchored(save, { hiddenReason: 'closed' })]), /“Untitled - Notepad”.*closed/);
+    assert.match(waitingNote(step, [anchored(save, { hiddenReason: 'other-desktop' })]), /another virtual desktop/);
     assert.match(
-        waitingNote(step, [anchored('window 0x1A2B "Paint"', { hiddenReason: 'minimized' })]),
+        waitingNote(step, [anchored({ kind: 'window', ref: '0x1A2B', label: 'Paint', app: 'Paint' }, { hiddenReason: 'minimized' })]),
         /^Waiting for “Paint”/,
         'a window anchor names its own title'
     );
     // A menu that closed: the window is still there, so the control is named.
-    assert.match(waitingNote(step, [anchored('"Save As…" [menuitem] el_9, in a popup of "Notepad"')]), /^Waiting for “Save As…” to come back: it is no longer on screen/);
-    assert.match(waitingNote(step, [anchored('[button] el_4', { hiddenReason: 'closed' })]), /^Waiting for the app/);
-    assert.match(waitingNote(step, [anchored('[button] el_4')]), /^Waiting for the target/);
+    const menuItem = { ref: 'el_9', label: 'Save As…', app: 'Notepad' };
+    assert.match(waitingNote(step, [anchored(menuItem)]), /^Waiting for “Save As…” to come back: it is no longer on screen/);
+    assert.match(waitingNote(step, [anchored({ ...menuItem, label: '' })]), /^Waiting for “Notepad”/, 'a control with no name: its window');
+    // A bare ref nothing was known about: no name, no title, and never the ref.
+    assert.equal(waitingNote(step, [anchored({ ref: 'el_4', label: '' }, { hiddenReason: 'closed' })]), 'Waiting for the app to come back: it was closed.');
+    assert.match(waitingNote(step, [anchored({ ref: 'el_4', label: '' })]), /^Waiting for the target/);
 
     assert.equal(waitingNote(step, [ann()]), undefined, 'a visible target needs no note');
-    assert.equal(waitingNote({ targetIds: ['a1', 'a2'] }, [anchored(element), ann({ id: 'a2' })]), undefined, 'one target still showing is enough');
-    assert.equal(waitingNote({ targetIds: [] }, [anchored(element)]), undefined, 'a step without a target');
-    assert.equal(waitingNote(null, [anchored(element)]), undefined);
+    assert.equal(waitingNote({ targetIds: ['a1', 'a2'] }, [anchored(save), ann({ id: 'a2' })]), undefined, 'one target still showing is enough');
+    assert.equal(waitingNote({ targetIds: [] }, [anchored(save)]), undefined, 'a step without a target');
+    assert.equal(waitingNote(null, [anchored(save)]), undefined);
 });
 
 test('an overlay takes the mouse only with a live page, while picking or hovered', () => {
@@ -295,6 +301,19 @@ test('the pointer is over a strip given in its display local DIPs, with slack', 
     assert.equal(overStrip({ x: 700 + 20, y: 60 }, origin, strip), false, 'the same local point on another display');
     assert.equal(overStrip({ x: 2700, y: 200 }, origin, strip), false);
     assert.equal(overStrip({ x: 2700, y: 60 }, origin, null), false, 'no strip shown');
+    // What main hovers by itself when a strip docks under a still pointer: the rect alone.
+    assert.equal(overStrip({ x: 2617, y: 60 }, origin, strip, 0), false, 'beside the strip is the app');
+    assert.equal(overStrip({ x: 2620, y: 60 }, origin, strip, 0), true, 'its edge is the strip');
+});
+
+test('after a new strip rect the renderer reports the pointer whichever way it lies', () => {
+    // Main may have hovered the new strip by itself; leaving it must be heard.
+    assert.equal(reportsHover(null, false, 0), true);
+    assert.equal(reportsHover(null, true, 0), true);
+    assert.equal(reportsHover(false, false, 1000), false, 'nothing new to say');
+    assert.equal(reportsHover(true, false, 0), true, 'leaving');
+    assert.equal(reportsHover(true, true, 50), false);
+    assert.equal(reportsHover(true, true, 250), true, 'over is repeated for main\'s failsafe');
 });
 
 test('the chat panel is excluded only where it overlaps a display', () => {
@@ -311,6 +330,26 @@ test('only well-formed answers from a renderer are accepted', () => {
     assert.equal(parseUserAnswer({ kind: 'clicks' }), null);
     assert.equal(parseUserAnswer(null), null);
     assert.equal(parseUserAnswer({ kind: 'reply' }), null);
+});
+
+// --------------------------------------------------------------- sound cues
+
+test('a fresh page only notes the step and check marks already on screen', () => {
+    const frame = (over = {}) => ({ displayId: 'd1', cues: true, lead: true, step: { id: 's1' }, annotations: [], ...over });
+    const tick = ann({ id: 'done1', type: 'done' });
+
+    // A page reloaded mid-step, possibly every 10 s: no start tone, no done tone.
+    const first = stepCues(null, frame({ annotations: [tick] }));
+    assert.deepEqual([first.start, first.done], [false, false]);
+    const again = stepCues(first.heard, frame({ annotations: [tick] }));
+    assert.deepEqual([again.start, again.done], [false, false], 'nothing new');
+
+    const next = stepCues(again.heard, frame({ step: { id: 's2' }, annotations: [tick, ann({ id: 'done2', type: 'done' })] }));
+    assert.deepEqual([next.start, next.done], [true, true], 'a new step and a new check mark still chime');
+    assert.equal(stepCues(again.heard, frame({ step: { id: 's2' }, lead: false })).start, false, 'only the lead starts a step');
+    assert.equal(stepCues(again.heard, frame({ step: { id: 's2' }, cues: false })).start, false, 'cues switched off');
+    const elsewhere = stepCues(again.heard, frame({ annotations: [tick, ann({ id: 'done3', type: 'done', displayId: 'd2' })] }));
+    assert.equal(elsewhere.done, false, 'a check mark chimes on its own display only');
 });
 
 // ------------------------------------------------------------------ palette

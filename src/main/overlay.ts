@@ -353,8 +353,11 @@ export function initOverlay(): void {
         // mousemove, so the renderer never reports the hover: the next step's
         // strip often docks exactly where the last one's Done was pressed.
         // Without this the click meant for it would fall through to the app.
-        if (rect && cursorOver(entry)) setHovered(entry);
-        else if (!rect && hovered === entry) setHovered(null);
+        // Only the strip's own rect counts, as in the renderer: a pointer in
+        // the failsafe's slack is beside the strip, and its clicks are the
+        // app's. One the strip moved away from goes click-through at once.
+        if (rect && cursorOver(entry, 0)) setHovered(entry);
+        else if (hovered === entry) setHovered(null);
     });
 }
 
@@ -409,9 +412,9 @@ function setHovered(entry: OverlayWindow | null): void {
     }
 }
 
-function cursorOver(entry: OverlayWindow): boolean {
+function cursorOver(entry: OverlayWindow, slack?: number): boolean {
     const b = entry.display.dipBounds;
-    return overStrip(screen.getCursorScreenPoint(), { x: b.x, y: b.y }, entry.strip);
+    return overStrip(screen.getCursorScreenPoint(), { x: b.x, y: b.y }, entry.strip, slack);
 }
 
 /**
