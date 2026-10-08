@@ -2,8 +2,19 @@ import { app, clipboard, globalShortcut, ipcMain, Menu, nativeImage, Tray } from
 import { join } from 'node:path';
 import { cleanupCaptureDir, initCaptureDir } from './capture.js';
 import { initClicks } from './clicks.js';
-import { cancelStep, currentStep } from './steps.js';
-import { createHud, hudWindow, pushMessage, setHudContentProtection, setStatus, toggleHud } from './hud.js';
+import { answerStep, bindStepKeys, cancelStep, currentStep, keyLabel } from './steps.js';
+import {
+    createHud,
+    hasLocalVoice,
+    hudWindow,
+    onVoicesKnown,
+    pushMessage,
+    setHudContentProtection,
+    setStatus,
+    stopSpeaking,
+    toggleHud
+} from './hud.js';
+import { startIdleWatch, stopIdleWatch } from './idle.js';
 import { disposeImageWorker } from './imageWorker.js';
 import {
     startMcpServer,
@@ -17,6 +28,7 @@ import {
     destroyOverlay,
     initOverlay,
     isContentProtected,
+    pushState,
     setContentProtection
 } from './overlay.js';
 import { store } from './store.js';
@@ -80,6 +92,9 @@ async function main(): Promise<void> {
     // Keeps anchored annotations glued to the windows and controls they point at.
     startAnchorTracking();
 
+    // Fades what an agent that went quiet left on screen.
+    startIdleWatch(mcpActiveRequests);
+
     buildTray();
     publishStatus();
     setInterval(publishStatus, 2000).unref?.();
@@ -114,24 +129,18 @@ function registerIpc(): void {
 
 function registerShortcuts(): void {
     // Toggle the chat panel.
-    globalShortcut.register('Control+Shift+O', () => toggleHud());
+    globalShortcut.register('Control+Shift+O', () => toggleHud(true));
     // Panic button: wipe everything drawn on screen and end the pending step.
     globalShortcut.register('Control+Shift+X', () => {
         cancelStep('clear');
         store.clear();
     });
 
-    // Escape is grabbed ONLY while a click-mode step is pending. A permanent
-    // global registration would swallow Escape from every other application on
-    // the machine; so would one during a watched step, where the user is
-    // operating their app and Escape closes its dialogs.
-    store.on('step', () => {
-        if (currentStep()?.mode === 'click') {
-            if (!globalShortcut.isRegistered('Escape')) globalShortcut.register('Escape', () => cancelStep('esc'));
-        } else {
-            globalShortcut.unregister('Escape');
-        }
-    });
+    // Done, Stuck and (in click mode) Escape, held only while a step is
+    // pending; see bindStepKeys for why.
+    bindStepKeys(globalShortcut, () => settings().stepKeys);
+    // The tray lists the keys that answer the current step.
+    store.on('step', refreshTrayMenu);
 }
 
 function buildTray(): void {
@@ -139,12 +148,29 @@ function buildTray(): void {
     const icon = nativeImage.createFromPath(join(__dirname, '..', 'tray.png'));
     tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
     tray.on('click', () => toggleHud());
-    tray.setToolTip('Screen MCP Overlay');
+    onVoicesKnown(refreshTrayMenu);
     refreshTrayMenu();
+}
+
+/** A menu label with its key shown at the right, when there is one. */
+function withKey(label: string, key: string | undefined): string {
+    return key ? `${label}\t${key}` : label;
 }
 
 function refreshTrayMenu(): void {
     if (!tray) return;
+    const prefs = settings();
+    const step = currentStep();
+    // A step lists only the keys that actually registered; between steps the
+    // configured ones are shown, so the user can learn them in advance.
+    const keys = step?.keys ?? { done: keyLabel(prefs.stepKeys.done), stuck: keyLabel(prefs.stepKeys.stuck) };
+    const answerable = step !== null && step.mode !== 'choice';
+    const noVoice = hasLocalVoice() === false;
+    tray.setToolTip(
+        noVoice && prefs.readStepsAloud
+            ? 'Screen MCP Overlay (no local voice installed, so steps are not read aloud)'
+            : 'Screen MCP Overlay'
+    );
     tray.setContextMenu(
         Menu.buildFromTemplate([
             { label: mcpUrl() || 'MCP server not running', enabled: false },
@@ -155,6 +181,20 @@ function refreshTrayMenu(): void {
                 click: () => {
                     cancelStep('clear');
                     store.clear();
+                }
+            },
+            {
+                label: withKey('I did the current step', keys.done || undefined),
+                enabled: answerable,
+                click: () => {
+                    if (step) answerStep({ kind: 'done' }, step.id);
+                }
+            },
+            {
+                label: withKey("I can't find it", keys.stuck || undefined),
+                enabled: answerable,
+                click: () => {
+                    if (step) answerStep({ kind: 'stuck' }, step.id);
                 }
             },
             {
@@ -177,9 +217,30 @@ function refreshTrayMenu(): void {
                 }
             },
             {
+                label: noVoice ? 'Read steps aloud (no local voice installed)' : 'Read steps aloud',
+                type: 'checkbox',
+                checked: prefs.readStepsAloud,
+                click: menuItem => {
+                    updateSettings({ readStepsAloud: menuItem.checked });
+                    if (!menuItem.checked) stopSpeaking();
+                    refreshTrayMenu();
+                }
+            },
+            {
+                label: 'Sound cues',
+                type: 'checkbox',
+                checked: prefs.soundCues,
+                click: menuItem => {
+                    updateSettings({ soundCues: menuItem.checked });
+                    // The overlay plays the cues and reads the preference from its state.
+                    pushState();
+                    refreshTrayMenu();
+                }
+            },
+            {
                 label: 'Start automatically at login',
                 type: 'checkbox',
-                checked: settings().openAtLogin,
+                checked: prefs.openAtLogin,
                 click: menuItem => {
                     updateSettings({ openAtLogin: menuItem.checked });
                     applyOpenAtLogin(menuItem.checked);
@@ -197,6 +258,7 @@ app.on('will-quit', () => {
 });
 
 app.on('quit', () => {
+    stopIdleWatch();
     stopAnchorTracking();
     stopUia();
     void mcp?.close();

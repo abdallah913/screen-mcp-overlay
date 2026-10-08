@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 /**
  * A tiny preferences file in userData. Deliberately not electron-store: there
- * are three booleans and adding a dependency for them is not worth it.
+ * are a handful of flags and adding a dependency for them is not worth it.
  */
 
 export interface Settings {
@@ -22,6 +22,8 @@ export interface Settings {
     token: string;
     /** Read each step's instruction aloud when it appears. */
     readStepsAloud: boolean;
+    /** Speech rate for steps read aloud, 0.5 to 2. */
+    speechRate: number;
     /** A short sound when a step starts and when it is done. */
     soundCues: boolean;
     /**
@@ -37,8 +39,12 @@ const DEFAULTS: Settings = {
     showInCapture: process.env.SCREEN_OVERLAY_SHOW_IN_CAPTURE === '1',
     token: '',
     readStepsAloud: false,
+    speechRate: 1,
     soundCues: false,
-    stepKeys: { done: '', stuck: '' }
+    // Chords nothing common claims. Ctrl+Shift+H is VS Code's Replace in Files,
+    // Ctrl+Shift+Enter is an array formula in Excel, and Ctrl+Alt chords are
+    // AltGr on many European layouts, where they type characters.
+    stepKeys: { done: 'Control+Shift+F9', stuck: 'Control+Shift+F10' }
 };
 
 let cache: Settings | undefined;
@@ -51,7 +57,10 @@ export function settings(): Settings {
     if (cache) return cache;
     let loaded: Settings;
     try {
-        loaded = { ...DEFAULTS, ...JSON.parse(readFileSync(file(), 'utf8')) };
+        const stored = JSON.parse(readFileSync(file(), 'utf8')) as Partial<Settings>;
+        // Merged one level down so a file that sets only one chord keeps the
+        // default for the other.
+        loaded = { ...DEFAULTS, ...stored, stepKeys: { ...DEFAULTS.stepKeys, ...stored.stepKeys } };
     } catch {
         loaded = { ...DEFAULTS };
     }

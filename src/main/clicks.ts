@@ -1,7 +1,8 @@
 import { ipcMain } from 'electron';
 import type { ClickResult, Point } from '../shared/types.js';
-import { physicalToImagePoint } from '../shared/geometry.js';
+import { physicalToImagePoint, rectContains } from '../shared/geometry.js';
 import { listDisplays } from './displays.js';
+import { hudBounds } from './hud.js';
 import { store } from './store.js';
 import { addClick, beginStep, cancelStep, currentCaptureId } from './steps.js';
 
@@ -20,6 +21,12 @@ export function initClicks(): void {
     ipcMain.on('overlay:click', (_e, payload: { displayId: string; dip: Point }) => {
         const display = listDisplays().find(d => d.id === payload.displayId);
         if (!display) return;
+        // The panel is raised above the overlay while a click is pending, so a
+        // click on it should never get here; if the z-order lost that race, a
+        // press meant for the panel's own buttons is still not the answer.
+        const panel = hudBounds();
+        const global = { x: display.dipBounds.x + payload.dip.x, y: display.dipBounds.y + payload.dip.y };
+        if (panel && rectContains(panel, global)) return;
 
         const physical: Point = {
             x: payload.dip.x * display.scaleFactor,

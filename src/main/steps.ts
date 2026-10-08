@@ -62,6 +62,19 @@ interface Pending {
 
 let pending: Pending | null = null;
 
+type EndedListener = (view: StepView, answer: StepAnswer) => void;
+const endedListeners = new Set<EndedListener>();
+
+/**
+ * Hear how each step ended. The store's 'step' event only says that the step
+ * went away; the panel needs the answer too, to log the outcome next to the
+ * instruction and to say when a step was replaced or stopped.
+ */
+export function onStepEnded(listener: EndedListener): () => void {
+    endedListeners.add(listener);
+    return () => endedListeners.delete(listener);
+}
+
 /** Labels for the keys that answer a step; set by whoever registers them. */
 let keys: StepView['keys'] = {};
 
@@ -84,6 +97,14 @@ function settle(p: Pending, answer: StepAnswer): void {
     if (p.onAbort) p.signal?.removeEventListener('abort', p.onAbort);
     publish();
     p.resolve(answer);
+    const view = { ...p.view, collected: p.got.length };
+    for (const listener of endedListeners) {
+        try {
+            listener(view, answer);
+        } catch {
+            // A broken panel must not stop the answer reaching the agent.
+        }
+    }
 }
 
 /**
@@ -196,4 +217,112 @@ export function currentStep(): StepView | null {
 /** The capture a click-mode step maps clicks into, if any. */
 export function currentCaptureId(): string | undefined {
     return pending?.captureId;
+}
+
+/** The subset of Electron's globalShortcut that step keys need. */
+export interface ShortcutApi {
+    register(accelerator: string, callback: () => void): boolean;
+    unregister(accelerator: string): void;
+    isRegistered(accelerator: string): boolean;
+}
+
+/**
+ * Global keys that answer the pending step, held only while one is pending.
+ *
+ * The user is in the target app during a step, so a "done" or "I'm stuck" key
+ * is the only way to answer without reaching for the mouse or a terminal. Held
+ * permanently, though, the chords would be stolen from every other app on the
+ * machine, so they are registered when a step starts and released when it ends.
+ *
+ * Escape is taken in click mode only. In watch mode the user is operating their
+ * app, where Escape closes the menu or dialog the step is about.
+ *
+ * Registration can fail (another app owns the chord, or the setting is not a
+ * valid accelerator), so only keys that actually registered are published for
+ * the UI to show: a hint for a key that does nothing is worse than none.
+ * Returns a function that stops listening and releases everything.
+ */
+export function bindStepKeys(api: ShortcutApi, chords: () => { done: string; stuck: string }): () => void {
+    let boundFor: string | null = null;
+    let held: string[] = [];
+
+    const release = (): void => {
+        for (const accel of held) {
+            try {
+                api.unregister(accel);
+            } catch {
+                // Already gone; nothing to release.
+            }
+        }
+        held = [];
+    };
+
+    const take = (accel: string, fn: () => void): boolean => {
+        if (!accel.trim()) return false;
+        try {
+            // Never take over one of our own chords: a setting equal to
+            // Ctrl+Shift+X would otherwise silently replace the panic button.
+            if (api.isRegistered(accel) || !api.register(accel, fn)) return false;
+        } catch {
+            return false;
+        }
+        held.push(accel);
+        return true;
+    };
+
+    const sync = (): void => {
+        const step = store.getStep();
+        const id = step?.id ?? null;
+        // setStepKeys republishes the step, which lands back here; only a new
+        // step, or the end of one, changes what is held.
+        if (id === boundFor) return;
+        release();
+        boundFor = id;
+        if (!step) {
+            setStepKeys({});
+            return;
+        }
+        const labels: StepView['keys'] = {};
+        // A choice is answered by picking an option, so done and stuck mean nothing there.
+        if (step.mode !== 'choice') {
+            const { done, stuck } = chords();
+            if (take(done, () => answerStep({ kind: 'done' }, step.id))) labels.done = keyLabel(done);
+            if (take(stuck, () => answerStep({ kind: 'stuck' }, step.id))) labels.stuck = keyLabel(stuck);
+        }
+        if (step.mode === 'click' && take('Escape', () => cancelStep('esc'))) labels.cancel = 'Esc';
+        setStepKeys(labels);
+    };
+
+    store.on('step', sync);
+    sync();
+    return () => {
+        store.off('step', sync);
+        release();
+        boundFor = null;
+    };
+}
+
+const KEY_NAMES: Record<string, string> = {
+    control: 'Ctrl',
+    ctrl: 'Ctrl',
+    commandorcontrol: 'Ctrl',
+    cmdorctrl: 'Ctrl',
+    alt: 'Alt',
+    option: 'Alt',
+    altgr: 'AltGr',
+    shift: 'Shift',
+    super: 'Win',
+    meta: 'Win',
+    escape: 'Esc',
+    esc: 'Esc'
+};
+
+/** "Control+Shift+F9" the way a Windows user reads it: "Ctrl+Shift+F9". */
+export function keyLabel(accelerator: string): string {
+    return accelerator
+        .split('+')
+        .map(part => part.trim())
+        .filter(Boolean)
+        .map(part => KEY_NAMES[part.toLowerCase()] ?? (part.length === 1 ? part.toUpperCase() : part))
+        .join('+');
 }
