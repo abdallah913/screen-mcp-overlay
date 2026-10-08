@@ -1,6 +1,8 @@
 import { screen } from 'electron';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { Annotation, ClickResult, Rect, SnapshotNode, StepAnswer } from '../../../shared/types.js';
 import { rectContains } from '../../../shared/geometry.js';
 import { parseProgress } from '../../../shared/progress.js';
@@ -13,7 +15,7 @@ import {
     coverage,
     describeWindow,
     elementAtPoint,
-    listWindows,
+    listAllWindows,
     resolveRefs,
     resolveWindow,
     type Coverage,
@@ -23,7 +25,7 @@ import {
 import { isTopLevelWait, waitForElement, type WaitCondition, type WaitOutcome, type WaitRequest } from '../../waits.js';
 import { answerText } from './answers.js';
 import { CONDITIONS, DEFAULT_COLORS, WINDOW, guarded, isWindowRole, selectorFields, text } from './common.js';
-import { placeAnchored, resolveAnchor, type ResolvedAnchor } from './anchoring.js';
+import { anchorNotes, placeAnchored, resolveAnchor, type ResolvedAnchor } from './anchoring.js';
 
 /**
  * Waiting on the user and the UI: highlight_and_wait, wait_for_element,
@@ -149,14 +151,80 @@ function offsetFrom(r: Rect, p: { x: number; y: number }, scale: number): string
 }
 
 /**
- * The resolver already says where the target sits when it could tell
+ * What was circled and where, for the response and the panel's step card. The
+ * resolver already says where the target sits when it could tell
  * (resolveAnchor's label is "what, where"); only fill the gap when it could not.
  */
-function circledLine(target: ResolvedAnchor, windowRef: string, windows: WindowInfo[]): string {
-    if (target.where) return `Circled ${target.label}.`;
+function targetLabel(target: ResolvedAnchor, windowRef: string, windows: WindowInfo[]): string {
+    if (target.where) return target.label;
     const win = windows.find(w => w.ref === windowRef);
     const spot = win ? whereIn(target.rect, win.rect) : null;
-    return `Circled ${target.label}, ${spot && win ? `${spot} of ${quote(win.title)}` : `in window ${windowRef}`}.`;
+    return `${target.label}, ${spot && win ? `${spot} of ${quote(win.title)}` : `in window ${windowRef}`}`;
+}
+
+/** Physical virtual-screen pixels to global DIPs, through Electron: mixed scaling is not a uniform factor. */
+function toDip(r: Rect): Rect {
+    const tl = screen.screenToDipPoint({ x: r.x, y: r.y });
+    const br = screen.screenToDipPoint({ x: r.x + r.width, y: r.y + r.height });
+    return {
+        x: Math.round(tl.x),
+        y: Math.round(tl.y),
+        width: Math.max(1, Math.round(br.x - tl.x)),
+        height: Math.max(1, Math.round(br.y - tl.y))
+    };
+}
+
+function overlapArea(a: Rect, b: Rect): number {
+    const w = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+    const h = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+    return w > 0 && h > 0 ? w * h : 0;
+}
+
+/** Below this share of the target on any display, the user may not see the circle at all. */
+const MIN_ON_SCREEN = 0.5;
+
+/**
+ * Where the circle is, when that is somewhere the user may not be looking:
+ * mostly past the edge of every display, or on another display than the
+ * window in front of them (usually the agent's own terminal). Null when it is
+ * in plain view. The overlay points the way on screen; this lets the agent
+ * say it in words too.
+ */
+function displayNote(rect: Rect, windows: WindowInfo[]): string | null {
+    const displays = screen.getAllDisplays();
+    const dip = toDip(rect);
+    const inside = displays.reduce((sum, d) => sum + overlapArea(dip, d.bounds), 0);
+    const share = inside / (dip.width * dip.height);
+    if (share < MIN_ON_SCREEN) {
+        const how = share === 0 ? 'off-screen' : `partly off-screen (${Math.round(share * 100)}% visible)`;
+        return `Note: the target is ${how}; ask the user to move its window into view.`;
+    }
+    const front = windows.find(w => w.foreground && onScreen(w));
+    if (displays.length < 2 || !front) return null;
+    const home = screen.getDisplayMatching(dip);
+    const theirs = screen.getDisplayMatching(toDip(front.rect));
+    if (home.id === theirs.id) return null;
+    // Numbered as list_displays numbers them.
+    const n = (id: number): number => displays.findIndex(d => d.id === id) + 1;
+    return (
+        `Note: the target is on display ${n(home.id)}, while the window in front (${quote(front.title)}) is on ` +
+        `display ${n(theirs.id)}; tell the user which screen to look at.`
+    );
+}
+
+/** Why a circled control left the screen, in the user's terms, when the tracker could tell. */
+function goneWhy(reason: Annotation['hiddenReason'], windowTitle: string): string | undefined {
+    switch (reason) {
+        case 'minimized':
+            return `${quote(windowTitle)} was minimised`;
+        case 'closed':
+            return `${quote(windowTitle)} closed`;
+        case 'other-desktop':
+            return `${quote(windowTitle)} is on another virtual desktop`;
+        default:
+            // The control itself went (a page changed, a panel closed): no more to say.
+            return undefined;
+    }
 }
 
 /**
@@ -192,7 +260,12 @@ async function coverageOf(windowRef: string, rect: Rect): Promise<Coverage | nul
 async function targetStatus(circleId: string | undefined, windowRef: string, windowTitle: string): Promise<string> {
     const circle = circleId ? store.list().find(a => a.id === circleId) : undefined;
     if (!circle?.anchor) return '';
-    if (circle.hidden) return 'The circled control is not on screen now (it went away, or its window is minimised).';
+    if (circle.hidden) {
+        const why = goneWhy(circle.hiddenReason, windowTitle);
+        return why
+            ? `The circled control is not on screen now: ${why}.`
+            : 'The circled control is not on screen now (it went away, or its window is minimised).';
+    }
     let rect: Rect | null = null;
     try {
         const [live] = await resolveRefs([circle.anchor.ref]);
@@ -326,21 +399,36 @@ function actionableRows(nodes: SnapshotNode[]): string {
     return [...shown, ...extra].join('; ');
 }
 
-/** Windows that opened or closed since `before`. */
-function windowDelta(before: WindowInfo[], now: WindowInfo[]): { opened: WindowInfo[]; closed: WindowInfo[] } {
-    const was = new Set(before.map(w => w.ref));
-    const is = new Set(now.map(w => w.ref));
-    return { opened: now.filter(w => !was.has(w.ref)), closed: before.filter(w => !is.has(w.ref)) };
+interface WindowDelta {
+    opened: WindowInfo[];
+    closed: WindowInfo[];
+    /** Still open, but minimised since: not closed, and the user can bring it back. */
+    minimized: WindowInfo[];
 }
 
-function windowLines(opened: WindowInfo[], closed: WindowInfo[]): string[] {
+/** Windows that opened, closed or were minimised since `before`; both lists include minimised windows. */
+function windowDelta(before: WindowInfo[], now: WindowInfo[]): WindowDelta {
+    const was = new Map(before.map(w => [w.ref, w]));
+    const is = new Set(now.map(w => w.ref));
+    return {
+        opened: now.filter(w => !was.has(w.ref)),
+        closed: before.filter(w => !is.has(w.ref)),
+        minimized: now.filter(w => w.minimized && was.get(w.ref)?.minimized === false)
+    };
+}
+
+function windowLines(d: WindowDelta): string[] {
     return [
-        ...opened
+        ...d.opened
             .slice(0, LIST_CAP)
             .map(w => `+ window ${w.ref} ${quote(w.title)}${w.foreground ? ' [foreground]' : ''}`),
-        ...closed.slice(0, LIST_CAP).map(w => `- window ${w.ref} ${quote(w.title)}`)
+        ...d.closed.slice(0, LIST_CAP).map(w => `- window ${w.ref} ${quote(w.title)}`),
+        ...d.minimized.slice(0, LIST_CAP).map(w => `~ window ${w.ref} ${quote(w.title)} minimised`)
     ];
 }
+
+/** A window the user can see: one that opened minimised or on another desktop is not news. */
+const onScreen = (w: WindowInfo): boolean => !w.minimized && !w.cloaked;
 
 /** Lines of a diff, capped, with how to see the rest. */
 function cappedDiff(lines: string[], cap: number, sinceId: string): string[] {
@@ -361,14 +449,15 @@ async function afterBlock(
 ): Promise<string> {
     let now: WindowInfo[];
     try {
-        now = await listWindows();
+        now = await listAllWindows();
     } catch {
         return '';
     }
-    const { opened, closed } = windowDelta(before, now);
-    const lines = windowLines(opened, closed);
+    const delta = windowDelta(before, now);
+    const lines = windowLines(delta);
 
-    const fresh = opened.find(w => w.foreground) ?? opened[0];
+    const shown = delta.opened.filter(onScreen);
+    const fresh = shown.find(w => w.foreground) ?? shown[0];
     if (fresh) {
         const snap = await snapshotOf(fresh.ref);
         const rows = snap && (actionableRows(snap.nodes) || 'no controls exposed');
@@ -400,12 +489,15 @@ async function failureDigest(ctx: {
     const out: string[] = [];
     let now: WindowInfo[] = [];
     try {
-        now = await listWindows();
+        now = await listAllWindows();
     } catch {
         // Leave the window part out rather than fail the report.
     }
-    const { opened, closed } = windowDelta(ctx.before, now);
-    if (opened.length || closed.length) out.push(`Since the step began:\n${windowLines(opened, closed).join('\n')}`);
+    const delta = windowDelta(ctx.before, now);
+    const { closed } = delta;
+    const opened = delta.opened.filter(onScreen);
+    const listed = windowLines(delta);
+    if (listed.length) out.push(`Since the step began:\n${listed.join('\n')}`);
     const front = now.find(w => w.foreground);
     if (front) out.push(`Foreground: ${quote(front.title)}.`);
 
@@ -472,7 +564,7 @@ async function waitPlan(u: Until, windowRef: string, before: WindowInfo[]): Prom
         role: topLevel ? 'window' : u.role,
         automationId: u.automationId,
         value: u.value,
-        baseline: new Set(before.map(w => w.ref))
+        baseline: before
     };
 }
 
@@ -486,27 +578,94 @@ function needsPrecheck(req: WaitPlan): boolean {
     return !(isTopLevelWait(req) && (req.condition === 'appears' || req.condition === 'enabled'));
 }
 
-/** Swap the step's circle for a brief check mark, so the user sees the step registered. */
-function confirmOnScreen(circleId: string | undefined): void {
+/**
+ * The one check before drawing. A failed check loses only this guard, not the
+ * step; nor does a window that is gone answer anything about what the user
+ * did, so it is no answer rather than "disappears: already true".
+ */
+async function precheck(plan: WaitPlan): Promise<WaitOutcome | undefined> {
+    const o = await waitForElement({ ...plan, timeoutMs: 0, pollMs: 0 }).catch(() => undefined);
+    return o?.windowClosed ? undefined : o;
+}
+
+/** The window an until settled in: the window it matched, else the one it searched. */
+function settledIn(o: WaitOutcome, plan: WaitPlan, windowRef: string): string {
+    return o.element?.role === 'window' ? o.element.ref : (plan.window ?? windowRef);
+}
+
+/**
+ * The window a plan's next step runs in. Usually where this step's until
+ * settled, but a step that closes a dialog ("Click OK") settles in a window
+ * that no longer exists, and the user is back in the app's other window: the
+ * one in front, else any. Failing that, whatever is in front now.
+ */
+async function nextWindow(ref: string, before: WindowInfo[]): Promise<string> {
+    let now: WindowInfo[];
+    try {
+        now = await listAllWindows();
+    } catch {
+        // The next step resolves the window itself and reports what it finds.
+        return ref;
+    }
+    if (now.some(w => w.ref === ref)) return ref;
+    const pid = before.find(w => w.ref === ref)?.pid;
+    const shown = now.filter(onScreen);
+    const sameApp = shown.filter(w => w.pid === pid);
+    return (sameApp.find(w => w.foreground) ?? sameApp[0] ?? shown.find(w => w.foreground))?.ref ?? ref;
+}
+
+/** How long the "All N steps done" label stays up. */
+const FINISHED_TTL_MS = 3000;
+/** How far below the circle the "All N steps done" label sits, in DIPs: clear of the check mark's caption. */
+const FINISHED_GAP = 40;
+
+/**
+ * Swap the step's circle for a brief check mark, so the user sees the step
+ * registered, and on a walkthrough's last step say the whole thing is done.
+ * With keep the circle stays, and only the closing label is added.
+ */
+function confirmOnScreen(circleId: string | undefined, opts: { keep: boolean; finished?: number }): void {
     const circle = circleId ? store.list().find(a => a.id === circleId) : undefined;
-    if (!circleId) return;
-    store.clear([circleId]);
-    // A target that went away (the dialog the user just closed) has no place to tick.
-    if (!circle || circle.hidden) return;
+    if (!circle) return;
     const now = Date.now();
-    store.add([
-        {
+    const shown: Annotation[] = [];
+    if (!opts.keep) {
+        store.clear([circle.id]);
+        // A target that went away (the dialog the user just closed) has no place to tick.
+        if (!circle.hidden) {
+            shown.push({
+                id: store.nextId('ann'),
+                displayId: circle.displayId,
+                type: 'done',
+                rect: circle.rect,
+                text: 'Got it',
+                color: DEFAULT_COLORS.done,
+                thickness: circle.thickness,
+                createdAt: now,
+                expiresAt: now + DONE_TTL_MS
+            });
+        }
+    }
+    if (opts.finished) {
+        // Where the user was last looking, even when the dialog they closed took
+        // the target with it: a hidden circle keeps its last visible place.
+        shown.push({
             id: store.nextId('ann'),
             displayId: circle.displayId,
-            type: 'done',
-            rect: circle.rect,
-            text: 'Got it',
+            type: 'label',
+            rect: {
+                x: circle.rect.x + circle.rect.width / 2,
+                y: circle.rect.y + circle.rect.height + FINISHED_GAP,
+                width: 0,
+                height: 0
+            },
+            text: `All ${opts.finished} steps done`,
             color: DEFAULT_COLORS.done,
-            thickness: circle.thickness,
             createdAt: now,
-            expiresAt: now + DONE_TTL_MS
-        }
-    ]);
+            expiresAt: now + FINISHED_TTL_MS
+        });
+    }
+    if (shown.length > 0) store.add(shown);
 }
 
 /** Drawings that outlive the step, so the agent can clear them when the task is done. */
@@ -518,14 +677,83 @@ function othersStillUp(ours: Set<string>): string {
     return `\n${others.length} other drawing(s) still up (${listed}${more}); clear_annotations when the task is done.`;
 }
 
-function giveUpWhenGone(circleId: string | undefined): (() => string | null) | undefined {
+function giveUpWhenGone(circleId: string | undefined, windowTitle: string): (() => string | null) | undefined {
     if (!circleId) return undefined;
     return () => {
         const a = store.list().find(x => x.id === circleId);
         if (!a?.hidden || a.hiddenSince === undefined) return null;
         const gone = Date.now() - a.hiddenSince;
-        return gone >= TARGET_GONE_MS ? `the circled control went away ${Math.round(gone / 1000)}s ago` : null;
+        if (gone < TARGET_GONE_MS) return null;
+        const why = goneWhy(a.hiddenReason, windowTitle);
+        return `the circled control went away ${Math.round(gone / 1000)}s ago${why ? ` (${why})` : ''}`;
     };
+}
+
+/** The longest stretch the circled control spent off screen during a step. */
+interface HiddenStretch {
+    ms: number;
+    reason?: Annotation['hiddenReason'];
+    /** Still off screen when the step ended. */
+    ongoing: boolean;
+}
+
+/** Off screen at least this long during a step, the response says so. */
+const HIDDEN_NOTE_MS = 5000;
+
+/**
+ * Watch the circle for the step's length. The overlay hides a drawing whose
+ * target went away, which takes the step's only on-screen instruction with
+ * it, so the agent hears about any long stretch of that, even one that ended.
+ * `onGone` fires once the target has been gone TARGET_GONE_MS. Returns the
+ * function that stops watching and reports the longest stretch.
+ */
+function watchHidden(circleId: string | undefined, onGone?: () => void): () => HiddenStretch | undefined {
+    if (!circleId) return () => undefined;
+    let longest: HiddenStretch | undefined;
+    let since: number | undefined;
+    let reason: Annotation['hiddenReason'];
+    let timer: NodeJS.Timeout | undefined;
+    const close = (ongoing: boolean): void => {
+        if (since === undefined) return;
+        const ms = Date.now() - since;
+        if (!longest || ms >= longest.ms) longest = { ms, reason, ongoing };
+    };
+    const update = (): void => {
+        const a = store.list().find(x => x.id === circleId);
+        if (a?.hidden && a.hiddenSince !== undefined) {
+            if (since !== a.hiddenSince) {
+                since = a.hiddenSince;
+                if (onGone) {
+                    clearTimeout(timer);
+                    timer = setTimeout(onGone, Math.max(0, since + TARGET_GONE_MS - Date.now()));
+                }
+            }
+            reason = a.hiddenReason ?? reason;
+        } else if (since !== undefined) {
+            close(false);
+            since = undefined;
+            reason = undefined;
+            clearTimeout(timer);
+        }
+    };
+    store.on('annotations', update);
+    update();
+    return () => {
+        update();
+        store.off('annotations', update);
+        clearTimeout(timer);
+        close(true);
+        return longest;
+    };
+}
+
+function hiddenNote(stretch: HiddenStretch | undefined, windowTitle: string): string {
+    if (!stretch || stretch.ms < HIDDEN_NOTE_MS) return '';
+    const secs = Math.round(stretch.ms / 1000);
+    const why = goneWhy(stretch.reason, windowTitle);
+    return stretch.ongoing
+        ? `Note: the circled control has been off screen for ${secs}s${why ? `: ${why}` : ''}.`
+        : `Note: the circled control was off screen for ${secs}s during the step${why ? ` (${why})` : ''}.`;
 }
 
 function prefixed(label: string, body: string): string {
@@ -542,7 +770,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         throw new Error('until needs name, automationId or role (or condition "changes")');
     }
     const windowRef = await resolveWindow(spec.window);
-    const before = await listWindows();
+    const before = await listAllWindows();
     const windowTitle = clean(before.find(w => w.ref === windowRef)?.title ?? windowRef);
     const plan = u ? await waitPlan(u, windowRef, before) : undefined;
     const result = (ok: boolean, body: string, line = body.split('\n')[0]!, next = windowRef): StepResult => ({
@@ -552,25 +780,34 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         window: next
     });
 
-    // Checked before drawing: a step whose until already holds would confirm
-    // at once, and the agent would move on while the user is still a step
-    // behind. A failed check loses only this guard, not the step.
-    const pre =
-        plan && needsPrecheck(plan)
-            ? await waitForElement({ ...plan, timeoutMs: 0, pollMs: 0 }).catch(() => undefined)
-            : undefined;
-
+    // The target first, with its retry: in a plan the window may still be
+    // filling in, and the until must be read from the same tree the target
+    // was found in, or a half-built dialog reads as "disappears: already true".
     let target: ResolvedAnchor | undefined;
+    let missing: unknown;
     if (spec.name || spec.automationId || spec.role) {
         try {
             target = await findTarget(spec, windowRef, opts.findRetryMs, opts.signal);
         } catch (err) {
-            if (pre?.met) {
-                const seen = pre.element ? `\n${elementLine(pre.element)}` : '';
-                return result(true, `Already done (the user was ahead): ${untilText(u!)} already holds.${seen}`);
-            }
-            throw err;
+            missing = err;
         }
+    }
+
+    // Checked before drawing: a step whose until already holds would confirm
+    // at once, and the agent would move on while the user is still a step behind.
+    const pre = plan && needsPrecheck(plan) ? await precheck(plan) : undefined;
+
+    if (missing !== undefined) {
+        // Only a match shows the user is ahead. An absence cannot tell "ahead"
+        // from "not there yet" or "misnamed", and "disappears" usually reuses
+        // the target's own selector, so its miss stands.
+        if (pre?.met && plan && plan.condition !== 'disappears') {
+            const seen = pre.element ? `\n${elementLine(pre.element)}` : '';
+            const next = await nextWindow(settledIn(pre, plan, windowRef), before);
+            const body = `Already done (the user was ahead): ${untilText(u!)} already holds.${seen}`;
+            return result(true, body, undefined, next);
+        }
+        throw missing;
     }
     if (pre?.met) {
         const seen = pre.element ? `: ${elementLine(pre.element)}` : '';
@@ -582,6 +819,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
     }
 
     const warnings: string[] = [];
+    let warnedCovered = false;
     if (target) {
         // Scrolled out, the rect is real but points at whatever is in front of
         // it now; drawing there would send the user to the wrong control.
@@ -595,7 +833,16 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         }
         const c = await coverageOf(windowRef, target.rect);
         const covered = c && coveredNote(c, target.what, windowTitle);
-        if (covered) warnings.push(covered);
+        if (covered) {
+            warnings.push(covered);
+            warnedCovered = true;
+        }
+        // The resolver's own notes (an ambiguous name, a window found on
+        // another desktop), less the two this step has just reported its own way.
+        const notes = anchorNotes({ ...target, offscreen: undefined, covered: undefined }).trim();
+        if (notes) warnings.push(notes);
+        const elsewhere = displayNote(target.rect, before);
+        if (elsewhere) warnings.push(elsewhere);
     }
 
     let drawn: Annotation[] = [];
@@ -609,8 +856,10 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         postToHud(spec.prompt, 'info');
     }
     const circleId = drawn[0]?.id;
-    const circled = target ? circledLine(target, windowRef, before) : '';
-    const tail = (body: string): string => [body, circled, ...warnings].filter(Boolean).join('\n');
+    const label = target ? targetLabel(target, windowRef, before) : undefined;
+    const circled = label ? `Circled ${label}.` : '';
+    const notes: string[] = [];
+    const tail = (body: string): string => [body, circled, ...warnings, ...notes].filter(Boolean).join('\n');
     const lineOf = (status: string): string => [status, circled].filter(Boolean).join(' ');
     const clearCircle = (): void => {
         if (!opts.keep && circleId) store.clear([circleId]);
@@ -623,6 +872,8 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
     const start = plan && plan.window === windowRef && !isTopLevelWait(plan) ? await snapshotOf(windowRef) : undefined;
 
     const progress = parseProgress(spec.prompt);
+    // A walkthrough's last step, when it is met, closes the whole walkthrough on screen.
+    const finished = progress && progress.n === progress.of ? progress.of : undefined;
     const step = beginStep({
         prompt: spec.prompt,
         mode: plan ? 'watch' : 'click',
@@ -630,24 +881,38 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         timeoutMs: opts.timeoutMs,
         signal: opts.signal,
         targetIds: drawn.map(a => a.id),
-        progress: progress ? { n: progress.n, of: progress.of } : undefined
+        progress: progress ? { n: progress.n, of: progress.of } : undefined,
+        target: label
     });
     const startedAt = Date.now();
+    const gone = giveUpWhenGone(circleId, windowTitle);
 
     // ---- click mode: the overlay captures one click
     if (!plan) {
+        // A target that went away cannot be clicked; waiting out the timeout
+        // would hold a crosshair over the screen for nothing.
+        let goneFor: string | null = null;
+        const stopWatching = watchHidden(circleId, () => {
+            goneFor = gone?.() ?? null;
+            if (goneFor) step.end();
+        });
         const a = await step.answer;
+        const stretch = stopWatching();
         const waited = Date.now() - startedAt;
         const verdict =
-            a.kind === 'clicks' && a.clicks[0]
-                ? await clickVerdict(a.clicks[0], circleId, windowRef)
-                : { ok: false, text: await userOutcome(a, waited, circleId, windowRef, windowTitle) };
-        if (verdict.ok && !opts.keep) confirmOnScreen(circleId);
+            a.kind === 'ended' && goneFor
+                ? { ok: false, text: `NOT done: ${goneFor}, so the user could not click it.` }
+                : a.kind === 'clicks' && a.clicks[0]
+                  ? await clickVerdict(a.clicks[0], circleId, windowRef, windowTitle)
+                  : { ok: false, text: await userOutcome(a, waited, circleId, windowRef, windowTitle) };
+        if (!goneFor) notes.push(hiddenNote(stretch, windowTitle));
+        if (verdict.ok) confirmOnScreen(circleId, { keep: opts.keep, finished });
         else clearCircle();
         return result(verdict.ok, tail(verdict.text) + (verdict.ok ? othersStillUp(ours) : ''));
     }
 
     // ---- watch mode: the user works in the app while the UI is polled
+    const stopWatching = watchHidden(circleId);
     const stop = new AbortController();
     const last = new AbortController();
     const waiting = waitForElement({
@@ -656,7 +921,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         pollMs: 400,
         signal: stop.signal,
         lastCheck: last.signal,
-        giveUp: giveUpWhenGone(circleId)
+        giveUp: gone
     }).then(
         o => ({ o }),
         (err: Error) => ({ err })
@@ -669,42 +934,57 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         answer = first.a;
         // Done, or the step's own clock running out: give the UI one last
         // look, so a state that arrived a moment ago still counts.
-        if (answer.kind === 'done' || answer.kind === 'timeout') last.abort();
+        const lastLook = answer.kind === 'done' || answer.kind === 'timeout';
+        if (lastLook) last.abort();
         else stop.abort();
         const settled = await waiting;
-        if (answer.kind === 'done' || answer.kind === 'timeout') {
-            if ('err' in settled) {
-                clearCircle();
-                throw settled.err;
-            }
-            outcome = settled.o;
+        if (lastLook) {
+            // The user has answered, so this is their outcome, not an error:
+            // a helper that failed even its first check leaves the until unknown.
+            outcome =
+                'err' in settled
+                    ? {
+                          met: false,
+                          waitedMs: Date.now() - startedAt,
+                          polls: 0,
+                          ended: 'unchecked',
+                          reason: settled.err.message
+                      }
+                    : settled.o;
         }
     } else {
         step.end();
         if ('err' in first) {
+            stopWatching();
             clearCircle();
             throw first.err;
         }
         outcome = first.o;
     }
+    if (outcome?.ended !== 'gave-up') notes.push(hiddenNote(stopWatching(), windowTitle));
+    else stopWatching();
 
     const req: WaitRequest = { ...plan, timeoutMs: opts.timeoutMs, pollMs: 400 };
-    const matched = outcome?.element?.role === 'window' ? outcome.element.ref : (plan.window ?? windowRef);
 
     if (outcome?.met) {
         const how = answer?.kind === 'done' ? ' (checked when the user pressed Done)' : '';
         const summary = waitSummary(req, outcome, how);
-        if (!opts.keep) confirmOnScreen(circleId);
+        confirmOnScreen(circleId, { keep: opts.keep, finished });
         const after = await afterBlock(before, plan.window, start);
-        return result(true, tail(summary) + after + othersStillUp(ours), lineOf(summary.split('\n')[0]!), matched);
+        const next = await nextWindow(settledIn(outcome, plan, windowRef), before);
+        return result(true, tail(summary) + after + othersStillUp(ours), lineOf(summary.split('\n')[0]!), next);
     }
 
     if (outcome && (answer === undefined || answer.kind === 'timeout' || answer.kind === 'done')) {
         const head =
-            answer?.kind === 'done'
-                ? `DONE after ${Math.round((Date.now() - startedAt) / 1000)}s, but the until is NOT met: ` +
-                  `${untilText(u!)}.${seenNote(req, outcome)}`
-                : waitSummary(req, outcome);
+            outcome.ended === 'unchecked'
+                ? `${answer?.kind === 'done' ? 'DONE' : 'NOT checked: timed out'} after ` +
+                  `${Math.round((Date.now() - startedAt) / 1000)}s; the until could not be checked ` +
+                  `(helper error: ${outcome.reason}): ${untilText(u!)}.`
+                : answer?.kind === 'done'
+                  ? `DONE after ${Math.round((Date.now() - startedAt) / 1000)}s, but the until is NOT met: ` +
+                    `${untilText(u!)}.${seenNote(req, outcome)}`
+                  : waitSummary(req, outcome);
         const digest = await failureDigest({
             req,
             before,
@@ -712,7 +992,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
             windowTitle,
             start,
             circleId,
-            warnedCovered: warnings.length > 0
+            warnedCovered
         });
         // Left up, so the user keeps the pointer while the agent decides; the
         // next step's drawing replaces it.
@@ -736,7 +1016,8 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
 async function clickVerdict(
     click: ClickResult,
     circleId: string | undefined,
-    windowRef: string
+    windowRef: string,
+    windowTitle: string
 ): Promise<{ ok: boolean; text: string }> {
     const where = `${click.physical.x},${click.physical.y} on display ${click.displayId}`;
     const named = await nameClick(click);
@@ -744,6 +1025,17 @@ async function clickVerdict(
     // Read the live annotation: the tracker may have moved it since it was drawn.
     const circle = circleId ? store.list().find(x => x.id === circleId) : undefined;
     if (!circle) return { ok: true, text: `The user clicked at ${where}${on}.` };
+
+    // The circle was not drawn, so whatever they clicked, it was not the target.
+    if (circle.hidden) {
+        const why = goneWhy(circle.hiddenReason, windowTitle);
+        return {
+            ok: false,
+            text:
+                `The user clicked at ${where}${on}, but the circled control was not on screen then` +
+                `${why ? ` (${why})` : ''}. The app did not receive that click.`
+        };
+    }
 
     if (!clickInside(circle, click)) {
         const scale = listDisplays().find(d => d.id === click.displayId)?.scaleFactor ?? 1;
@@ -848,6 +1140,38 @@ async function runPlan(
 
 // ------------------------------------------------------------- the tools
 
+type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+/** How often a blocked call tells its client it is still waiting. */
+const PROGRESS_EVERY_MS = 10_000;
+
+/**
+ * Run a wait on the user while telling the client it is alive. Clients time a
+ * tool call out (60 s is common) and a step can take minutes; one that resets
+ * its clock on progress keeps the call open as long as the user needs. Only
+ * when the request asked for progress (it carries a progressToken); a lost
+ * notification costs nothing but that reset.
+ */
+async function withProgress<T>(extra: Extra, message: string, run: () => Promise<T>): Promise<T> {
+    const token = extra._meta?.progressToken;
+    if (token === undefined) return run();
+    const started = Date.now();
+    const send = (): void => {
+        const progress = Math.round((Date.now() - started) / 1000);
+        extra
+            .sendNotification({ method: 'notifications/progress', params: { progressToken: token, progress, message } })
+            .catch(() => {});
+    };
+    send();
+    const timer = setInterval(send, PROGRESS_EVERY_MS);
+    timer.unref?.();
+    try {
+        return await run();
+    } finally {
+        clearInterval(timer);
+    }
+}
+
 const untilSchema = () =>
     z.object({
         condition: z.enum(UNTIL_CONDITIONS),
@@ -898,8 +1222,9 @@ export function registerGuide(server: McpServer): void {
                 keep: z.boolean().default(false).describe('Leave the circle up afterwards.')
             }
         },
-        (args, { signal }) =>
+        (args, extra) =>
             guarded('highlight_and_wait', async () => {
+                const { signal } = extra;
                 const main: StepSpec = {
                     window: args.window,
                     name: args.name,
@@ -909,8 +1234,10 @@ export function registerGuide(server: McpServer): void {
                     until: args.until
                 };
                 const opts = { timeoutMs: args.timeoutMs, keep: args.keep, signal };
+                const waiting = `Waiting for the user: ${clean(args.prompt)}`;
                 if (!args.then?.length) {
-                    return text((await runStep(main, { ...opts, findRetryMs: 0, label: '' })).text);
+                    const single = { ...opts, findRetryMs: 0, label: '' };
+                    return text((await withProgress(extra, waiting, () => runStep(main, single))).text);
                 }
                 if (!args.until) throw new Error('then needs until on this step too: a plan cannot wait for clicks');
                 const then = args.then.map((s, i) => {
@@ -920,7 +1247,7 @@ export function registerGuide(server: McpServer): void {
                     }
                     return { ...s, until: until.data };
                 });
-                return text(await runPlan(main, then, opts));
+                return text(await withProgress(extra, waiting, () => runPlan(main, then, opts)));
             })
     );
 
@@ -942,8 +1269,9 @@ export function registerGuide(server: McpServer): void {
                 timeoutMs: z.number().int().min(0).max(900000).default(60000)
             }
         },
-        (args, { signal }) =>
+        (args, extra) =>
             guarded('wait_for_element', async () => {
+                const { signal } = extra;
                 if (args.condition !== 'changes' && !args.name && !args.role && !args.automationId) {
                     throw new Error('needs name, automationId or role to match against (or condition "changes")');
                 }
@@ -959,9 +1287,12 @@ export function registerGuide(server: McpServer): void {
                     signal
                 };
                 // Only a real wait reports what else changed; an assertion stays one line.
-                const before = args.timeoutMs > 0 ? await listWindows() : undefined;
-                const outcome = await waitForElement(req);
+                const before = args.timeoutMs > 0 ? await listAllWindows() : undefined;
+                const outcome = await withProgress(extra, `Waiting for "${req.condition}"`, () => waitForElement(req));
                 if (outcome.ended === 'aborted') return text('CANCELLED: the request was cancelled while waiting.');
+                // No user is waiting on this answer, so a helper that failed the
+                // last look is the error it is, not a verdict on the condition.
+                if (outcome.ended === 'unchecked') throw new Error(`the final check failed: ${outcome.reason}`);
                 // A top-level window wait uses the window list and is fast anyway.
                 const slow = !req.window && !isTopLevelWait(req) ? UNSCOPED_NOTE : '';
                 const naming =
@@ -989,11 +1320,12 @@ export function registerGuide(server: McpServer): void {
                 captureId: z.string().optional().describe('Map clicks into this capture. Default: the latest.')
             }
         },
-        (args, { signal }) =>
+        (args, extra) =>
             guarded('wait_for_user_click', async () => {
+                const { signal } = extra;
                 const progress = parseProgress(args.prompt);
                 const startedAt = Date.now();
-                const a = await beginStep({
+                const step = beginStep({
                     prompt: args.prompt,
                     mode: 'click',
                     count: args.count,
@@ -1001,7 +1333,8 @@ export function registerGuide(server: McpServer): void {
                     captureId: args.captureId ?? store.latestCapture()?.id,
                     signal,
                     progress: progress ? { n: progress.n, of: progress.of } : undefined
-                }).answer;
+                });
+                const a = await withProgress(extra, `Waiting for the user: ${clean(args.prompt)}`, () => step.answer);
                 const clicks =
                     a.kind === 'clicks' ? a.clicks : a.kind === 'timeout' || a.kind === 'cancelled' ? a.partial : [];
                 const lines: string[] = [];
