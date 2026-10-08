@@ -86,7 +86,26 @@ test('a value change is reported as a modification, not add plus remove', () => 
 
     const lines = diffLines(before, after);
     assert.equal(lines.length, 1);
-    assert.match(lines[0], /^~ Text editor \[document\] "abc" enabled -> "abcdef" enabled/);
+    assert.match(lines[0], /^~ Text editor \[document\] "abc" -> "abcdef" {2}el_/);
+});
+
+test('a state change names the old and new state words', () => {
+    const t = checked => [n(0, 'window', 'Settings'), n(1, 'checkbox', 'Dark mode', { state: checked ? 'checked' : 'unchecked' })];
+    const lines = diffLines(toSnapshotNodes(t(false)), toSnapshotNodes(t(true)));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /^~ Dark mode \[checkbox\] unchecked -> checked {2}el_/);
+});
+
+test('a state word that goes away reads as "not"', () => {
+    const t = state => [n(0, 'window', 'W'), n(1, 'tabitem', 'Advanced', { state })];
+    const [line] = diffLines(toSnapshotNodes(t('selected')), toSnapshotNodes(t(undefined)));
+    assert.match(line, /^~ Advanced \[tabitem\] selected -> not selected/);
+});
+
+test('focus moving is not a change', () => {
+    // Every click moves focus; reporting it would make every diff noisy.
+    const t = state => [n(0, 'window', 'W'), n(1, 'edit', 'Name', { state })];
+    assert.equal(diffLines(toSnapshotNodes(t(undefined)), toSnapshotNodes(t('focused'))), null);
 });
 
 test('an enable/disable flip is reported as a modification', () => {
@@ -212,4 +231,131 @@ test('element lines match describe rows, plus the rect', () => {
         rect: { x: 100, y: 200, width: 80, height: 24 }
     });
     assert.equal(line, 'Export [button] disabled id=ExportBtn  80x24@100,200  el_7');
+});
+
+test('rows carry state words, offscreen and popup marks', () => {
+    const nodes = toSnapshotNodes([
+        n(0, 'window', 'Paint'),
+        n(1, 'checkbox', 'Rulers', { state: 'checked,focused' }),
+        n(1, 'listitem', 'Layer 9', { offscreen: true }),
+        n(1, 'menu', 'File', { popup: true })
+    ]);
+    assert.match(row(nodes[1], false), /^ {2}Rulers \[checkbox\] checked focused {2}el_/);
+    assert.match(row(nodes[2], false), /^ {2}Layer 9 \[listitem\] offscreen {2}el_/);
+    assert.match(row(nodes[3], false), /^ {2}\(popup\) File \[menu\] {2}el_/);
+});
+
+test('element lines carry state words and the offscreen mark', () => {
+    const line = elementLine({
+        ref: 'el_3',
+        name: 'Dark mode',
+        role: 'checkbox',
+        enabled: true,
+        state: 'checked',
+        offscreen: true,
+        rect: { x: 1, y: 2, width: 3, height: 4 }
+    });
+    assert.equal(line, 'Dark mode [checkbox] checked offscreen  3x4@1,2  el_3');
+});
+
+// --- collapsing long lists ----------------------------------------------------
+
+const list = (count, extra = () => ({})) => [
+    n(0, 'window', 'Files'),
+    n(1, 'list', 'Items'),
+    ...Array.from({ length: count }, (_, i) => n(2, 'listitem', `File ${i + 1}`, extra(i))),
+    n(1, 'button', 'Save')
+];
+
+test('a long run of list items collapses to a few rows and a marker', () => {
+    const nodes = toSnapshotNodes(list(20));
+    const rows = nodes.map(x => row(x, false).trim());
+    assert.deepEqual(rows.slice(2, 7).map(r => r.split(' [')[0]), ['File 1', 'File 2', 'File 3', 'File 4', 'File 5']);
+    assert.equal(rows[7], '… +15 more [listitem]; find_ui_elements role:listitem name:…');
+    // The point of collapsing: what comes after the list is still there.
+    assert.match(rows[8], /^Save \[button\]/);
+});
+
+test('a short run is left alone', () => {
+    assert.equal(toSnapshotNodes(list(8)).some(x => x.more !== undefined), false);
+});
+
+test('a selected or focused item is never collapsed away', () => {
+    const nodes = toSnapshotNodes(list(20, i => (i === 11 ? { state: 'selected' } : {})));
+    assert.ok(nodes.some(x => x.name === 'File 12'));
+    assert.equal(nodes.find(x => x.more !== undefined).more, 14);
+});
+
+test('a collapsed item takes its children with it', () => {
+    const raw = list(10);
+    raw.splice(10, 0, n(3, 'text', 'size 4 KB'));
+    assert.equal(toSnapshotNodes(raw).some(x => x.name === 'size 4 KB'), false);
+});
+
+test('the marker is keyed by its parent, so a growing list does not churn the diff', () => {
+    assert.equal(diffLines(toSnapshotNodes(list(20)), toSnapshotNodes(list(25))), null);
+});
+
+// --- elevated windows ---------------------------------------------------------
+
+test('a thin tree from an elevated window blames UIPI, not the provider', () => {
+    const d = diagnoseTree([snap(0, 'Task Manager', 'window'), snap(1, 'Close', 'button')], { elevated: true });
+    assert.match(d, /administrator/);
+    assert.match(d, /UIPI/);
+    assert.equal(/no accessibility provider/.test(d), false);
+});
+
+test('a full tree from an elevated window needs no diagnosis', () => {
+    const d = diagnoseTree([snap(0, 'Regedit', 'window'), snap(1, 'HKEY_CURRENT_USER', 'treeitem')], { elevated: true });
+    assert.equal(d, null);
+});
+
+// --- ranking name matches -----------------------------------------------------
+
+import { rankMatches, isAmbiguous, labelKey, nameTier, whereIn } from '../dist-test/uitree.js';
+
+const m = (name, extra = {}) => ({ name, enabled: true, rect: { x: 0, y: 0, width: 10, height: 10 }, ...extra });
+
+test('labels compare without case, mnemonics, ellipses or shortcuts', () => {
+    assert.equal(labelKey('&Save As...\tCtrl+Shift+S'), 'save as');
+    assert.equal(labelKey('Export…'), 'export');
+    assert.equal(nameTier('Save', 'save'), 0);
+    assert.equal(nameTier('Save as…', 'Save'), 1);
+    assert.equal(nameTier('Autosave', 'Save'), 2);
+});
+
+test('an exact label beats one that starts with it, which beats one that contains it', () => {
+    const ranked = rankMatches([m('Autosave'), m('Save as…'), m('Save')], { name: 'Save' });
+    assert.deepEqual(ranked.map(x => x.name), ['Save', 'Save as…', 'Autosave']);
+});
+
+test('an AutomationId match comes first', () => {
+    const ranked = rankMatches([m('Save'), m('Store', { automation_id: 'SaveBtn' })], { name: 'Save', automationId: 'SaveBtn' });
+    assert.equal(ranked[0].name, 'Store');
+});
+
+test('ties go to the enabled, visible, smaller control inside the window', () => {
+    const win = { x: 0, y: 0, width: 100, height: 100 };
+    const big = m('OK', { rect: { x: 0, y: 0, width: 90, height: 90 } });
+    const disabled = m('OK', { enabled: false });
+    const off = m('OK', { offscreen: true });
+    const outside = m('OK', { rect: { x: 500, y: 500, width: 5, height: 5 } });
+    const small = m('OK');
+    assert.equal(rankMatches([disabled, off, outside, big, small], { name: 'OK' }, win)[0], small);
+});
+
+test('a unique exact match is not ambiguous; partial or repeated matches are', () => {
+    assert.equal(isAmbiguous(rankMatches([m('Save as'), m('Save')], { name: 'Save' }), { name: 'Save' }), false);
+    assert.equal(isAmbiguous([m('Save as'), m('Save all')], { name: 'Save' }), true);
+    assert.equal(isAmbiguous([m('Save'), m('Save')], { name: 'Save' }), true);
+    assert.equal(isAmbiguous([m('Save')], { name: 'Save' }), false);
+});
+
+test('where a control sits is said in thirds of its window', () => {
+    const win = { x: 100, y: 100, width: 900, height: 600 };
+    assert.equal(whereIn({ x: 110, y: 110, width: 20, height: 20 }, win), 'top-left');
+    assert.equal(whereIn({ x: 540, y: 390, width: 20, height: 20 }, win), 'centre');
+    assert.equal(whereIn({ x: 540, y: 650, width: 20, height: 20 }, win), 'bottom');
+    assert.equal(whereIn({ x: 950, y: 390, width: 20, height: 20 }, win), 'right');
+    assert.equal(whereIn({ x: 2000, y: 390, width: 20, height: 20 }, win), null);
 });

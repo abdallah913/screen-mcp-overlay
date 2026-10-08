@@ -9,6 +9,7 @@
     --user: rgba(122, 162, 255, 0.16);
     --tool: rgba(255, 255, 255, 0.05);
     --danger: #ff6b6b;
+    --guide: #ffc43d;
     --radius: 14px;
 }
 
@@ -123,6 +124,28 @@ button {
     font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
     padding: 5px 9px;
     border-radius: 7px;
+}
+
+/* Instructions to the user: what to do next. They read as the main text of
+   the panel, not as one more muted log line. */
+.msg.guide .body {
+    background: rgba(255, 196, 61, 0.1);
+    border-left: 3px solid var(--guide);
+    border-radius: 4px 11px 11px 4px;
+    color: var(--fg);
+    font-weight: 500;
+}
+
+.outcome {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 0 7px;
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--muted);
+    font-size: 11.5px;
+    font-weight: 400;
+    white-space: nowrap;
 }
 
 .msg.error .body {
@@ -328,3 +351,97 @@ button {
 @media (prefers-reduced-motion: reduce) {
     #mirror-dot { animation: none; }
 }
+
+/* --------------------------------------------------------- pending step */
+
+#step-card[hidden],
+#step-progress[hidden],
+#step-count[hidden],
+#step-keys[hidden] { display: none; }
+
+#step-card {
+    flex: none;
+    margin: 0 10px 10px;
+    padding: 10px 12px;
+    border-radius: 11px;
+    background: rgba(255, 196, 61, 0.08);
+    border: 1px solid rgba(255, 196, 61, 0.38);
+}
+
+#step-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-bottom: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+}
+
+#step-progress {
+    padding: 0 7px;
+    border-radius: 9px;
+    background: var(--guide);
+    color: #241a00;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+#step-kind { text-transform: uppercase; font-weight: 600; }
+#step-time { font-variant-numeric: tabular-nums; }
+
+#step-prompt {
+    font-size: 14.5px;
+    font-weight: 500;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+#step-count { margin-top: 3px; font-size: 12px; color: var(--muted); }
+
+#step-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 9px;
+}
+#step-buttons.options { flex-direction: column; }
+
+.step-btn {
+    padding: 6px 11px;
+    border-radius: 8px;
+    font-size: 13px;
+    text-align: left;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid var(--stroke);
+    transition: background 120ms ease, border-color 120ms ease;
+}
+.step-btn:hover { background: rgba(255, 255, 255, 0.13); }
+.step-btn.primary { background: var(--guide); color: #241a00; font-weight: 600; border-color: transparent; }
+.step-btn.primary:hover { background: #ffd36e; }
+
+.step-btn kbd {
+    display: inline-block;
+    min-width: 18px;
+    margin-right: 8px;
+    padding: 0 4px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.35);
+    font: 600 11px/18px ui-monospace, "Cascadia Code", Consolas, monospace;
+    text-align: center;
+}
+
+#step-keys { margin-top: 7px; font-size: 11px; color: var(--muted); }
+
+/* ------------------------------------------------- collapsed out of the way */
+
+/* Something is drawn in every corner, so the panel shrinks to its title bar
+   instead of covering it. Focusing the pill brings the panel back. */
+body.pill #log,
+body.pill #picker,
+body.pill #mirror-bar,
+body.pill #step-card,
+body.pill #composer,
+body.pill #status,
+body.pill #bar .ghost:not(.close) { display: none; }
+body.pill #bar { border-bottom: none; }

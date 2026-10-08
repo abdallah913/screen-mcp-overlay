@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { AppStatus, HudMessage } from '../shared/types.js';
+import type { AppStatus, HudMessage, StepView, UserAnswer } from '../shared/types.js';
 
 contextBridge.exposeInMainWorld('hudApi', {
     onMessage(cb: (m: HudMessage) => void): void {
@@ -23,6 +23,21 @@ contextBridge.exposeInMainWorld('hudApi', {
     onSpeak(cb: (p: { text: string; rate: number }) => void): void {
         ipcRenderer.on('hud:speak', (_e, p) => cb(p));
     },
+    onSpeakStop(cb: () => void): void {
+        ipcRenderer.on('hud:speak-stop', () => cb());
+    },
+    onStep(cb: (step: StepView | null) => void): void {
+        ipcRenderer.on('hud:step', (_e, step: StepView | null) => cb(step));
+    },
+    onStepEnded(cb: (p: { id: string; outcome: string }) => void): void {
+        ipcRenderer.on('hud:step-ended', (_e, p) => cb(p));
+    },
+    onCollapsed(cb: (collapsed: boolean) => void): void {
+        ipcRenderer.on('hud:collapsed', (_e, collapsed: boolean) => cb(collapsed));
+    },
+    answerStep: (id: string, answer: UserAnswer): void => ipcRenderer.send('hud:step-answer', { id, answer }),
+    composing: (on: boolean): void => ipcRenderer.send('hud:composing', on),
+    reportVoices: (local: boolean): void => ipcRenderer.send('hud:voices', { local }),
     send: (prompt: string): Promise<void> => ipcRenderer.invoke('agent:send', prompt),
     interrupt: (): Promise<void> => ipcRenderer.invoke('agent:interrupt'),
     reset: (): Promise<void> => ipcRenderer.invoke('agent:reset'),

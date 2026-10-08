@@ -32,6 +32,10 @@ features = [
     "Win32_System_Threading",
     # Elevation checks (OpenProcessToken, GetTokenInformation).
     "Win32_Security",
+    # IUIAutomation2 connection and transaction timeouts, so a hung app fails
+    # one UIA call instead of wedging the helper. uiautomation enables it too;
+    # it is declared here because the helper calls it directly.
+    "Win32_UI_Accessibility",
 ]
 
 [profile.release]

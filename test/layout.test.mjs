@@ -1,0 +1,269 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+    classify,
+    dockStrip,
+    edgeArrow,
+    elsewhereText,
+    leadDisplay,
+    localPart,
+    nearestIsHere,
+    opensDownward,
+    overlapArea,
+    parseUserAnswer,
+    placeCaptions,
+    ringShape,
+    routeTo,
+    shapeBounds,
+    stepBadge,
+    stripProgress,
+    timeLeft,
+    visibleFraction,
+    wrapText
+} from '../dist-test/layout.js';
+import { DEFAULT_COLORS, contrastRatio, parseColor, relativeLuminance, textOn } from '../dist-test/palette.js';
+
+/**
+ * The overlay's placement rules, checked without a window. The renderer only
+ * measures text and paints what these return, so a caption landing on its
+ * target or a strip covering a menu bar is caught here.
+ */
+
+const VIEW = { width: 1920, height: 1080 };
+/** 8 DIP per character: close enough to a 14px UI font for layout purposes. */
+const measure = s => s.length * 8;
+
+const ann = (over = {}) => ({
+    id: 'a1',
+    displayId: 'd1',
+    type: 'circle',
+    rect: { x: 100, y: 100, width: 80, height: 30 },
+    createdAt: 1,
+    ...over
+});
+
+// ------------------------------------------------------------------ captions
+
+test('a caption for a target at the top edge goes beside it, never onto it', () => {
+    // A "File" menu at y=0, padded by 8 the way highlight_and_wait pads it.
+    const target = { x: 2, y: -8, width: 60, height: 40 };
+    const [c] = placeCaptions([{ id: 'c', size: { width: 120, height: 30 }, target, opensDown: true }], VIEW, []);
+    assert.equal(overlapArea(c.box, target), 0, 'the old fallback put the chip at y+6, inside the tab');
+    assert.ok(c.box.x >= target.x + target.width, 'right of it, not below the menu it opens');
+});
+
+test('captions are placed above first and never pile onto each other', () => {
+    const t1 = { x: 500, y: 500, width: 100, height: 30 };
+    const t2 = { x: 520, y: 540, width: 100, height: 30 };
+    const boxes = placeCaptions(
+        [
+            { id: 'one', size: { width: 140, height: 30 }, target: t1 },
+            { id: 'two', size: { width: 140, height: 30 }, target: t2 }
+        ],
+        VIEW,
+        []
+    );
+    assert.ok(boxes[0].box.y + boxes[0].box.height <= t1.y, 'first caption sits above its target');
+    assert.equal(overlapArea(boxes[0].box, boxes[1].box), 0);
+    for (const b of boxes) {
+        assert.equal(overlapArea(b.box, t1), 0);
+        assert.equal(overlapArea(b.box, t2), 0);
+    }
+});
+
+test('captions keep off obstacles such as the step strip and the chat panel', () => {
+    const target = { x: 900, y: 120, width: 100, height: 30 };
+    const strip = { x: 700, y: 60, width: 500, height: 56 };
+    const [c] = placeCaptions([{ id: 'c', size: { width: 140, height: 30 }, target }], VIEW, [strip]);
+    assert.equal(overlapArea(c.box, strip), 0);
+    assert.equal(overlapArea(c.box, target), 0);
+});
+
+test('below is the last resort for something that opens a menu', () => {
+    // No room above, right or left: a full-width ribbon tab row.
+    const target = { x: 0, y: 0, width: 1920, height: 40 };
+    const free = placeCaptions([{ id: 'c', size: { width: 140, height: 30 }, target }], VIEW, []);
+    assert.ok(free[0].box.y >= 40, 'an ordinary target falls back to below');
+    const menu = placeCaptions([{ id: 'c', size: { width: 140, height: 30 }, target, opensDown: true }], VIEW, []);
+    assert.ok(menu[0].box.y >= 40, 'still below when every other spot covers the target');
+});
+
+test('a caption stays on the display and gets a leader when pushed away from its target', () => {
+    // A control hanging off the bottom of the display: the chip is clamped
+    // back on screen, away from it, so a leader shows what it belongs to.
+    const target = { x: 500, y: 1100, width: 50, height: 50 };
+    const [c] = placeCaptions([{ id: 'c', size: { width: 200, height: 30 }, target }], VIEW, []);
+    assert.ok(c.box.y >= 0 && c.box.y + c.box.height <= VIEW.height);
+    assert.ok(c.leader, 'leader drawn');
+    const [near] = placeCaptions([{ id: 'c', size: { width: 200, height: 30 }, target: { ...target, y: 500 } }], VIEW, []);
+    assert.equal(near.leader, undefined, 'no leader when it sits right next to it');
+});
+
+test('a label keeps its centred spot above its point', () => {
+    const [c] = placeCaptions(
+        [{ id: 'l', size: { width: 100, height: 30 }, target: { x: 400, y: 300, width: 0, height: 0 }, mode: 'above-point' }],
+        VIEW,
+        []
+    );
+    assert.deepEqual(c.box, { x: 350, y: 264, width: 100, height: 30 });
+    assert.equal(c.leader, undefined);
+});
+
+test('long prompts wrap into at most three lines and end in an ellipsis', () => {
+    const long = 'Open the File menu, then choose Export, then pick PNG from the list of formats and press Save';
+    const lines = wrapText(long, 160, measure);
+    assert.equal(lines.length, 3);
+    for (const l of lines) assert.ok(measure(l) <= 160, l);
+    assert.ok(lines[2].endsWith('\u2026'));
+    assert.deepEqual(wrapText('Click Save', 160, measure), ['Click Save']);
+    const path = wrapText('C:\\Users\\someone\\AppData\\Roaming\\thing', 80, measure);
+    for (const l of path) assert.ok(measure(l) <= 80, 'an unbreakable word is split');
+});
+
+test('menus, tabs and dropdowns open downward', () => {
+    for (const r of ['menuitem', 'menu item', 'tabitem', 'menubar', 'combobox', 'splitbutton']) assert.ok(opensDownward(r), r);
+    for (const r of ['button', 'edit', undefined]) assert.equal(opensDownward(r), false, String(r));
+});
+
+// --------------------------------------------------------------------- ring
+
+test('wide targets get a rounded rect whose corners still enclose the control', () => {
+    assert.deepEqual(ringShape({ x: 0, y: 0, width: 60, height: 50 }, 8), { kind: 'ellipse' });
+    // The 400x24 field padded by 8: radius is half the padded height.
+    assert.deepEqual(ringShape({ x: 0, y: 0, width: 416, height: 40 }, 8), { kind: 'rounded', radius: 20 });
+    // A tall-wide control: a full stadium would cut its corners, so the radius is capped.
+    const pad = 8;
+    const ring = ringShape({ x: 0, y: 0, width: 416, height: 76 }, pad);
+    assert.equal(ring.kind, 'rounded');
+    assert.ok(ring.radius < 38);
+    // The control's corner sits at (pad, pad) from the padded corner; the arc's
+    // centre is at (r, r). Inside the arc means within r of that centre.
+    const d = Math.hypot(ring.radius - pad, ring.radius - pad);
+    assert.ok(d <= ring.radius, `corner ${d.toFixed(1)} outside radius ${ring.radius}`);
+});
+
+// ------------------------------------------------------------ step badges
+
+test('short step text is the badge; longer text is a caption beside a number', () => {
+    assert.deepEqual(stepBadge('2', 5), { badge: '2' });
+    assert.deepEqual(stepBadge('A', 1), { badge: 'A' });
+    assert.deepEqual(stepBadge(undefined, 4), { badge: '4' });
+    assert.deepEqual(stepBadge('Click Save', 3), { badge: '3', caption: 'Click Save' });
+    assert.deepEqual(stepBadge('3. Click Save', 1), { badge: '3', caption: 'Click Save' });
+    assert.deepEqual(stepBadge('2/5 Click Export', 1), { badge: '2', caption: '2/5 Click Export' });
+});
+
+test('the strip shows progress from the step or from the prompt prefix', () => {
+    const step = { id: 's', prompt: '2/5 Click Export', mode: 'watch', count: 0, collected: 0, startedAt: 0, deadline: 0, targetIds: [], keys: {} };
+    assert.deepEqual(stripProgress(step), { progress: { n: 2, of: 5 }, prompt: 'Click Export' });
+    assert.deepEqual(stripProgress({ ...step, prompt: 'Click Export', progress: { n: 1, of: 3 } }), {
+        progress: { n: 1, of: 3 },
+        prompt: 'Click Export'
+    });
+    assert.deepEqual(stripProgress({ ...step, prompt: 'Click Export' }), { progress: undefined, prompt: 'Click Export' });
+});
+
+test('time left reads as minutes and seconds', () => {
+    assert.equal(timeLeft(78_000, 0), '1:18 left');
+    assert.equal(timeLeft(500, 0), '0:01 left');
+    assert.equal(timeLeft(0, 5000), '0:00 left');
+});
+
+// -------------------------------------------------------------------- strip
+
+test('the strip docks away from a target in the menu bar', () => {
+    const wa = { x: 0, y: 0, width: 1920, height: 1040 };
+    const size = { width: 520, height: 70 };
+    const free = dockStrip(size, wa, [{ x: 1500, y: 600, width: 80, height: 30 }], []);
+    assert.equal(free.y, 24, 'top centre when nothing is there');
+    const menu = { x: 900, y: 30, width: 80, height: 30 };
+    const moved = dockStrip(size, wa, [menu], []);
+    assert.equal(overlapArea(moved, menu), 0);
+    assert.equal(moved.y, 1040 - 70 - 24, 'bottom centre next, inset from the work area');
+});
+
+test('the strip respects a taskbar on any edge', () => {
+    const wa = { x: 0, y: 48, width: 1920, height: 1032 };
+    const box = dockStrip({ width: 400, height: 60 }, wa, [], []);
+    assert.equal(box.y, 72);
+});
+
+// ------------------------------------------------------------------ routing
+
+test('every display gets every drawing, in its own coordinates', () => {
+    const origins = new Map([
+        ['d1', { x: 0, y: 0 }],
+        ['d2', { x: 1920, y: 0 }]
+    ]);
+    const a = ann({ displayId: 'd1', rect: { x: 1880, y: 100, width: 80, height: 30 } });
+    const arrow = ann({ id: 'a2', type: 'arrow', displayId: 'd2', rect: { x: 10, y: 10, width: 0, height: 0 }, to: { x: 50, y: 60 } });
+    const onD2 = routeTo([a, arrow, ann({ id: 'gone', displayId: 'd9' })], origins, { x: 1920, y: 0 });
+    assert.equal(onD2.length, 2, 'a drawing whose display is gone is dropped');
+    assert.deepEqual(onD2[0].rect, { x: -40, y: 100, width: 80, height: 30 }, 'straddles onto d2 from the left');
+    assert.equal(onD2[0].displayId, 'd1', 'keeps its home display');
+    assert.deepEqual(onD2[1].to, { x: 50, y: 60 });
+    assert.equal(classify(shapeBounds(onD2[0]), VIEW, [{ x: -1920, y: 0, width: 1920, height: 1080 }]), 'here');
+});
+
+test('a shape mostly off every display is "off"; one on another monitor is "elsewhere"', () => {
+    const others = [{ x: 1920, y: 0, width: 1920, height: 1080 }];
+    assert.equal(classify({ x: 2000, y: 100, width: 50, height: 50 }, VIEW, others), 'elsewhere');
+    assert.equal(classify({ x: 100, y: -200, width: 50, height: 210 }, VIEW, others), 'off', 'under a quarter visible');
+    assert.equal(classify({ x: 100, y: 100, width: 50, height: 50 }, VIEW, others), 'here');
+    assert.equal(visibleFraction({ x: 1900, y: 0, width: 40, height: 10 }, [{ x: 0, y: 0, ...VIEW }, ...others]), 1);
+    assert.ok(nearestIsHere({ x: 100, y: -500, width: 50, height: 50 }, VIEW, others));
+    assert.equal(nearestIsHere({ x: 3000, y: -500, width: 50, height: 50 }, VIEW, others), false);
+});
+
+test('edge pointers sit inside the view and point out toward the target', () => {
+    const { tip, tail, side } = edgeArrow({ x: 2500, y: 500, width: 40, height: 40 }, VIEW);
+    assert.equal(side, 'right');
+    assert.ok(tip.x <= VIEW.width && tip.x > tail.x);
+    assert.match(elsewhereText('right'), /right-hand screen/);
+    assert.match(elsewhereText('top'), /screen above/);
+});
+
+test('the lead display holds the step target, else the primary', () => {
+    const step = { targetIds: ['a1'] };
+    assert.equal(leadDisplay(step, [ann({ displayId: 'd2', hidden: true })], 'd1'), 'd2', 'a hidden target still leads');
+    assert.equal(leadDisplay(step, [], 'd1'), 'd1');
+    assert.equal(leadDisplay(null, [ann()], 'd1'), 'd1');
+});
+
+test('the chat panel is excluded only where it overlaps a display', () => {
+    const display = { x: 1920, y: 0, width: 1920, height: 1080 };
+    assert.deepEqual(localPart({ x: 3400, y: 500, width: 420, height: 580 }, display), { x: 1480, y: 500, width: 420, height: 580 });
+    assert.equal(localPart({ x: 100, y: 100, width: 420, height: 580 }, display), null);
+});
+
+test('only well-formed answers from a renderer are accepted', () => {
+    assert.deepEqual(parseUserAnswer({ kind: 'done' }), { kind: 'done' });
+    assert.deepEqual(parseUserAnswer({ kind: 'choice', index: 1 }), { kind: 'choice', index: 1 });
+    assert.deepEqual(parseUserAnswer({ kind: 'stuck' }), { kind: 'stuck' });
+    assert.equal(parseUserAnswer({ kind: 'choice', index: -1 }), null);
+    assert.equal(parseUserAnswer({ kind: 'clicks' }), null);
+    assert.equal(parseUserAnswer(null), null);
+    assert.equal(parseUserAnswer({ kind: 'reply' }), null);
+});
+
+// ------------------------------------------------------------------ palette
+
+test('badge text is whichever of dark or light reads better on the fill', () => {
+    assert.equal(textOn('#ffd60a'), '#111111', 'yellow');
+    assert.equal(textOn('#ffffff'), '#111111');
+    assert.equal(textOn(DEFAULT_COLORS.step), '#ffffff');
+    assert.equal(textOn('rgba(0, 0, 0, 1)'), '#ffffff');
+    assert.equal(textOn('not a colour'), '#ffffff');
+});
+
+test('colour parsing and contrast follow WCAG', () => {
+    assert.deepEqual(parseColor('#f0a'), [255, 0, 170]);
+    assert.deepEqual(parseColor('#ff2d95cc'), [255, 45, 149]);
+    assert.deepEqual(parseColor('rgb(10, 20, 30)'), [10, 20, 30]);
+    assert.equal(parseColor('red'), null);
+    const white = relativeLuminance([255, 255, 255]);
+    const black = relativeLuminance([0, 0, 0]);
+    assert.equal(contrastRatio(white, black), 21);
+    // White badge text on the default step colour clears AA for large text.
+    assert.ok(contrastRatio(white, relativeLuminance(parseColor(DEFAULT_COLORS.step))) >= 4.5);
+});

@@ -1,7 +1,7 @@
 import { ipcMain } from 'electron';
 import type { AgentEvent, AgentProvider } from './types.js';
 import { ClaudeProvider } from './claude.js';
-import { clearLog, pushMessage, setBusy, setMirror, streamMessage } from '../hud.js';
+import { clearLog, pushMessage, replyToStep, setBusy, setMirror, streamMessage } from '../hud.js';
 import { listIdeWorkspaces, listSessionsForDir, type IdeWorkspace, type SessionChoice } from './sessions.js';
 import { sdkUnavailable } from './sdk.js';
 import { mirroring, startMirror, stopMirror } from './mirror.js';
@@ -10,6 +10,13 @@ import { mirroring, startMirror, stopMirror } from './mirror.js';
  * Owns the chat panel's conversation: one provider, one in-flight turn at a
  * time, and the translation from provider events into HUD updates.
  */
+
+/**
+ * This server's tools whose content the panel already logs itself. Matched on
+ * the built-in agent's server name (claude.ts) only, so another server's tool
+ * of the same name is still listed.
+ */
+const SELF_LOGGING = /^mcp__screen-overlay__(highlight_and_wait|wait_for_user_click|show_message)$/;
 
 const providers = new Map<string, AgentProvider>();
 let current: AgentProvider;
@@ -99,6 +106,11 @@ export function isBusy(): boolean {
 export async function sendPrompt(prompt: string): Promise<void> {
     const trimmed = prompt.trim();
     if (!trimmed) return;
+    // While a step is pending, what the user types is their answer to it.
+    // Starting a separate conversation instead would leave the waiting agent
+    // blind, and that conversation's drawings could wipe the step's circle.
+    // The panel's own agent is busy exactly because it waits on that step.
+    if (replyToStep(trimmed)) return;
     if (busy) {
         pushMessage('system', 'Still working on the previous message. Press Stop to interrupt.');
         return;
@@ -148,7 +160,9 @@ export async function sendPrompt(prompt: string): Promise<void> {
                 setBusy(true);
                 break;
             case 'tool':
-                pushMessage('tool', e.summary);
+                // Steps and messages show up on their own, as guidance and as
+                // the step card; an "asking you: ..." line would repeat them.
+                if (!SELF_LOGGING.test(e.name)) pushMessage('tool', e.summary);
                 break;
             case 'notice':
                 pushMessage('system', e.text);
