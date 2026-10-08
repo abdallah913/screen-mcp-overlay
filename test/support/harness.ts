@@ -8,5 +8,6 @@ export { TOOL_NAMES } from '../../src/main/mcp/tools/index.js';
 export { store } from '../../src/main/store.js';
 export { useHelperTransport } from '../../src/main/uia.js';
 export { beginStep, answerStep, addClick, cancelStep, currentStep } from '../../src/main/steps.js';
+export { answerText } from '../../src/main/mcp/tools/answers.js';
 export { Client } from '@modelcontextprotocol/sdk/client/index.js';
 export { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
