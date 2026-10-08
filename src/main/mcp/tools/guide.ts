@@ -730,15 +730,20 @@ function watchHidden(circleId: string | undefined, onGone?: () => void): () => H
         const ms = Date.now() - since;
         if (!longest || ms >= longest.ms) longest = { ms, reason, ongoing };
     };
+    // A timer can run a millisecond before Date.now() reaches its time; onGone
+    // would then find the target not gone long enough, and nothing re-armed it.
+    const arm = (from: number): void => {
+        clearTimeout(timer);
+        const left = from + TARGET_GONE_MS - Date.now();
+        if (left <= 0) onGone?.();
+        else timer = setTimeout(() => arm(from), left);
+    };
     const update = (): void => {
         const a = store.list().find(x => x.id === circleId);
         if (a?.hidden && a.hiddenSince !== undefined) {
             if (since !== a.hiddenSince) {
                 since = a.hiddenSince;
-                if (onGone) {
-                    clearTimeout(timer);
-                    timer = setTimeout(onGone, Math.max(0, since + TARGET_GONE_MS - Date.now()));
-                }
+                if (onGone) arm(since);
             }
             reason = a.hiddenReason ?? reason;
         } else if (since !== undefined) {

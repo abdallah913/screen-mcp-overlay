@@ -86,6 +86,9 @@ class Store extends EventEmitter {
                 a.to?.x !== u.to?.x ||
                 a.to?.y !== u.to?.y ||
                 !!a.hidden !== u.hidden ||
+                // A minimised window the user then closes stays hidden, but
+                // "restore it" has become wrong advice.
+                (u.hidden && u.hiddenReason !== undefined && u.hiddenReason !== a.hiddenReason) ||
                 (u.covered !== undefined && (a.covered ?? null) !== u.covered) ||
                 (u.offscreen !== undefined && !!a.offscreen !== u.offscreen);
             if (!moved) continue;

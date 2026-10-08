@@ -1,5 +1,6 @@
 import type { SnapshotNode } from '../shared/types.js';
 import { toSnapshotNodes, type TreeRow } from '../shared/uitree.js';
+import { rectContains } from '../shared/geometry.js';
 import {
     describeWindow,
     findElements,
@@ -194,6 +195,8 @@ export function windowSignature(nodes: DescribedNode[]): string {
 /** Small: a "changes" check re-reads the window every poll, and the tracker shares the helper. */
 const CHANGES_MAX_NODES = 80;
 const CHANGES_MIN_POLL_MS = 1000;
+/** Before the final look's second read: long enough for a redraw to settle. */
+const FINAL_SETTLE_MS = 300;
 
 /**
  * One check: `hit` is the satisfying control (null when success has no
@@ -217,6 +220,24 @@ function opened(windows: WindowInfo[], before: string): Probe {
     const known = new Set(before.split(','));
     const fresh = windows.find(w => !known.has(w.ref));
     return { hit: fresh ? asElement(fresh) : null };
+}
+
+/**
+ * A window another process opened for the step's app, if one came up: a
+ * packaged app's file picker or "Open with" is not the app's own process. It
+ * counts when it is in front and centred over the app's window, as a dialog
+ * is; one that opens behind, like a reminder, is not the user's doing.
+ */
+function openedFor(windows: WindowInfo[], before: Set<string>, home: string): WindowInfo | undefined {
+    const app = windows.find(w => w.ref === home);
+    if (!app) return undefined;
+    return windows.find(
+        w =>
+            w.foreground &&
+            w.pid !== app.pid &&
+            !before.has(w.ref) &&
+            rectContains(app.rect, { x: w.rect.x + w.rect.width / 2, y: w.rect.y + w.rect.height / 2 })
+    );
 }
 
 /** Windows whose title contains `needle`, or all of them. */
@@ -297,21 +318,35 @@ function makeCheck(req: WaitRequest): Check {
     let tree: string | undefined;
     let pending: string | undefined;
     let windows = req.baseline ? refList(appWindows(req.baseline).map(w => w.ref)) : undefined;
+    let everyWindow = req.baseline ? new Set(req.baseline.map(w => w.ref)) : undefined;
+    // Focus is left out: the user switching into the app moves it, and so
+    // would decide which rows of a long list the helper keeps.
+    const signature = async (): Promise<string> =>
+        windowSignature((await describeWindow({ window: req.window!, maxNodes: CHANGES_MAX_NODES, ignoreFocus: true })).nodes);
     const check: Check = async final => {
-        const listed = appWindows(await listAllWindows());
+        const all = await listAllWindows();
+        everyWindow ??= new Set(all.map(w => w.ref));
+        const listed = appWindows(all);
         const now = refList(listed.map(w => w.ref));
         windows ??= now;
         if (now !== windows) return opened(listed, windows);
-        const { nodes } = await describeWindow({ window: req.window!, maxNodes: CHANGES_MAX_NODES });
-        const sig = windowSignature(nodes);
+        const fronted = openedFor(all, everyWindow, req.window!);
+        if (fronted) return { hit: asElement(fronted) };
+        const sig = await signature();
         tree ??= sig;
         if (sig === tree) {
             pending = undefined;
             return { hit: false };
         }
-        // The final look gets no second one: the user pressing Done a moment
-        // after their change is the normal case, not a redraw in progress.
-        if (pending === sig || final) return { hit: null };
+        if (pending === sig) return { hit: null };
+        if (final) {
+            // The user pressing Done a moment after their change is the normal
+            // case, so the last look takes its second sighting now rather than
+            // at the next poll. A window that never stops changing (a playing
+            // track's slider, a live log) must not read as the step done.
+            await pause(FINAL_SETTLE_MS, [req.signal]);
+            return { hit: (await signature()) === sig ? null : false };
+        }
         pending = sig;
         return { hit: false };
     };

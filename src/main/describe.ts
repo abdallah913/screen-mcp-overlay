@@ -122,7 +122,16 @@ export async function describeWindowAsText(opts: DescribeOptions): Promise<strin
     }
 
     const changes = diffLines(baseline.nodes, snapshotNodes);
-    if (!changes) return `No changes since ${opts.since}.\nsnapshotId: ${id}`;
+    if (!changes) {
+        // Rows the helper skipped in long lists are not in either snapshot, so
+        // a change among them (a box ticked far down a list) cannot show here.
+        const unread = snapshotNodes.reduce((sum, n) => sum + (n.unread ?? 0), 0);
+        const blind = unread
+            ? ` (${unread} row(s) of long lists were not read, so a change there would not show; ` +
+              'find_ui_elements with a name reads one)'
+            : '';
+        return `No changes since ${opts.since}${blind}.\nsnapshotId: ${id}`;
+    }
 
     const delta = `${changes.length} change(s) since ${opts.since}:\n${changes.join('\n')}\nsnapshotId: ${id}`;
     // After a navigation or a dialog opening nearly everything differs, and the

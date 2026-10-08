@@ -300,6 +300,12 @@ test('scroll_window says how far the view moved', async () => {
     assert.equal(text, 'Scrolled -3 notch(es): moved 0%->31%. Re-read to see the new content.');
 });
 
+test('scroll_window tells a small move in a long document from none', async () => {
+    fakeHelper({ scroll_window: () => ({ scrolled: true, before: 12.2, after: 12.3 }) });
+    const { text } = await call('scroll_window', { window: 'Notepad', notches: -3 });
+    assert.equal(text, 'Scrolled -3 notch(es): moved 12.2%->12.3%. Re-read to see the new content.');
+});
+
 test('scroll_window says when nothing moved', async () => {
     fakeHelper({ scroll_window: () => ({ scrolled: true, before: 100, after: 100 }) });
     const { text } = await call('scroll_window', { window: 'Notepad', notches: -3 });
@@ -327,6 +333,20 @@ test('a drawing hidden for a while is reported with why', async () => {
     const { text } = await call('clear_annotations', { ids: ['ann_none'] });
     assert.match(text, new RegExp(`Note: ${circle.id} not showing for 12s: its window is minimised \\(focus_window restores it\\)\\.`));
     assert.match(text, new RegExp(`Note: ${arrow.id} not showing for 12s: the control is gone`));
+});
+
+test('a hidden drawing takes a new reason while it stays hidden', async () => {
+    fakeHelper();
+    await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
+    const [circle] = store.list();
+    const hide = hiddenReason => ({ id: circle.id, displayId: circle.displayId, rect: circle.rect, hidden: true, hiddenReason });
+    store.applyTracking([hide('minimized')]);
+    // The user closes the window they had minimised: "restore it" is wrong now.
+    assert.equal(store.applyTracking([hide('closed')]), true);
+    assert.equal(store.list()[0].hiddenReason, 'closed');
+    // A tick that cannot say why keeps the reason it had.
+    assert.equal(store.applyTracking([hide(undefined)]), false);
+    assert.equal(store.list()[0].hiddenReason, 'closed');
 });
 
 // --- questions ---------------------------------------------------------------------

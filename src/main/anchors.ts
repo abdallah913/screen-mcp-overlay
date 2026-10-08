@@ -169,6 +169,9 @@ async function tick(): Promise<void> {
         failedSearches.clear();
         coverChecked.clear();
         lastRects.clear();
+        // A failure run belongs to the drawings it hid. Carried over, the
+        // first slow call after a quiet spell would hide new ones at once.
+        failingSince = undefined;
         return;
     }
 
@@ -246,9 +249,17 @@ async function explainMissing(anchored: Annotation[], byRef: Map<string, Resolve
     const homes = new Map<string, string>();
     for (const a of anchored) {
         const spec = a.anchor!;
-        const live = byRef.get(spec.ref);
+        let live = byRef.get(spec.ref);
         const home = homeWindow(spec);
-        if (spec.kind === 'window' || !live || live.rect || live.reason || !home) continue;
+        if (spec.kind === 'window' || !live || live.rect || !home) continue;
+        // A menu item lives in the menu's own popup, which closes whenever the
+        // menu does. That says nothing about the app, and taken as "closed" it
+        // stopped the item being found again when the menu reopened.
+        if (live.reason === 'closed' && targetWindow(spec) !== home) {
+            live = { ref: live.ref, rect: null, offscreen: live.offscreen, stale: live.stale };
+            byRef.set(spec.ref, live);
+        }
+        if (live.reason) continue;
         homes.set(spec.ref, home);
     }
     if (homes.size === 0) return;

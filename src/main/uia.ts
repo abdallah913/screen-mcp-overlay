@@ -452,10 +452,15 @@ export async function describeWindow(opts: {
     window: string;
     maxNodes?: number;
     maxDepth?: number;
+    /**
+     * Read no focus: no row is marked focused, and a long list keeps no row
+     * for being focused. For comparing trees, which focus alone must not change.
+     */
+    ignoreFocus?: boolean;
 }): Promise<Described> {
     const described = await send<Described>(
         'describe',
-        { window: opts.window, max_nodes: opts.maxNodes, max_depth: opts.maxDepth },
+        { window: opts.window, max_nodes: opts.maxNodes, max_depth: opts.maxDepth, ignore_focus: opts.ignoreFocus },
         20000
     );
     // The root row is the window itself, already addressable by its own ref.

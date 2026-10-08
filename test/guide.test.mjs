@@ -722,6 +722,33 @@ test('an unselected "changes" ignores a window minimised, and windows of other a
     assert.equal(/- window 200/.test(text), false, 'a minimised window is not reported closed');
 });
 
+test('an unselected "changes" counts a dialog another process opens in front of the app', async () => {
+    const desktop = fakeDesktop();
+    let lists = 0;
+    // A packaged app's file picker belongs to PickerHost, not to the app.
+    const picker = { ...desktop.windows[1], ref: '800', title: 'Open', pid: 98, rect: rect(300, 250, 400, 300), foreground: true };
+    fakeHelper(
+        {
+            find_elements: finder(() => []),
+            list_windows: () =>
+                ++lists > 3 ? [{ ...desktop.windows[0], foreground: false }, ...desktop.windows.slice(1), picker] : desktop.windows
+        },
+        desktop
+    );
+    const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs: 5000 });
+    assert.match(text, /^Met: "changes" after [\d.]+s\.\nOpen \[window\]/);
+});
+
+test('a window that never stops changing does not meet "changes" when the step times out', async () => {
+    const desktop = fakeDesktop();
+    let reads = 0;
+    // A playing track's position, say: different on every read.
+    const ticking = () => [...desktop.tree.slice(0, 3), { ...desktop.tree[3], value: `at ${++reads}s` }];
+    fakeHelper({ find_elements: finder(() => []), describe: () => ({ nodes: ticking(), truncated: false }) }, desktop);
+    const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs: 2500 });
+    assert.match(text, /^NOT met: "changes" did not happen/);
+});
+
 test('restoring a minimised window does not meet a window until', async () => {
     const desktop = fakeDesktop();
     let lists = 0;
