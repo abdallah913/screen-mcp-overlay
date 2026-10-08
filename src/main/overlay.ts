@@ -140,6 +140,13 @@ export function pushState(): void {
     for (const entry of windows.values()) pushTo(entry);
 }
 
+/** Replay the attention ping on these annotations, e.g. for the panel's "Show me". */
+export function pingTargets(ids: string[]): void {
+    for (const { win } of windows.values()) {
+        if (!win.isDestroyed()) win.webContents.send('overlay:ping', ids);
+    }
+}
+
 /**
  * Follow the chat panel so the exclusion rect tracks it. Hooked lazily from
  * here rather than from hud.ts, which imports this module; the panel exists

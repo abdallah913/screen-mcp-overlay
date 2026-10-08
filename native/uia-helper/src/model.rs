@@ -102,6 +102,11 @@ pub struct DescribedNode {
     /// listed under the window it belongs to.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub popup: bool,
+    /// Set on the last item the walk kept from a long run of same-role
+    /// siblings (list, tree or grid rows): how many more it skipped, so the
+    /// node budget reaches what comes after the list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more: Option<usize>,
 }
 
 /// A describe result. `truncated` is true when the node budget ran out before

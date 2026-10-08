@@ -20,6 +20,8 @@ export interface RawNode {
     state?: string;
     offscreen?: boolean;
     popup?: boolean;
+    /** Siblings of the same role the helper skipped after this one. */
+    more?: number;
 }
 
 /** Control names can contain newlines; they would break one-line-per-row output. */

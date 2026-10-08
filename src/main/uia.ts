@@ -68,6 +68,8 @@ export interface DescribedNode {
     offscreen?: boolean;
     /** Top node of an open popup belonging to the window. */
     popup?: boolean;
+    /** Last kept item of a long same-role run: how many more siblings the walk skipped. */
+    more?: number;
 }
 
 export interface Described {

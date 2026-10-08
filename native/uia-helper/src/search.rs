@@ -697,6 +697,7 @@ impl Session {
             value,
             rect,
             popup,
+            more: None,
         }
     }
 
