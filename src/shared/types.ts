@@ -174,6 +174,8 @@ export interface Annotation {
     hidden?: boolean;
     /** When it became hidden, so long-gone targets can be retired. */
     hiddenSince?: number;
+    /** Why the target went away: minimized, closed, other-desktop, or gone. */
+    hiddenReason?: 'minimized' | 'closed' | 'other-desktop' | 'gone';
     /**
      * Titles of the windows covering the target. The renderer draws such a
      * shape so it cannot be mistaken for pointing at the covering window.
@@ -213,6 +215,8 @@ export interface StepView {
     deadline: number;
     /** "Step n of N", when the agent said where in a walkthrough this is. */
     progress?: { n: number; of: number };
+    /** What is circled and where, e.g. `"Save" [button], top-left of "Notepad"`. */
+    target?: string;
     /** The annotations that mark the step's target, for docking UI out of their way. */
     targetIds: string[];
     /**

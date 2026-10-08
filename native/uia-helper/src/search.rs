@@ -19,8 +19,8 @@ use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, IsIconic, IsWindowVisible, WindowFromPoint, GA_ROOT};
 
 use crate::model::{
-    ContainerInfo, Described, DescribedNode, ElementInfo, PointHit, Rect, Resolved, ScrollIntoView, Suggestion,
-    WindowRef,
+    ContainerInfo, Described, DescribedNode, ElementInfo, PointHit, Rect, Resolved, ScrollIntoView, Scrolled,
+    Suggestion, WindowRef,
 };
 use crate::windows::{rect_of, title_of};
 
@@ -851,13 +851,13 @@ impl Session {
                         props::offscreen(&el, cached)
                             || (entry.top != 0 && rect_of(hwnd_of(entry.top)).is_some_and(|t| rank::outside(&rc, &t)))
                     });
-                    Resolved { r#ref: r.clone(), rect, offscreen }
+                    Resolved { r#ref: r.clone(), rect, offscreen, reason: None }
                 } else if let Ok(raw) = r.parse::<isize>() {
                     let hwnd = hwnd_of(raw);
                     let shown = unsafe { IsWindowVisible(hwnd) }.as_bool() && !unsafe { IsIconic(hwnd) }.as_bool();
-                    Resolved { r#ref: r.clone(), rect: if shown { rect_of(hwnd) } else { None }, offscreen: false }
+                    Resolved { r#ref: r.clone(), rect: if shown { rect_of(hwnd) } else { None }, offscreen: false, reason: None }
                 } else {
-                    Resolved { r#ref: r.clone(), rect: None, offscreen: false }
+                    Resolved { r#ref: r.clone(), rect: None, offscreen: false, reason: None }
                 }
             })
             .collect()
@@ -954,6 +954,17 @@ impl Session {
             best.container = None;
         }
         Ok(ScrollIntoView { scrolled: true, element: best })
+    }
+
+    /// Scroll a window by wheel notches, reporting what moved.
+    pub fn scroll_window(&mut self, hwnd: HWND, notches: i32) -> Result<Scrolled, String> {
+        crate::winops::scroll(hwnd, notches).map(|_| Scrolled { scrolled: true, before: None, after: None })
+    }
+
+    /// Collapsed expandable controls in a window (menus, combo boxes, tree
+    /// nodes): where a control that matched nothing may be hiding.
+    pub fn collapsed(&mut self, _window_ref: &str, _limit: usize) -> Result<Vec<ElementInfo>, String> {
+        Err("collapsed is not implemented yet".into())
     }
 
     /// Names in the window closest to one that matched nothing, best first.

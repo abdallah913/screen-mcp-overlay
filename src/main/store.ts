@@ -69,6 +69,8 @@ class Store extends EventEmitter {
             /** Leave undefined to keep the current value. */
             covered?: string | null;
             offscreen?: boolean;
+            /** Why the target is hidden, when it is. */
+            hiddenReason?: Annotation['hiddenReason'];
         }[]
     ): boolean {
         let changed = false;
@@ -92,6 +94,7 @@ class Store extends EventEmitter {
             a.to = u.to;
             if (u.hidden && !a.hidden) a.hiddenSince = Date.now();
             if (!u.hidden) a.hiddenSince = undefined;
+            a.hiddenReason = u.hidden ? u.hiddenReason ?? a.hiddenReason : undefined;
             a.hidden = u.hidden;
             if (u.covered !== undefined) a.covered = u.covered ?? undefined;
             if (u.offscreen !== undefined) a.offscreen = u.offscreen || undefined;

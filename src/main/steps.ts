@@ -36,6 +36,8 @@ export interface StepRequest {
     /** Annotations marking the step's target, so the UI can dock out of their way. */
     targetIds?: string[];
     progress?: { n: number; of: number };
+    /** What is circled and where, for the panel card and log. */
+    target?: string;
 }
 
 export interface StepHandle {
@@ -131,6 +133,7 @@ export function beginStep(req: StepRequest): StepHandle {
             startedAt: now,
             deadline: now + req.timeoutMs,
             progress: req.progress,
+            target: req.target,
             targetIds: req.targetIds ?? [],
             keys
         },

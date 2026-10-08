@@ -590,7 +590,7 @@ fn covering_name(hwnd: HWND) -> String {
 /// How much of `rect` (virtual-screen physical; the whole window when None) is
 /// hidden behind other top-level windows, measured at the points the user would
 /// look at rather than by summing rectangles. Our own windows never count.
-pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32) -> Result<Coverage, String> {
+pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, _hud: Option<HWND>) -> Result<Coverage, String> {
     if !exists(hwnd) {
         return Err(CLOSED.into());
     }

@@ -71,6 +71,10 @@ struct Request {
     /// with why (collapsed container, unselected tab) and what contains them.
     #[serde(default)]
     include_hidden: bool,
+    /// covered: a window of ignore_pid that still counts as covering (the
+    /// chat panel, which the user can see; the overlay itself never covers).
+    #[serde(default)]
+    hud: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -200,11 +204,7 @@ fn main() {
                 }
             }
             "scroll_window" => match parse_hwnd(req.window.as_deref()) {
-                Ok(h) => reply(
-                    req.id,
-                    winops::scroll(h, req.notches.unwrap_or(-3))
-                        .map(|_| serde_json::json!({ "scrolled": true })),
-                ),
+                Ok(h) => reply(req.id, session.scroll_window(h, req.notches.unwrap_or(-3))),
                 Err(e) => reply::<()>(req.id, Err(e)),
             },
             "ocr" => match req.path.as_deref() {
@@ -216,8 +216,15 @@ fn main() {
                 _ => reply::<()>(req.id, Err("element_at_point needs x and y".into())),
             },
             "covered" => match parse_hwnd(req.window.as_deref()) {
-                Ok(h) => reply(req.id, winops::covered(h, req.rect, ignore_pid(&req))),
+                Ok(h) => {
+                    let hud = req.hud.as_deref().and_then(|r| parse_hwnd(Some(r)).ok());
+                    reply(req.id, winops::covered(h, req.rect, ignore_pid(&req), hud))
+                }
                 Err(e) => reply::<()>(req.id, Err(e)),
+            },
+            "collapsed" => match req.window.as_deref() {
+                Some(w) => reply(req.id, session.collapsed(w, req.limit.unwrap_or(8).clamp(1, 20))),
+                None => reply::<()>(req.id, Err("collapsed needs a window ref".into())),
             },
             "scroll_into_view" => match req.window.as_deref() {
                 Some(w) => reply(

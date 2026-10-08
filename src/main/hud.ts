@@ -16,7 +16,7 @@ import { raiseOverlays } from './overlay.js';
 import { settings } from './settings.js';
 import { answerStep, currentStep, onStepEnded } from './steps.js';
 import { store } from './store.js';
-import { focusWindow } from './uia.js';
+import { focusWindow, setHudWindowRef } from './uia.js';
 
 /**
  * The chat panel. Unlike the overlay windows this one is focusable and
@@ -91,6 +91,7 @@ export function createHud(contentProtection: boolean): BrowserWindow {
     hud.setAlwaysOnTop(true, 'floating');
     hud.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     hud.setContentProtection(contentProtection);
+    setHudWindowRef(nativeRef(hud));
 
     void hud.loadFile(join(__dirname, '../renderer/hud/index.html'));
     hud.once('ready-to-show', () => {
@@ -102,6 +103,7 @@ export function createHud(contentProtection: boolean): BrowserWindow {
     });
     hud.on('closed', () => {
         hud = null;
+        setHudWindowRef(undefined);
     });
     // Focusing or showing the panel raises it within the topmost band; put the
     // annotations back above it so nothing the agent drew gets hidden. Not while
@@ -169,6 +171,16 @@ function wire(): void {
         localVoice = p?.local === true;
         onVoices?.();
     });
+}
+
+/** A window's HWND in the decimal form the helper uses for refs. */
+function nativeRef(win: BrowserWindow): string | undefined {
+    try {
+        const h = win.getNativeWindowHandle();
+        return String(h.length >= 8 ? h.readBigUInt64LE(0) : h.readUInt32LE(0));
+    } catch {
+        return undefined;
+    }
 }
 
 export function hudWindow(): BrowserWindow | null {

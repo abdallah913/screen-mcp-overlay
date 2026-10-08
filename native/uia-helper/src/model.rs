@@ -119,6 +119,9 @@ pub struct Resolved {
     pub r#ref: String,
     /// null when the window or control has gone away.
     pub rect: Option<Rect>,
+    /// Why rect is null: "minimized", "closed", "other-desktop" or "gone".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub offscreen: bool,
 }
@@ -165,4 +168,15 @@ pub struct ScrollIntoView {
 pub struct Suggestion {
     pub name: String,
     pub role: String,
+}
+
+/// What a wheel scroll did, read from the nearest ScrollPattern before and
+/// after: percentages 0..100, None when nothing there reports one.
+#[derive(Serialize)]
+pub struct Scrolled {
+    pub scrolled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<f64>,
 }

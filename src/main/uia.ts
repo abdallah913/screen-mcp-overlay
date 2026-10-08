@@ -107,6 +107,8 @@ export interface ResolvedRef {
     ref: string;
     rect: Rect | null;
     offscreen?: boolean;
+    /** Why rect is null, when the helper can tell. */
+    reason?: 'minimized' | 'closed' | 'other-desktop' | 'gone';
     /** An element ref from a helper that has since restarted: it names nothing now. */
     stale?: boolean;
 }
@@ -499,8 +501,26 @@ export async function elementAtPoint(x: number, y: number): Promise<PointHit> {
  * How much of a window, or of a rect in it (virtual-screen physical), is hidden
  * behind other top-level windows. Our own windows never count as covering.
  */
+/**
+ * The chat panel's window ref. Our own windows never count as covering a
+ * target -- the overlay is click-through and drawn for the user -- except the
+ * panel, which is opaque and really can sit on top of what they need to click.
+ */
+let hudRef: string | undefined;
+
+export function setHudWindowRef(ref: string | undefined): void {
+    hudRef = ref;
+}
+
 export function coverage(window: string, rect?: Rect): Promise<Coverage> {
-    return send<Coverage>('covered', { window, rect, ignore_pid: process.pid }, 4000);
+    return send<Coverage>('covered', { window, rect, ignore_pid: process.pid, hud: hudRef }, 4000);
+}
+
+/** Collapsed expandable controls in a window: where a control that matched nothing may be. */
+export async function collapsedControls(window: string, limit = 8): Promise<ElementInfo[]> {
+    const found = await send<ElementInfo[]>('collapsed', { window, limit }, 15000);
+    for (const e of found) liveElementRefs.add(e.ref);
+    return found;
 }
 
 /** Scroll a control into view (UIA ScrollItemPattern): a view change, not input. */
@@ -528,8 +548,16 @@ export function suggestNames(
 }
 
 /** Send wheel notches to a window. Negative scrolls down, as a wheel does. */
-export function scrollWindow(ref: string, notches: number): Promise<{ scrolled: boolean }> {
-    return send<{ scrolled: boolean }>('scroll_window', { window: ref, notches }, 6000);
+/**
+ * Send wheel notches to a window. before/after are the vertical scroll
+ * position (0..100) of the nearest scrollable element, when one reports it,
+ * so a scroll that moved nothing can say so.
+ */
+export function scrollWindow(
+    ref: string,
+    notches: number
+): Promise<{ scrolled: boolean; before?: number; after?: number }> {
+    return send<{ scrolled: boolean; before?: number; after?: number }>('scroll_window', { window: ref, notches }, 6000);
 }
 
 /** Recognise text in a PNG. Coordinates come back in that image's pixels. */
