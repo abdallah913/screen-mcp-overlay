@@ -35,14 +35,16 @@
     <div id="picker-list"></div>
   </div>
 
-  <section id="step-card" hidden>
+  <section id="step-card" tabindex="-1" hidden>
     <div id="step-head">
       <span id="step-progress" hidden></span>
       <span id="step-kind"></span>
       <span class="spacer"></span>
       <span id="step-time"></span>
+      <button id="step-show" class="ghost" title="Point at it again on screen" hidden>Show me</button>
     </div>
     <div id="step-prompt"></div>
+    <div id="step-target" hidden></div>
     <div id="step-count" hidden></div>
     <div id="step-buttons"></div>
     <div id="step-keys" hidden></div>

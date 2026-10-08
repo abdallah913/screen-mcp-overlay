@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { request } from 'node:http';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,8 +21,10 @@ await build({
     stdin: {
         contents: `
             export { bindStepKeys, keyLabel, onStepEnded, beginStep, answerStep, cancelStep, addClick, currentStep } from './src/main/steps.ts';
-            export { dodgePlacement, outcomeLabel, panelAnswer, capReply, targetWindowRef, replyToStep, REPLY_LIMIT } from './src/main/hud.ts';
+            export { dodgePlacement, outcomeLabel, panelAnswer, capReply, targetWindowRef, replyToStep, pointerNear, REPLY_LIMIT } from './src/main/hud.ts';
             export { shouldFade, idleTick, noteRequest, IDLE_MS } from './src/main/idle.ts';
+            export { normalizeSettings } from './src/main/settings.ts';
+            export { startMcpServer, mcpActiveRequests } from './src/main/mcp/server.ts';
             export { sendPrompt } from './src/main/agent/host.ts';
             export { store } from './src/main/store.ts';
             export * as card from './src/renderer/hud/step.ts';
@@ -142,6 +145,70 @@ test('a superseding step re-binds the keys to the new step', async () => {
     }
 });
 
+test('a click step is answered by pointing or Escape, not by done/stuck keys', () => {
+    const api = fakeShortcuts();
+    const unbind = m.bindStepKeys(api, () => chords);
+    try {
+        m.beginStep({ prompt: 'Point at it', mode: 'click', timeoutMs: 5000 });
+        assert.deepEqual([...api.held.keys()], ['Escape']);
+        assert.deepEqual(m.currentStep().keys, { cancel: 'Esc' });
+    } finally {
+        unbind();
+    }
+});
+
+test('a chord that is not a string disables that key instead of breaking the step', async () => {
+    const api = fakeShortcuts();
+    const unbind = m.bindStepKeys(api, () => ({ done: null, stuck: 'Control+Shift+F10' }));
+    try {
+        const step = m.beginStep({ prompt: 'Open File', mode: 'watch', timeoutMs: 5000 });
+        assert.deepEqual(m.currentStep().keys, { stuck: 'Ctrl+Shift+F10' });
+        api.held.get('Control+Shift+F10')();
+        assert.equal((await step.answer).kind, 'stuck');
+    } finally {
+        unbind();
+    }
+});
+
+test('a step listener that throws cannot break a step or keep its answer from the agent', async () => {
+    const boom = () => {
+        throw new Error('tray exploded');
+    };
+    store.on('step', boom);
+    const heard = [];
+    const off = m.onStepEnded((_view, answer) => heard.push(answer.kind));
+    try {
+        const step = m.beginStep({ prompt: 'Which?', mode: 'choice', options: ['A', 'B'], timeoutMs: 5000 });
+        assert.equal(m.answerStep({ kind: 'choice', index: 1 }), true);
+        assert.deepEqual(await step.answer, { kind: 'choice', index: 1, label: 'B' });
+        assert.deepEqual(heard, ['choice']);
+        assert.equal(m.currentStep(), null);
+    } finally {
+        store.off('step', boom);
+        off();
+    }
+});
+
+test('settings of the wrong type fall back instead of reaching code that trusts them', () => {
+    const s = m.normalizeSettings({
+        stepKeys: { done: null, stuck: 42 },
+        readStepsAloud: 'yes',
+        soundCues: true,
+        speechRate: 9,
+        token: 7
+    });
+    assert.deepEqual(s.stepKeys, { done: '', stuck: 'Control+Shift+F10' }, 'null switches a key off');
+    assert.equal(s.readStepsAloud, false);
+    assert.equal(s.soundCues, true);
+    assert.equal(s.speechRate, 2);
+    assert.equal(s.token, '');
+    assert.deepEqual(m.normalizeSettings({ stepKeys: { stuck: '' } }).stepKeys, {
+        done: 'Control+Shift+F9',
+        stuck: ''
+    });
+    assert.deepEqual(m.normalizeSettings('garbage').stepKeys, { done: 'Control+Shift+F9', stuck: 'Control+Shift+F10' });
+});
+
 test('accelerators read the way Windows users write them', () => {
     assert.equal(m.keyLabel('Control+Shift+F9'), 'Ctrl+Shift+F9');
     assert.equal(m.keyLabel('CommandOrControl+Alt+k'), 'Ctrl+Alt+K');
@@ -207,6 +274,19 @@ test('answers from the panel are validated before they reach the step', () => {
     assert.equal(m.panelAnswer({ kind: 'explode' }), null);
     assert.equal(m.panelAnswer(null), null);
     assert.deepEqual(m.panelAnswer({ kind: 'stuck', text: 42 }), { kind: 'stuck' });
+    assert.deepEqual(m.panelAnswer({ kind: 'cancel' }), { kind: 'cancel' });
+});
+
+test('the card sends what was typed only where it was meant to go', () => {
+    const s1 = view({ id: 'step_1' });
+    const idle = { busy: false, mirroring: false };
+    assert.equal(card.heldReplyNote('step_1', s1, idle), null, 'same step: send it');
+    assert.equal(card.heldReplyNote(null, null, idle), null, 'no step before or after: a message');
+    assert.match(card.heldReplyNote('step_1', null, idle), /ended.*new message/);
+    assert.match(card.heldReplyNote('step_1', null, { busy: true, mirroring: false }), /still working/);
+    assert.match(card.heldReplyNote('step_1', null, { busy: false, mirroring: true }), /type it there/);
+    assert.match(card.heldReplyNote('step_1', view({ id: 'step_2' }), idle), /replaced.*new step/);
+    assert.match(card.heldReplyNote(null, s1, idle), /started a step/);
 });
 
 test("a step's window comes from its drawing's anchor", () => {
@@ -244,7 +324,11 @@ test('the card offers the answers that fit the mode', () => {
             ['Skip', 'skip']
         ]
     );
-    assert.deepEqual(card.stepButtons(view({ mode: 'click', count: 1 })).map(b => b.label), ['Cancel']);
+    // Cancel ends a click step like Escape (keeping placed points), not as a skip.
+    assert.deepEqual(
+        card.stepButtons(view({ mode: 'click', count: 1 })).map(b => [b.label, b.answer.kind]),
+        [['Cancel', 'cancel']]
+    );
     const choice = view({ mode: 'choice', options: ['PNG', 'JPEG'] });
     assert.deepEqual(
         card.stepButtons(choice).map(b => [b.label, b.key, b.answer.index]),
@@ -324,7 +408,32 @@ test('with every corner taken the panel collapses to a pill on its own side', ()
     assert.equal(r.bounds.y + r.bounds.height, home.y + home.height);
 });
 
+test('the pointer on or next to the panel holds it still', () => {
+    assert.equal(m.pointerNear(home, { x: home.x + 10, y: home.y + 10 }), true);
+    assert.equal(m.pointerNear(home, { x: home.x - 20, y: home.y + 10 }), true, 'reaching for an edge');
+    assert.equal(m.pointerNear(home, { x: home.x - 60, y: home.y + 10 }), false);
+    assert.equal(m.pointerNear(home, { x: 10, y: 10 }), false);
+});
+
 // --------------------------------------------------------- idle clients
+
+test('a client parked on GET /mcp is turned away and does not count as busy', async () => {
+    const server = await m.startMcpServer(0);
+    try {
+        const status = await new Promise((resolve, reject) => {
+            const req = request(`${server.url}`, { method: 'GET', headers: { accept: 'text/event-stream' } }, res => {
+                res.resume();
+                resolve(res.statusCode);
+            });
+            req.on('error', reject);
+            req.end();
+        });
+        assert.equal(status, 405, 'the SDK client reads 405 as "no standalone stream"');
+        assert.equal(m.mcpActiveRequests(), 0);
+    } finally {
+        await server.close();
+    }
+});
 
 test('fading waits for real silence', () => {
     const base = { quietMs: m.IDLE_MS, stepPending: false, activeRequests: 0, faded: false };
