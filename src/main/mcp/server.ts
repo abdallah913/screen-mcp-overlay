@@ -2,11 +2,12 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { registerTools } from './tools.js';
+import { registerTools } from './tools/index.js';
 import { listWindows } from '../uia.js';
 import { windowLine } from '../../shared/windows.js';
 import { store } from '../store.js';
 import { settings } from '../settings.js';
+import { noteRequest } from '../idle.js';
 
 /**
  * The MCP surface is served over streamable HTTP on loopback rather than stdio.
@@ -298,6 +299,7 @@ export function startMcpServer(preferredPort: number, host = '127.0.0.1'): Promi
                     );
                     return;
                 }
+                noteRequest();
                 void handleMcp(req, res);
                 return;
             }

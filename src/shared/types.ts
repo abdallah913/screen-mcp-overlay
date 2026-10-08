@@ -64,6 +64,11 @@ export interface CaptureRecord {
      * same way as for a screen capture.
      */
     windowRef?: string;
+    /**
+     * The window refused to render itself and the pixels came from the screen
+     * instead, so anything covering it is in the image.
+     */
+    fallback?: boolean;
 }
 
 /**
@@ -81,6 +86,12 @@ export interface SnapshotNode {
     enabled: boolean;
     ref: string;
     rect: Rect;
+    /** Comma-joined state words: checked, unchecked, selected, expanded, collapsed, focused. */
+    state?: string;
+    /** Scrolled out of view: real rect, but not where the user can see it. */
+    offscreen?: boolean;
+    /** Top node of an open popup (menu, dropdown) belonging to the window. */
+    popup?: boolean;
 }
 
 export interface UiSnapshot {
@@ -90,7 +101,11 @@ export interface UiSnapshot {
     nodes: SnapshotNode[];
 }
 
-export type ShapeType = 'box' | 'highlight' | 'circle' | 'arrow' | 'label' | 'spotlight' | 'step';
+/**
+ * `done` is internal: the brief check mark that replaces a step's circle once
+ * the step is met. Agents cannot draw it, so it is not in the annotate schema.
+ */
+export type ShapeType = 'box' | 'highlight' | 'circle' | 'arrow' | 'label' | 'spotlight' | 'step' | 'done';
 
 /**
  * Ties an annotation to a live window or UI control instead of to fixed screen
@@ -148,7 +163,7 @@ export interface Annotation {
     thickness?: number;
     /** 0..1 dim strength for `spotlight`. */
     dim?: number;
-    /** Slow opacity pulse to draw the eye. */
+    /** Draw the eye: a short attention ping when it appears, moves or comes back. */
     pulse?: boolean;
     /** Wall-clock ms at which this annotation self-clears. */
     expiresAt?: number;
@@ -157,14 +172,80 @@ export interface Annotation {
     anchor?: AnchorSpec;
     /** True when the anchor's target is gone; kept so it returns if it comes back. */
     hidden?: boolean;
+    /** When it became hidden, so long-gone targets can be retired. */
+    hiddenSince?: number;
+    /**
+     * Titles of the windows covering the target. The renderer draws such a
+     * shape so it cannot be mistaken for pointing at the covering window.
+     */
+    covered?: string;
+    /**
+     * The target is scrolled out of view or off every display. The renderer
+     * points toward it instead of drawing on unrelated UI.
+     */
+    offscreen?: boolean;
+    /** Left over from an idle client: drawn faded until someone clears it. */
+    stale?: boolean;
+    /** The pending step this belongs to, if any. */
+    stepId?: string;
 }
 
-export interface ClickRequest {
+/**
+ * The step the user is being asked to take, as the overlay and the panel show
+ * it. There is at most one at a time; see src/main/steps.ts.
+ *
+ * - `click`: point at something; the overlay captures the click (the app does
+ *   not receive it).
+ * - `watch`: the user operates the app normally while the agent waits for the UI
+ *   to change; the overlay stays click-through apart from the step strip.
+ * - `choice`: pick one of `options`.
+ */
+export interface StepView {
     id: string;
     prompt: string;
-    /** How many points to collect before resolving. */
+    mode: 'click' | 'watch' | 'choice';
+    /** Click mode: how many points to collect, and how many are in. */
     count: number;
+    collected: number;
+    options?: string[];
+    startedAt: number;
+    /** Wall-clock ms when the step times out. */
+    deadline: number;
+    /** "Step n of N", when the agent said where in a walkthrough this is. */
+    progress?: { n: number; of: number };
+    /** The annotations that mark the step's target, for docking UI out of their way. */
+    targetIds: string[];
+    /**
+     * Accelerators that answer this step, as labels for the UI to show (e.g.
+     * "Ctrl+Shift+F9"). Only keys that actually registered are listed; Escape
+     * cancels in click mode only.
+     */
+    keys: { done?: string; stuck?: string; cancel?: string };
 }
+
+/** What the user can answer from the overlay strip, the panel or a hotkey. */
+export type UserAnswer =
+    | { kind: 'done' }
+    | { kind: 'stuck'; text?: string }
+    | { kind: 'skip' }
+    | { kind: 'reply'; text: string }
+    | { kind: 'choice'; index: number };
+
+/**
+ * How a step ended. Never an error: Escape, silence and a typed reply are all
+ * answers the agent should act on, not failures to retry.
+ */
+export type StepAnswer =
+    | { kind: 'clicks'; clicks: ClickResult[]; complete: boolean }
+    | { kind: 'done' }
+    | { kind: 'stuck'; text?: string }
+    | { kind: 'skip' }
+    | { kind: 'reply'; text: string }
+    | { kind: 'choice'; index: number; label: string }
+    | { kind: 'cancelled'; by: 'esc' | 'clear' | 'client' | 'superseded'; partial: ClickResult[] }
+    | { kind: 'timeout'; partial: ClickResult[] }
+    /** The tool ended the step itself, e.g. because the awaited UI state arrived. */
+    | { kind: 'ended' };
 
 export interface ClickResult {
     /** Display the click landed on. */
@@ -176,7 +257,8 @@ export interface ClickResult {
     image?: Point;
 }
 
-export type HudRole = 'user' | 'assistant' | 'tool' | 'system' | 'error';
+/** `guide` is an instruction to the user, styled apart from audit and tool lines. */
+export type HudRole = 'user' | 'assistant' | 'tool' | 'system' | 'error' | 'guide';
 
 export interface HudMessage {
     id: string;
@@ -195,7 +277,14 @@ export interface OverlayState {
      */
     displayId: string;
     annotations: Annotation[];
-    click: ClickRequest | null;
+    step: StepView | null;
+    /**
+     * Display-local DIP rects the overlay must leave clear: the chat panel, so
+     * a spotlight's scrim never dims the place the user types.
+     */
+    exclude: Rect[];
+    /** The user's sound-cue preference. */
+    cues: boolean;
 }
 
 export interface AppStatus {

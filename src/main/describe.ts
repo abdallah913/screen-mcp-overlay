@@ -27,7 +27,7 @@ export interface DescribeOptions {
 }
 
 export async function describeWindowAsText(opts: DescribeOptions): Promise<string> {
-    const nodes = await describeWindow({
+    const { nodes, truncated: walkTruncated } = await describeWindow({
         window: opts.window,
         maxNodes: opts.maxNodes,
         maxDepth: opts.maxDepth
@@ -52,10 +52,11 @@ export async function describeWindowAsText(opts: DescribeOptions): Promise<strin
     const diagnosis = diagnoseTree(snapshotNodes);
     const note = diagnosis ? `\n\nNOTE: ${diagnosis}` : '';
 
-    const truncated =
-        nodes.length >= (opts.maxNodes ?? 120)
-            ? `\n(truncated at ${nodes.length} nodes — raise maxNodes or narrow with find_ui_elements)`
-            : '';
+    // Judged by the helper's walk, not the row count: the walk spends its budget
+    // on unnamed wrappers that never become rows, so counting rows hid the cut.
+    const truncated = walkTruncated
+        ? '\n(truncated: the tree is bigger than maxNodes. Raise maxNodes or narrow with find_ui_elements)'
+        : '';
     const full =
         snapshotNodes.map(n => row(n, opts.includeRects ?? false)).join('\n') +
         truncated +

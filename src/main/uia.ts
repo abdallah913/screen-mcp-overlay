@@ -25,6 +25,12 @@ export interface WindowInfo {
     rect: Rect;
     foreground: boolean;
     minimized: boolean;
+    /** On another virtual desktop: Windows lists it, the user cannot see it. */
+    cloaked: boolean;
+    /** Runs elevated, so UIPI blocks UI Automation and window messages. */
+    elevated: boolean;
+    /** Not responding. */
+    hung: boolean;
 }
 
 export interface ElementInfo {
@@ -35,6 +41,18 @@ export interface ElementInfo {
     automation_id?: string;
     rect: Rect;
     enabled: boolean;
+    /** The control's value (an edit's text, a slider's position); never a password. */
+    value?: string;
+    /** Scrolled out of view: the rect is real but not visible. */
+    offscreen?: boolean;
+    /** Comma-joined: checked, unchecked, mixed, selected, expanded, collapsed, focused. */
+    state?: string;
+    /** Set when the match is in a popup (menu, dropdown) of the window's process: that popup's ref. */
+    window?: string;
+    /** Only with includeHidden: why the match has no usable rect. */
+    hidden?: 'collapsed' | 'unselected-tab' | 'no-rect';
+    /** Only with includeHidden: what to open to reveal it. */
+    container?: { ref: string; name: string; role: string };
 }
 
 export interface DescribedNode {
@@ -46,6 +64,31 @@ export interface DescribedNode {
     value?: string;
     enabled: boolean;
     rect: Rect;
+    state?: string;
+    offscreen?: boolean;
+    /** Top node of an open popup belonging to the window. */
+    popup?: boolean;
+}
+
+export interface Described {
+    nodes: DescribedNode[];
+    /** The node budget ran out before the walk finished. */
+    truncated: boolean;
+    /** Names of the first subtrees the walk never reached. */
+    unvisited?: string[];
+}
+
+export interface PointHit {
+    element: ElementInfo | null;
+    window: { ref: string; title: string } | null;
+}
+
+export interface Coverage {
+    /** Fraction of the area whose topmost window is not the target, 0..1. */
+    fraction: number;
+    centre_covered: boolean;
+    /** Titles of the covering windows, nearest first. */
+    by: string[];
 }
 
 export interface Occlusion {
@@ -63,6 +106,7 @@ export interface OcrLine {
 export interface ResolvedRef {
     ref: string;
     rect: Rect | null;
+    offscreen?: boolean;
 }
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
@@ -194,10 +238,18 @@ function send<T>(op: string, params: Record<string, unknown> = {}, timeoutMs = 8
     });
 }
 
-/** Top-level windows, our own excluded — pointing at the overlay is never useful. */
+/**
+ * Windows the user can see: our own excluded (pointing at the overlay is never
+ * useful), and minimised or other-desktop ones left out.
+ */
 export async function listWindows(): Promise<WindowInfo[]> {
+    return (await listAllWindows()).filter(w => !w.minimized && !w.cloaked);
+}
+
+/** Every top-level window but our own, minimised and other-desktop ones included. */
+export async function listAllWindows(): Promise<WindowInfo[]> {
     const all = await send<WindowInfo[]>('list_windows');
-    return all.filter(w => w.pid !== process.pid && !w.minimized);
+    return all.filter(w => w.pid !== process.pid);
 }
 
 /**
@@ -219,12 +271,14 @@ export async function findElements(opts: {
     role?: string;
     automationId?: string;
     limit?: number;
+    /** Also return matches with no usable rect, marked with why and their container. */
+    includeHidden?: boolean;
 }): Promise<ElementInfo[]> {
     // A full-tree search can take ~100ms on a large app; allow generous headroom.
-    const { automationId, ...rest } = opts;
+    const { automationId, includeHidden, ...rest } = opts;
     const found = await send<ElementInfo[]>(
         'find_elements',
-        { ...rest, automation_id: automationId },
+        { ...rest, automation_id: automationId, include_hidden: includeHidden ?? false },
         15000
     );
     for (const e of found) liveElementRefs.add(e.ref);
@@ -236,14 +290,14 @@ export async function describeWindow(opts: {
     window: string;
     maxNodes?: number;
     maxDepth?: number;
-}): Promise<DescribedNode[]> {
-    const nodes = await send<DescribedNode[]>(
+}): Promise<Described> {
+    const described = await send<Described>(
         'describe',
         { window: opts.window, max_nodes: opts.maxNodes, max_depth: opts.maxDepth },
         20000
     );
-    for (const n of nodes) liveElementRefs.add(n.ref);
-    return nodes;
+    for (const n of described.nodes) liveElementRefs.add(n.ref);
+    return described;
 }
 
 /** Bring a window to the front and give it focus. */
@@ -264,10 +318,50 @@ export function occlusionOf(ref: string): Promise<Occlusion> {
 /**
  * Render a window's own pixels to a PNG, occluded or not. Returns the raw window
  * rectangle the image corresponds to, which includes the invisible resize border
- * that list_windows trims.
+ * that list_windows trims, and whether the window refused so the screen was
+ * copied instead (then anything covering it is in the image).
  */
-export function printWindow(ref: string, path: string): Promise<Rect> {
-    return send<Rect>('print_window', { window: ref, path }, 20000);
+export function printWindow(ref: string, path: string): Promise<{ rect: Rect; fallback: boolean }> {
+    return send<{ rect: Rect; fallback: boolean }>('print_window', { window: ref, path }, 20000);
+}
+
+/** The control under a virtual-screen physical point, and its top-level window. Never the overlay. */
+export async function elementAtPoint(x: number, y: number): Promise<PointHit> {
+    const hit = await send<PointHit>('element_at_point', { x: Math.round(x), y: Math.round(y), ignore_pid: process.pid }, 4000);
+    if (hit.element) liveElementRefs.add(hit.element.ref);
+    return hit;
+}
+
+/**
+ * How much of a window, or of a rect in it (virtual-screen physical), is hidden
+ * behind other top-level windows. Our own windows never count as covering.
+ */
+export function coverage(window: string, rect?: Rect): Promise<Coverage> {
+    return send<Coverage>('covered', { window, rect, ignore_pid: process.pid }, 4000);
+}
+
+/** Scroll a control into view (UIA ScrollItemPattern): a view change, not input. */
+export async function scrollIntoView(
+    window: string,
+    selector: { name?: string; role?: string; automationId?: string }
+): Promise<{ scrolled: boolean; element: ElementInfo }> {
+    const r = await send<{ scrolled: boolean; element: ElementInfo }>(
+        'scroll_into_view',
+        { window, name: selector.name, role: selector.role, automation_id: selector.automationId },
+        8000
+    );
+    liveElementRefs.add(r.element.ref);
+    return r;
+}
+
+/** The names in a window closest to one that matched nothing. */
+export function suggestNames(
+    window: string,
+    name: string,
+    role?: string,
+    limit = 3
+): Promise<{ name: string; role: string }[]> {
+    return send<{ name: string; role: string }[]>('suggest', { window, name, role, limit }, 15000);
 }
 
 /** Send wheel notches to a window. Negative scrolls down, as a wheel does. */

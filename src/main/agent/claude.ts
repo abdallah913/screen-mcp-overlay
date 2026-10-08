@@ -1,7 +1,7 @@
 import { app } from 'electron';
 import type { AgentEvent, AgentProvider, SendInput } from './types.js';
 import { mcpUrl } from '../mcp/server.js';
-import { TOOL_NAMES } from '../mcp/tools.js';
+import { TOOL_NAMES } from '../mcp/tools/index.js';
 import { loadSdk, sdkUnavailable, type SdkModule } from './sdk.js';
 
 /**

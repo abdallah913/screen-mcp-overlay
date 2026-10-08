@@ -20,13 +20,25 @@ export interface Settings {
      * so the URLs written into agent configs keep working across restarts.
      */
     token: string;
+    /** Read each step's instruction aloud when it appears. */
+    readStepsAloud: boolean;
+    /** A short sound when a step starts and when it is done. */
+    soundCues: boolean;
+    /**
+     * Global accelerators (Electron syntax) for answering a pending step,
+     * registered only while one is pending. Empty string disables one.
+     */
+    stepKeys: { done: string; stuck: string };
 }
 
 const DEFAULTS: Settings = {
     openAtLogin: false,
     startHidden: false,
     showInCapture: process.env.SCREEN_OVERLAY_SHOW_IN_CAPTURE === '1',
-    token: ''
+    token: '',
+    readStepsAloud: false,
+    soundCues: false,
+    stepKeys: { done: '', stuck: '' }
 };
 
 let cache: Settings | undefined;

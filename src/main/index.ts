@@ -1,7 +1,8 @@
 import { app, clipboard, globalShortcut, ipcMain, Menu, nativeImage, Tray } from 'electron';
 import { join } from 'node:path';
 import { cleanupCaptureDir, initCaptureDir } from './capture.js';
-import { cancelClicks, hasPendingClick, initClicks } from './clicks.js';
+import { initClicks } from './clicks.js';
+import { cancelStep, currentStep } from './steps.js';
 import { createHud, hudWindow, pushMessage, setHudContentProtection, setStatus, toggleHud } from './hud.js';
 import { disposeImageWorker } from './imageWorker.js';
 import {
@@ -114,15 +115,19 @@ function registerIpc(): void {
 function registerShortcuts(): void {
     // Toggle the chat panel.
     globalShortcut.register('Control+Shift+O', () => toggleHud());
-    // Panic button: wipe everything drawn on screen.
-    globalShortcut.register('Control+Shift+X', () => store.clear());
+    // Panic button: wipe everything drawn on screen and end the pending step.
+    globalShortcut.register('Control+Shift+X', () => {
+        cancelStep('clear');
+        store.clear();
+    });
 
-    // Escape is grabbed ONLY while a click request is pending. A permanent
+    // Escape is grabbed ONLY while a click-mode step is pending. A permanent
     // global registration would swallow Escape from every other application on
-    // the machine for as long as the overlay runs.
-    store.on('click-request', () => {
-        if (hasPendingClick()) {
-            globalShortcut.register('Escape', () => cancelClicks());
+    // the machine; so would one during a watched step, where the user is
+    // operating their app and Escape closes its dialogs.
+    store.on('step', () => {
+        if (currentStep()?.mode === 'click') {
+            if (!globalShortcut.isRegistered('Escape')) globalShortcut.register('Escape', () => cancelStep('esc'));
         } else {
             globalShortcut.unregister('Escape');
         }
@@ -145,7 +150,13 @@ function refreshTrayMenu(): void {
             { label: mcpUrl() || 'MCP server not running', enabled: false },
             { type: 'separator' },
             { label: 'Show / hide panel\tCtrl+Shift+O', click: () => toggleHud() },
-            { label: 'Clear annotations\tCtrl+Shift+X', click: () => store.clear() },
+            {
+                label: 'Clear and stop the current step\tCtrl+Shift+X',
+                click: () => {
+                    cancelStep('clear');
+                    store.clear();
+                }
+            },
             {
                 label: 'Copy MCP URL (includes access token)',
                 click: () => {

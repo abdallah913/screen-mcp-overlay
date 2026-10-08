@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { call, connect, fakeHelper, harness, rect } from './support/fake-helper.mjs';
 
 /*
  * The MCP tools end to end: the real server and every handler, with Electron
@@ -9,9 +9,7 @@ import { createRequire } from 'node:module';
  * formats are pinned down.
  */
 
-const require = createRequire(import.meta.url);
-const { buildServer, stripSchemaNoise, TOOL_NAMES, store, useHelperTransport, Client, InMemoryTransport } =
-    require('../dist-test/harness.cjs');
+const { stripSchemaNoise, TOOL_NAMES, store } = harness;
 
 /**
  * Model-visible size of the tool list (name + description + input schema per
@@ -19,72 +17,6 @@ const { buildServer, stripSchemaNoise, TOOL_NAMES, store, useHelperTransport, Cl
  * deliberately: it was 12,673 characters before the tool surface was tightened.
  */
 const TOOL_LIST_BUDGET = 10_500;
-
-const rect = (x, y, width, height) => ({ x, y, width, height });
-
-/** A small fake desktop, and a record of what the tools asked the helper. */
-function fakeHelper(overrides = {}) {
-    const calls = [];
-    const windows = [
-        { ref: '100', title: 'Untitled - Notepad', class: 'Notepad', pid: 11, rect: rect(100, 100, 800, 600), foreground: true, minimized: false },
-        { ref: '200', title: 'Calculator', class: 'Calc', pid: 12, rect: rect(1000, 100, 320, 500), foreground: false, minimized: false },
-        { ref: '300', title: 'Minimised thing', class: 'X', pid: 13, rect: rect(0, 0, 100, 100), foreground: false, minimized: true },
-        { ref: '400', title: 'Overlay panel', class: 'Chrome_WidgetWin_1', pid: process.pid, rect: rect(0, 0, 100, 100), foreground: false, minimized: false }
-    ];
-    const controls = [
-        { ref: 'el_1', name: 'Save', role: 'button', automation_id: 'SaveBtn', rect: rect(150, 150, 80, 24), enabled: true },
-        { ref: 'el_2', name: 'Export', role: 'button', rect: rect(250, 150, 80, 24), enabled: false }
-    ];
-    const tree = [
-        { depth: 0, ref: 'el_10', name: 'Untitled - Notepad', role: 'window', enabled: true, rect: rect(100, 100, 800, 600) },
-        { depth: 2, ref: 'el_11', name: 'Save', role: 'button', enabled: true, rect: rect(150, 150, 80, 24) },
-        { depth: 3, ref: 'el_12', name: 'Save', role: 'text', enabled: true, rect: rect(152, 152, 70, 20) },
-        { depth: 2, ref: 'el_13', name: 'Text editor', role: 'document', value: 'hello', enabled: true, rect: rect(100, 180, 800, 500) }
-    ];
-    const handlers = {
-        list_windows: () => windows,
-        find_elements: p =>
-            controls
-                .filter(c => (p.automation_id ? c.automation_id === p.automation_id : !p.name || c.name.toLowerCase().includes(p.name.toLowerCase())))
-                .filter(c => !p.role || c.role === p.role)
-                .slice(0, p.limit ?? 25),
-        describe: () => tree,
-        resolve: p =>
-            p.refs.map(r => ({
-                ref: r,
-                rect: windows.find(w => w.ref === r)?.rect ?? controls.find(c => c.ref === r)?.rect ?? null
-            })),
-        focus_window: () => ({ focused: true }),
-        scroll_window: () => ({ scrolled: true }),
-        ...overrides
-    };
-    useHelperTransport(async (op, params) => {
-        calls.push({ op, params });
-        const h = handlers[op];
-        if (!h) throw new Error(`fake helper has no ${op}`);
-        return h(params, calls);
-    });
-    return { calls, windows, controls };
-}
-
-async function connect() {
-    const server = buildServer();
-    const [a, b] = InMemoryTransport.createLinkedPair();
-    await server.connect(a);
-    const client = new Client({ name: 'test', version: '0' });
-    await client.connect(b);
-    return client;
-}
-
-async function call(name, args = {}) {
-    const client = await connect();
-    try {
-        const r = await client.callTool({ name, arguments: args });
-        return { text: r.content.filter(c => c.type === 'text').map(c => c.text).join('\n'), isError: Boolean(r.isError) };
-    } finally {
-        await client.close();
-    }
-}
 
 test.beforeEach(() => store.clear());
 

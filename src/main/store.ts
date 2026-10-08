@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import type { Annotation, CaptureRecord, ClickRequest, Point, Rect, UiSnapshot } from '../shared/types.js';
+import type { Annotation, CaptureRecord, Point, Rect, StepView, UiSnapshot } from '../shared/types.js';
 
 /**
  * Single source of truth for everything drawn on screen. The MCP server, the
@@ -11,7 +11,7 @@ class Store extends EventEmitter {
     private annotations = new Map<string, Annotation>();
     private captures = new Map<string, CaptureRecord>();
     private snapshots = new Map<string, UiSnapshot>();
-    private clickRequest: ClickRequest | null = null;
+    private step: StepView | null = null;
     private seq = 0;
     private sweeper: NodeJS.Timeout | null = null;
 
@@ -147,15 +147,16 @@ class Store extends EventEmitter {
         return this.snapshots.get(id);
     }
 
-    // ---- click requests ----------------------------------------------------
+    // ---- the pending step ---------------------------------------------------
 
-    setClickRequest(req: ClickRequest | null): void {
-        this.clickRequest = req;
-        this.emit('click-request');
+    /** Owned by steps.ts; everything else only reads it or listens for 'step'. */
+    setStep(step: StepView | null): void {
+        this.step = step;
+        this.emit('step');
     }
 
-    getClickRequest(): ClickRequest | null {
-        return this.clickRequest;
+    getStep(): StepView | null {
+        return this.step;
     }
 }
 

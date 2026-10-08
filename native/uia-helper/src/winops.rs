@@ -24,7 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GW_HWNDPREV, SW_RESTORE, WM_MOUSEWHEEL, WS_EX_TOOLWINDOW,
 };
 
-use crate::{is_cloaked, rect_of, Rect};
+use crate::model::{Coverage, PrintResult, Rect};
+use crate::windows::{is_cloaked, rect_of};
 
 /// PW_RENDERFULLCONTENT: renders DirectComposition surfaces too, which is what
 /// makes this work for Chromium and other GPU-composited apps.
@@ -78,7 +79,7 @@ pub fn occlusion_of(hwnd: HWND, ignore_pid: u32) -> Occlusion {
                 let overlap = intersect(&target, &r);
                 if overlap > area / 100 {
                     covered += overlap;
-                    by.push(crate::title_of(above));
+                    by.push(crate::windows::title_of(above));
                 }
             }
         }
@@ -142,7 +143,7 @@ pub fn focus(hwnd: HWND) -> Result<(), String> {
 /// PrintWindow asks the window to render itself into a bitmap, so the result is
 /// the window's content rather than whatever happens to be on screen at those
 /// coordinates.
-pub fn print_window_png(hwnd: HWND, path: &str) -> Result<Rect, String> {
+pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
     let rect = rect_of(hwnd).ok_or("could not measure that window")?;
     // PrintWindow works in window coordinates, which include the frame that the
     // DWM extended bounds trims, so use the raw window rect for the bitmap size.
@@ -224,7 +225,7 @@ pub fn print_window_png(hwnd: HWND, path: &str) -> Result<Rect, String> {
         // the raw window rect, which includes the invisible resize border that
         // the DWM extended bounds trims, so image coordinates are relative to
         // this rectangle rather than to the one list_windows reports.
-        Ok(Rect { x: raw.left, y: raw.top, width, height })
+        Ok(PrintResult { rect: Rect { x: raw.left, y: raw.top, width, height }, fallback: !printed })
     }
 }
 
@@ -246,4 +247,11 @@ pub fn scroll(hwnd: HWND, notches: i32) -> Result<(), String> {
         SendMessageW(hwnd, WM_MOUSEWHEEL, Some(wparam), Some(lparam));
     }
     Ok(())
+}
+
+/// How much of `rect` (virtual-screen physical; the whole window when None) is
+/// hidden behind other top-level windows, measured at the points the user would
+/// look at rather than by summing rectangles.
+pub fn covered(_hwnd: HWND, _rect: Option<Rect>, _ignore_pid: u32) -> Result<Coverage, String> {
+    Err("covered is not implemented yet".into())
 }

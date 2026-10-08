@@ -51,7 +51,7 @@ export async function captureWindow(opts: {
 }): Promise<CaptureRecord> {
     const id = store.nextId('cap');
     const raw = join(captureDir, `${id}-raw.png`);
-    const rect = await printWindow(opts.windowRef, raw);
+    const { rect, fallback } = await printWindow(opts.windowRef, raw);
 
     let image = nativeImage.createFromPath(raw);
     if (image.isEmpty()) throw new Error('the window rendered an empty image');
@@ -97,7 +97,8 @@ export async function captureWindow(opts: {
         imageScale: finalSize.width / Math.max(1, rect.width),
         path,
         createdAt: Date.now(),
-        windowRef: opts.windowRef
+        windowRef: opts.windowRef,
+        fallback
     };
     store.recordCapture(record);
     pushMessage('system', `Window captured: ${finalSize.width}x${finalSize.height}.`);

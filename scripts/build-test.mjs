@@ -6,6 +6,7 @@
  * tool layer to load and run under plain Node.
  */
 import { build } from 'esbuild';
+import { readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,7 +15,10 @@ const out = join(root, 'dist-test');
 
 await Promise.all([
     build({
-        entryPoints: ['geometry', 'uitree', 'windows'].map(m => join(root, 'src/shared', `${m}.ts`)),
+        // Every pure module, so a new one is testable without editing this list.
+        entryPoints: readdirSync(join(root, 'src/shared'))
+            .filter(f => f.endsWith('.ts') && f !== 'types.ts')
+            .map(f => join(root, 'src/shared', f)),
         bundle: true,
         platform: 'node',
         format: 'esm',

@@ -1,4 +1,4 @@
-import type { Annotation, ClickRequest, OverlayState } from '../../shared/types.js';
+import type { Annotation, OverlayState, StepView } from '../../shared/types.js';
 
 /**
  * The drawing surface. The window exactly covers one display in DIPs, so the
@@ -22,7 +22,8 @@ const banner = document.getElementById('banner') as HTMLDivElement;
 const bannerText = document.getElementById('banner-text') as HTMLSpanElement;
 
 let annotations: Annotation[] = [];
-let click: ClickRequest | null = null;
+/** The pending click-mode step, if any. Other step modes are drawn by the step strip. */
+let click: StepView | null = null;
 let displayId = '';
 let collected = 0;
 /** rAF handle while an animation is running; null when the canvas is static. */
@@ -68,7 +69,7 @@ window.overlayApi.onState(state => {
     // nothing drawn, and the main process silently dropped every click there.
     displayId = state.displayId;
     const wasPending = click !== null;
-    click = state.click;
+    click = state.step?.mode === 'click' ? state.step : null;
     if (!click) collected = 0;
     if (wasPending !== (click !== null)) updateClickMode();
     updateBanner();

@@ -3,33 +3,21 @@ import type { ClickResult, Point } from '../shared/types.js';
 import { physicalToImagePoint } from '../shared/geometry.js';
 import { listDisplays } from './displays.js';
 import { store } from './store.js';
+import { addClick, beginStep, cancelStep, currentCaptureId } from './steps.js';
 
 /**
- * Human-in-the-loop pointing. `wait_for_user_click` turns the overlay
- * interactive, collects N clicks, and hands their coordinates back to the agent
- * in every space it might need — including back into the screenshot it was
- * looking at when it asked.
+ * Human-in-the-loop pointing. While a click-mode step is pending the overlay
+ * turns interactive, and each click it reports is converted here into every
+ * coordinate space the agent might need -- including back into the screenshot
+ * it was looking at when it asked -- and handed to the step (steps.ts).
  *
  * Implemented as a long-running tool call rather than MCP elicitation on
  * purpose: elicitation is form/URL-shaped and unsupported by several clients,
  * while a blocking tool call works everywhere.
  */
 
-interface Pending {
-    id: string;
-    captureId?: string;
-    want: number;
-    got: ClickResult[];
-    resolve: (r: ClickResult[]) => void;
-    reject: (e: Error) => void;
-    timer: NodeJS.Timeout;
-}
-
-let pending: Pending | null = null;
-
 export function initClicks(): void {
     ipcMain.on('overlay:click', (_e, payload: { displayId: string; dip: Point }) => {
-        if (!pending) return;
         const display = listDisplays().find(d => d.id === payload.displayId);
         if (!display) return;
 
@@ -47,17 +35,16 @@ export function initClicks(): void {
             }
         };
 
-        const capture = pending.captureId ? store.capture(pending.captureId) : undefined;
+        const captureId = currentCaptureId();
+        const capture = captureId ? store.capture(captureId) : undefined;
         if (capture && capture.displayId === display.id) {
             result.image = round(physicalToImagePoint(physical, capture));
         }
-
-        pending.got.push(result);
-        if (pending.got.length >= pending.want) finish(p => p.resolve(p.got));
+        addClick(result);
     });
 
     ipcMain.on('overlay:cancel-click', () => {
-        finish(p => p.reject(new Error('the user cancelled the click request')));
+        cancelStep('esc');
     });
 }
 
@@ -65,53 +52,26 @@ function round(p: Point): Point {
     return { x: Math.round(p.x), y: Math.round(p.y) };
 }
 
-function finish(action: (p: Pending) => void): void {
-    if (!pending) return;
-    const p = pending;
-    pending = null;
-    clearTimeout(p.timer);
-    store.setClickRequest(null);
-    action(p);
-}
-
-export function requestClicks(opts: {
+/**
+ * Collect clicks with the pre-steps.ts contract: resolves with the clicks,
+ * rejects on cancel or a timeout with none. Kept only until the tool layer
+ * formats step answers itself; new code should use beginStep().
+ */
+export async function requestClicks(opts: {
     prompt: string;
     count: number;
     timeoutMs: number;
     captureId?: string;
 }): Promise<ClickResult[]> {
-    if (pending) {
-        return Promise.reject(new Error('another click request is already waiting; only one can be active at a time'));
-    }
-
-    return new Promise<ClickResult[]>((resolve, reject) => {
-        const id = store.nextId('click');
-        const timer = setTimeout(() => {
-            finish(p =>
-                p.got.length > 0
-                    ? p.resolve(p.got)
-                    : p.reject(new Error(`timed out after ${opts.timeoutMs}ms with no click`))
-            );
-        }, opts.timeoutMs);
-        timer.unref?.();
-
-        pending = {
-            id,
-            captureId: opts.captureId,
-            want: opts.count,
-            got: [],
-            resolve,
-            reject,
-            timer
-        };
-        store.setClickRequest({ id, prompt: opts.prompt, count: opts.count });
-    });
-}
-
-export function cancelClicks(): void {
-    finish(p => p.reject(new Error('the click request was cancelled')));
+    const step = beginStep({ prompt: opts.prompt, mode: 'click', count: opts.count, captureId: opts.captureId, timeoutMs: opts.timeoutMs });
+    const a = await step.answer;
+    if (a.kind === 'clicks') return a.clicks;
+    if (a.kind === 'timeout' && a.partial.length > 0) return a.partial;
+    throw new Error(
+        a.kind === 'timeout' ? `timed out after ${opts.timeoutMs}ms with no click` : 'the user cancelled the click request'
+    );
 }
 
 export function hasPendingClick(): boolean {
-    return pending !== null;
+    return store.getStep()?.mode === 'click';
 }

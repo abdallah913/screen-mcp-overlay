@@ -17,6 +17,9 @@ export interface RawNode {
     value?: string;
     enabled: boolean;
     rect: { x: number; y: number; width: number; height: number };
+    state?: string;
+    offscreen?: boolean;
+    popup?: boolean;
 }
 
 /** Control names can contain newlines; they would break one-line-per-row output. */
@@ -131,7 +134,10 @@ export function toSnapshotNodes(raw: RawNode[]): SnapshotNode[] {
         value: n.value ? clean(n.value) : undefined,
         enabled: n.enabled,
         ref: n.ref,
-        rect: n.rect
+        rect: n.rect,
+        state: n.state,
+        offscreen: n.offscreen,
+        popup: n.popup
     }));
 }
 

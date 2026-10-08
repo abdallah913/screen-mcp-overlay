@@ -1,6 +1,6 @@
 import { BrowserWindow, screen } from 'electron';
 import { join } from 'node:path';
-import type { AppStatus, HudMessage, HudRole } from '../shared/types.js';
+import type { AppStatus, HudMessage, HudRole, Rect } from '../shared/types.js';
 import { raiseOverlays } from './overlay.js';
 
 /**
@@ -69,6 +69,12 @@ export function createHud(contentProtection: boolean): BrowserWindow {
 
 export function hudWindow(): BrowserWindow | null {
     return hud && !hud.isDestroyed() ? hud : null;
+}
+
+/** The panel's bounds in global DIPs while it is visible, else null. */
+export function hudBounds(): Rect | null {
+    const win = hudWindow();
+    return win && win.isVisible() ? win.getBounds() : null;
 }
 
 export function toggleHud(): void {

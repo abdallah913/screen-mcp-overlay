@@ -82,16 +82,16 @@ function createOverlayWindow(display: DisplayInfo): OverlayWindow {
 }
 
 function currentState(display: DisplayInfo): OverlayState {
-    const req = store.getClickRequest();
     return {
         displayId: display.id,
         // Anchored annotations whose target vanished are kept in the store but
         // must not be drawn; they come back if the window reappears.
         annotations: store.forDisplay(display.id).filter(a => !a.hidden),
-        // Only the display under the cursor prompts for a click, but every
-        // display needs the banner so the user sees the request wherever they
-        // are looking.
-        click: req
+        // Every display gets the step, so the user sees the request wherever
+        // they are looking.
+        step: store.getStep(),
+        exclude: [],
+        cues: false
     };
 }
 
@@ -136,8 +136,8 @@ export function initOverlay(): void {
     screen.on('display-metrics-changed', syncDisplays);
 
     store.on('annotations', pushState);
-    store.on('click-request', () => {
-        setInteractive(store.getClickRequest() !== null);
+    store.on('step', () => {
+        setInteractive(store.getStep()?.mode === 'click');
         pushState();
     });
 }
