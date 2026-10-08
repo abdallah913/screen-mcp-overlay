@@ -1,4 +1,4 @@
-import type { Rect, SnapshotNode } from './types.js';
+import type { Point, Rect, SnapshotNode } from './types.js';
 
 /**
  * Pure logic for turning a UI Automation tree into text and diffing two of them.
@@ -99,15 +99,20 @@ export function displayDepths(nodes: Pick<RawNode, 'depth'>[]): number[] {
  * a rename costs that one row rather than its entire subtree.
  */
 export function structuralKeys(
-    nodes: Pick<RawNode, 'depth' | 'role' | 'name' | 'automation_id'>[]
+    nodes: Pick<RawNode, 'depth' | 'role' | 'name' | 'automation_id' | 'popup'>[]
 ): string[] {
     return structure(nodes).map(s => s.key);
 }
 
-/** Each node's key, plus its parent's path, which a collapse marker is keyed under. */
+/**
+ * Each node's key. An open popup is numbered apart from the window's own
+ * children: it is listed first, so sharing their counter turned the window's
+ * "pane[1]" into "pane[2]" whenever a pane-like popup opened, re-keying its
+ * whole subtree and making a since= diff report every row as removed and added.
+ */
 function structure(
-    nodes: Pick<RawNode, 'depth' | 'role' | 'name' | 'automation_id'>[]
-): { key: string; parentPath: string }[] {
+    nodes: Pick<RawNode, 'depth' | 'role' | 'name' | 'automation_id' | 'popup'>[]
+): { key: string }[] {
     const stack: { depth: number; segment: string }[] = [];
     const childCounts = new Map<string, Map<string, number>>();
 
@@ -119,22 +124,26 @@ function structure(
         childCounts.set(parentPath, scope);
 
         // Position among same-role siblings: stable while the layout is.
-        const index = (scope.get(n.role) ?? 0) + 1;
-        scope.set(n.role, index);
+        const kind = n.popup ? `popup:${n.role}` : n.role;
+        const index = (scope.get(kind) ?? 0) + 1;
+        scope.set(kind, index);
 
-        stack.push({ depth: n.depth, segment: `${n.role}[${index}]` });
+        const segment = `${kind}[${index}]`;
+        stack.push({ depth: n.depth, segment });
         // An AutomationId is the app's own stable handle, so prefer it over the
         // display name: it survives relabelling and translation.
         const identity = n.automation_id ? `#${n.automation_id}` : clean(n.name);
-        return { key: `${parentPath ? `${parentPath}/` : ''}${n.role}[${index}]:${identity}`, parentPath };
+        return { key: `${parentPath ? `${parentPath}/` : ''}${segment}:${identity}` };
     });
 }
 
 /**
- * A snapshot row, or the marker standing in for a collapsed run of list rows:
- * `more` is how many rows the marker replaces, and its ref is empty.
+ * A snapshot row. `unread` is how many same-role siblings after it the helper
+ * skipped, to spend its row budget on the controls past a long list. On a
+ * display-only marker (see collapseRuns), `more` is how many rows it stands
+ * for, and its ref is empty.
  */
-export type TreeRow = SnapshotNode & { more?: number };
+export type TreeRow = SnapshotNode & { unread?: number; more?: number };
 
 /** Roles that come in long, uniform runs: list, tree and grid rows. */
 const RUN_ROLES = new Set(['listitem', 'treeitem', 'dataitem']);
@@ -149,15 +158,20 @@ function isCurrent(n: Pick<SnapshotNode, 'state'>): boolean {
 }
 
 /**
- * Collapse long runs of same-role list, tree and grid siblings into a marker.
+ * Collapse long runs of same-role list, tree and grid siblings into a marker,
+ * for printing only.
  *
  * A file list or a settings tree can spend most of a describe on near-identical
  * rows, burying the controls after it (a dialog's File name box, its Save
  * button) under rows nobody asked about. The marker names the search that
- * recovers any collapsed row, and is keyed by its parent rather than by count,
- * so a since= diff does not churn when the list grows or shrinks.
+ * recovers any collapsed row. Rows the helper never read (`unread`) get the
+ * same marker, so the agent knows the list goes on.
+ *
+ * Snapshots, diffs and change signatures use the full rows: a selection moving
+ * inside a collapsed row, or rows added past the fifth, is a real change that a
+ * collapsed copy cannot see.
  */
-export function collapseRuns(nodes: TreeRow[], parentPaths: string[]): TreeRow[] {
+export function collapseRuns(nodes: TreeRow[]): TreeRow[] {
     // Group each node's children, in order; -1 is the top level.
     const children = new Map<number, number[]>();
     const stack: number[] = [];
@@ -176,11 +190,16 @@ export function collapseRuns(nodes: TreeRow[], parentPaths: string[]): TreeRow[]
         while (j < nodes.length && nodes[j]!.indent > nodes[i]!.indent) j += 1;
         return j;
     };
+    /**
+     * Whether the user is on this row or anywhere under it: an expanded tree
+     * node holding the selected child must stay, or the row that says where
+     * the user is goes with it.
+     */
+    const holdsCurrent = (i: number): boolean => nodes.slice(i, subtreeEnd(i)).some(isCurrent);
 
     const dropped = new Set<number>();
-    /** Markers, by the index of the row they follow. */
-    const markers = new Map<number, TreeRow>();
-    for (const kids of children.values()) {
+    const markers: { after: number; parent: number; row: TreeRow }[] = [];
+    for (const [parent, kids] of children) {
         let start = 0;
         while (start < kids.length) {
             const role = nodes[kids[start]!]!.role;
@@ -188,39 +207,54 @@ export function collapseRuns(nodes: TreeRow[], parentPaths: string[]): TreeRow[]
             while (stop < kids.length && nodes[kids[stop]!]!.role === role) stop += 1;
             const run = kids.slice(start, stop);
             start = stop;
-            if (!RUN_ROLES.has(role) || run.length <= RUN_LIMIT) continue;
 
-            const hidden = run.slice(RUN_SHOWN).filter(i => !isCurrent(nodes[i]!));
+            const long = RUN_ROLES.has(role) && run.length > RUN_LIMIT;
+            const hidden = long ? run.slice(RUN_SHOWN).filter(i => !holdsCurrent(i)) : [];
+            const unread = run.reduce((sum, i) => sum + (nodes[i]!.unread ?? 0), 0);
+            if (hidden.length === 0 && unread === 0) continue;
+
             for (const i of hidden) for (let j = i; j < subtreeEnd(i); j += 1) dropped.add(j);
             const first = nodes[run[0]!]!;
-            const parentPath = parentPaths[run[0]!] ?? '';
-            markers.set(subtreeEnd(run[run.length - 1]!) - 1, {
-                key: `${parentPath ? `${parentPath}/` : ''}more[${role}]`,
-                indent: first.indent,
-                name: '',
-                role,
-                enabled: true,
-                ref: '',
-                rect: first.rect,
-                more: hidden.length
+            markers.push({
+                after: subtreeEnd(run[run.length - 1]!) - 1,
+                parent,
+                row: {
+                    key: `${parent >= 0 ? `${nodes[parent]!.key}/` : ''}more[${role}]`,
+                    indent: first.indent,
+                    name: '',
+                    role,
+                    enabled: true,
+                    ref: '',
+                    rect: first.rect,
+                    more: hidden.length + unread,
+                    unread: unread || undefined
+                }
             });
         }
     }
 
+    // A run nested in a collapsed row went with it. Where an inner run and an
+    // outer one end on the same row, the deeper marker prints first.
+    const after = new Map<number, TreeRow[]>();
+    for (const m of markers) {
+        if (dropped.has(m.parent)) continue;
+        after.set(m.after, [...(after.get(m.after) ?? []), m.row]);
+    }
     const out: TreeRow[] = [];
     nodes.forEach((n, i) => {
         if (!dropped.has(i)) out.push(n);
-        const marker = markers.get(i);
-        if (marker) out.push(marker);
+        const here = after.get(i);
+        if (here) out.push(...here.sort((a, b) => b.indent - a.indent));
     });
     return out;
 }
 
+/** Every row of a tree: what snapshots store, diffs compare and describes print through collapseRuns. */
 export function toSnapshotNodes(raw: RawNode[]): TreeRow[] {
     const nodes = pruneEchoes(raw);
     const depths = displayDepths(nodes);
     const shape = structure(nodes);
-    const rows: TreeRow[] = nodes.map((n, i) => ({
+    return nodes.map((n, i) => ({
         key: shape[i]!.key,
         indent: depths[i]!,
         name: clean(n.name),
@@ -232,9 +266,9 @@ export function toSnapshotNodes(raw: RawNode[]): TreeRow[] {
         rect: n.rect,
         state: n.state || undefined,
         offscreen: n.offscreen || undefined,
-        popup: n.popup || undefined
+        popup: n.popup || undefined,
+        unread: n.more || undefined
     }));
-    return collapseRuns(rows, shape.map(s => s.parentPath));
 }
 
 /** State words as printed: "checked focused". */
@@ -246,16 +280,17 @@ function words(state: string | undefined): string {
         .join(' ');
 }
 
-/** What a row is called in a diff: its name, a popup's mark, or a marker's count. */
+/** What a row is called: its name, with a popup's mark. */
 function title(n: TreeRow): string {
-    if (n.more !== undefined) return `… +${n.more} more`;
     return `${n.popup ? '(popup) ' : ''}${n.name || '(unnamed)'}`;
 }
 
 export function row(n: TreeRow, includeRects: boolean): string {
     const pad = '  '.repeat(n.indent);
     if (n.more !== undefined) {
-        return `${pad}… +${n.more} more [${n.role}]; find_ui_elements role:${n.role} name:…`;
+        const unread = n.unread ?? 0;
+        const why = unread === 0 ? '' : unread === n.more ? ' not read' : ` (${unread} not read)`;
+        return `${pad}… +${n.more} more [${n.role}]${why}; find_ui_elements role:${n.role} name:…`;
     }
     // An open menu or dropdown is its own top-level popup, gone the moment the
     // user clicks elsewhere, so it is worth saying where a row came from.
@@ -384,12 +419,17 @@ function change(old: TreeRow, n: TreeRow): string | null {
         before.push(old.enabled ? 'enabled' : 'disabled');
         after.push(n.enabled ? 'enabled' : 'disabled');
     }
+    // How many rows the helper skipped after this one: rows added or removed
+    // past its cut show up only here.
+    if ((old.unread ?? 0) !== (n.unread ?? 0)) {
+        before.push(`+${old.unread ?? 0} unread`);
+        after.push(`+${n.unread ?? 0} unread`);
+    }
     return before.length > 0 ? `${before.join(' ')} -> ${after.join(' ')}` : null;
 }
 
 /** A new row as a diff prints it: the describe row's words, without the indent. */
 function added(n: TreeRow): string {
-    if (n.more !== undefined) return `+ ${title(n)} [${n.role}]`;
     const value = n.value && n.value !== n.name ? ` "${n.value}"` : '';
     const state = words(n.state);
     return (
@@ -490,6 +530,44 @@ export function isAmbiguous(ranked: Candidate[], wanted: { name?: string; automa
     if (ranked.length < 2 || !wanted.name || wanted.automationId) return false;
     const exact = ranked.filter(m => nameTier(m.name, wanted.name!) === 0).length;
     return exact !== 1 || nameTier(ranked[0]!.name, wanted.name) !== 0;
+}
+
+/** How near a re-found control must be to where its drawing last was, in physical px. */
+const RECOVER_NEAR_PX = 16;
+
+/**
+ * Which of the controls a selector finds again is the one a drawing was on,
+ * or undefined when that cannot be told.
+ *
+ * Per-row buttons ("Remove" on every row, often with one AutomationId between
+ * them) tie on every rank key, so taking the first match moved a circle to
+ * another row's button for good. When the choice is not clear-cut, only the
+ * match that sits where the target last was counts; otherwise the drawing
+ * stays hidden rather than point at a look-alike.
+ */
+export function recoveredMatch<T extends Candidate>(
+    ranked: T[],
+    wanted: { name?: string; automationId?: string },
+    last?: Rect
+): T | undefined {
+    const best = ranked[0];
+    if (!best) return undefined;
+    const identity = (m: T): string =>
+        [wanted.automationId && m.automation_id === wanted.automationId, wanted.name ? nameTier(m.name, wanted.name) : 0].join();
+    const rank = (m: T): string => [identity(m), m.enabled, Boolean(m.offscreen)].join();
+    const tied = ranked.some(m => m !== best && rank(m) === rank(best));
+    if (!tied && !isAmbiguous(ranked, wanted)) return best;
+    if (!last) return undefined;
+
+    const centre = (r: Rect): Point => ({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
+    const was = centre(last);
+    const distance = (m: T): number => Math.hypot(centre(m.rect).x - was.x, centre(m.rect).y - was.y);
+    const near = Math.max(RECOVER_NEAR_PX, Math.min(last.width, last.height) / 2);
+    const [nearest] = ranked
+        .filter(m => identity(m) === identity(best))
+        .map(m => ({ m, d: distance(m) }))
+        .sort((a, b) => a.d - b.d);
+    return nearest && nearest.d <= near ? nearest.m : undefined;
 }
 
 /**

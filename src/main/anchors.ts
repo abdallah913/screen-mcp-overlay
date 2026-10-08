@@ -1,6 +1,6 @@
 import { screen } from 'electron';
 import type { AnchorSelector, AnchorSpec, Annotation, Point, Rect } from '../shared/types.js';
-import { rankMatches } from '../shared/uitree.js';
+import { rankMatches, recoveredMatch } from '../shared/uitree.js';
 import { coverVerdict } from '../shared/windows.js';
 import { store } from './store.js';
 import {
@@ -38,6 +38,13 @@ const RECOVER_EVERY_MS = 2000;
  * anchor on the 120ms hot path for no visible gain.
  */
 const COVER_EVERY_MS = 1000;
+/**
+ * The helper is single-threaded, so a resolve queued behind a long describe,
+ * desktop-wide search or OCR times out while nothing on screen has moved.
+ * Drawings keep their place through that; only resolves failing for this long
+ * in a row mean the helper is really gone, and then the drawings hide.
+ */
+const GIVE_UP_AFTER_MS = 30_000;
 let timer: NodeJS.Timeout | null = null;
 let inFlight = false;
 let calmTicks = 0;
@@ -46,6 +53,10 @@ let running = false;
 const failedSearches = new Map<string, number>();
 /** When each annotation's coverage was last checked. */
 const coverChecked = new Map<string, number>();
+/** Each annotation's last live target rect (physical): where a re-found control should be. */
+const lastRects = new Map<string, Rect>();
+/** When the current run of failed resolves began. */
+let failingSince: number | undefined;
 
 /**
  * Physical virtual-screen pixels -> a display id plus display-local DIPs.
@@ -139,6 +150,11 @@ export async function findRanked(selector: AnchorSelector, within?: Rect): Promi
     return rankMatches(found, selector, within);
 }
 
+/** The window a control was found in: whether that is minimised or closed says why the control is missing. */
+function homeWindow(spec: AnchorSpec): string | undefined {
+    return spec.kind === 'window' ? spec.ref : (spec.selector?.window ?? knownControl(spec.ref)?.selector.window);
+}
+
 /** The top-level window a target lives in, when known: what coverage is measured against. */
 function targetWindow(spec: AnchorSpec): string | undefined {
     if (spec.kind === 'window') return spec.ref;
@@ -152,31 +168,50 @@ async function tick(): Promise<void> {
     if (anchored.length === 0) {
         failedSearches.clear();
         coverChecked.clear();
+        lastRects.clear();
         return;
     }
 
     inFlight = true;
     try {
         const refs = [...new Set(anchored.map(a => a.anchor!.ref))];
-        let byRef = new Map<string, ResolvedRef>();
+        let byRef: Map<string, ResolvedRef>;
         try {
             byRef = new Map((await resolveRefs(refs)).map(r => [r.ref, r]));
+            failingSince = undefined;
         } catch {
-            // The helper failed or timed out: every target is unknown this
-            // tick, and the selector recovery below gets its chance.
+            // Busy or restarting is not an answer: nothing is known to have
+            // moved, so every drawing keeps its place and state. Searching
+            // by selector now would queue a search per anchor behind the
+            // slow call, and could move a drawing onto a look-alike.
+            failingSince ??= Date.now();
+            if (Date.now() - failingSince < GIVE_UP_AFTER_MS) return;
+            store.applyTracking(anchored.map(a => ({ id: a.id, displayId: a.displayId, rect: a.rect, to: a.to, hidden: true })));
+            return;
         }
 
-        // Anything unresolved that can be found again gets looked up.
+        await explainMissing(anchored, byRef);
+        // Anything the helper reported missing that can be found again gets looked up.
         await recoverBySelector(anchored, byRef);
         const covered = await refreshCoverage(anchored, byRef);
 
+        const ids = new Set(anchored.map(a => a.id));
+        for (const id of lastRects.keys()) if (!ids.has(id)) lastRects.delete(id);
         const updates = anchored.map(a => {
             const live = byRef.get(a.anchor!.ref);
             if (!live?.rect) {
                 // Target gone (closed, minimised, navigated away). Hide rather
                 // than delete so it reappears if the window comes back.
-                return { id: a.id, displayId: a.displayId, rect: a.rect, to: a.to, hidden: true };
+                return {
+                    id: a.id,
+                    displayId: a.displayId,
+                    rect: a.rect,
+                    to: a.to,
+                    hidden: true,
+                    hiddenReason: live?.reason
+                };
             }
+            lastRects.set(a.id, live.rect);
             const g = geometryFor(a, live.rect);
             return {
                 id: a.id,
@@ -202,6 +237,30 @@ async function tick(): Promise<void> {
 }
 
 /**
+ * Why missing controls are missing, from their windows. A control in a
+ * minimised window, or one on another desktop, just reads as rect-less, and
+ * the agent should hear "minimised" (focus_window fixes that) rather than
+ * "gone". Asks only while such a control is missing with no reason of its own.
+ */
+async function explainMissing(anchored: Annotation[], byRef: Map<string, ResolvedRef>): Promise<void> {
+    const homes = new Map<string, string>();
+    for (const a of anchored) {
+        const spec = a.anchor!;
+        const live = byRef.get(spec.ref);
+        const home = homeWindow(spec);
+        if (spec.kind === 'window' || !live || live.rect || live.reason || !home) continue;
+        homes.set(spec.ref, home);
+    }
+    if (homes.size === 0) return;
+    const windows = await resolveRefs([...new Set(homes.values())]).catch(() => []);
+    const why = new Map(windows.filter(w => !w.rect && w.reason).map(w => [w.ref, w.reason]));
+    for (const [ref, home] of homes) {
+        const reason = why.get(home);
+        if (reason) byRef.set(ref, { ...byRef.get(ref)!, reason });
+    }
+}
+
+/**
  * Re-find controls whose ref stopped resolving.
  *
  * An element ref is only meaningful while the helper that issued it is alive and
@@ -210,16 +269,23 @@ async function tick(): Promise<void> {
  * silently staying hidden. A {ref} anchor uses the selector recorded when its
  * ref was first seen.
  *
- * Only a search that found nothing is throttled. Throttling every attempt hid a
- * drawing for up to two seconds each time a toolkit rebuilt its controls, which
- * Chromium does often enough to make drawings flicker.
+ * Only a search that settled nothing is throttled. Throttling every attempt hid
+ * a drawing for up to two seconds each time a toolkit rebuilt its controls,
+ * which Chromium does often enough to make drawings flicker. Where several
+ * controls match, only the one where the drawing last was is taken (see
+ * recoveredMatch).
  */
 async function recoverBySelector(anchored: Annotation[], byRef: Map<string, ResolvedRef>): Promise<void> {
     const now = Date.now();
-    const thisTick = new Map<string, ElementInfo | null>();
+    const thisTick = new Map<string, ElementInfo[]>();
+    const recovered = new Set<string>();
     for (const a of anchored) {
         const spec = a.anchor!;
-        if (spec.kind === 'window' || byRef.get(spec.ref)?.rect) continue;
+        // Only a control the helper reported missing, and not one whose window
+        // is minimised, closed or on another desktop: that comes back with its
+        // window, and a search there finds nothing or the wrong thing.
+        const live = byRef.get(spec.ref);
+        if (spec.kind === 'window' || !live || live.rect || (live.reason && live.reason !== 'gone')) continue;
         const known = selectorForRef(spec.ref);
         const selector = spec.selector ?? known;
         if (!selector) continue;
@@ -228,19 +294,25 @@ async function recoverBySelector(anchored: Annotation[], byRef: Map<string, Reso
         // so the control must also be the same kind it was when first found.
         const role = selector.role ?? (known?.role !== 'other' ? known?.role : undefined);
         const key = JSON.stringify([selector.window, selector.name, selector.automationId, role]);
-        if (!thisTick.has(key)) {
+        let ranked = thisTick.get(key);
+        if (!ranked) {
             if (now - (failedSearches.get(key) ?? 0) < RECOVER_EVERY_MS) continue;
-            const [best] = await findRanked({ ...selector, role }).catch(() => []);
-            thisTick.set(key, best ?? null);
-            if (best) failedSearches.delete(key);
-            else failedSearches.set(key, now);
+            ranked = await findRanked({ ...selector, role }).catch(() => []);
+            thisTick.set(key, ranked);
         }
-        const best = thisTick.get(key);
+        const best = recoveredMatch(ranked, selector, lastRects.get(a.id));
         if (!best) continue;
+        recovered.add(key);
         // The store hands out its own objects, so this updates the annotation.
         spec.ref = best.ref;
         spec.selector ??= selector;
         byRef.set(best.ref, { ref: best.ref, rect: best.rect, offscreen: best.offscreen });
+    }
+    // A search that settled nothing, finding no match or only look-alikes, is
+    // retried slowly.
+    for (const key of thisTick.keys()) {
+        if (recovered.has(key)) failedSearches.delete(key);
+        else failedSearches.set(key, now);
     }
 }
 

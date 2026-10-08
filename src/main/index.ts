@@ -4,6 +4,7 @@ import { cleanupCaptureDir, initCaptureDir } from './capture.js';
 import { initClicks } from './clicks.js';
 import { answerStep, bindStepKeys, cancelStep, currentStep, keyLabel } from './steps.js';
 import {
+    allowHudClose,
     createHud,
     hasLocalVoice,
     hudWindow,
@@ -68,8 +69,7 @@ async function main(): Promise<void> {
     initOverlay();
     initClicks();
     initAgentHost();
-    createHud(isContentProtected());
-    if (startedHidden()) hudWindow()?.hide();
+    createHud(isContentProtected(), startedHidden());
     registerIpc();
     registerShortcuts();
 
@@ -164,7 +164,8 @@ function refreshTrayMenu(): void {
     // A step lists only the keys that actually registered; between steps the
     // configured ones are shown, so the user can learn them in advance.
     const keys = step?.keys ?? { done: keyLabel(prefs.stepKeys.done), stuck: keyLabel(prefs.stepKeys.stuck) };
-    const answerable = step !== null && step.mode !== 'choice';
+    // Done and stuck answer a watched step only; see bindStepKeys.
+    const answerable = step?.mode === 'watch';
     const noVoice = hasLocalVoice() === false;
     tray.setToolTip(
         noVoice && prefs.readStepsAloud
@@ -252,6 +253,9 @@ function refreshTrayMenu(): void {
         ])
     );
 }
+
+// The panel ignores a close (Alt+F4) by hiding instead; quitting must still close it.
+app.on('before-quit', allowHudClose);
 
 app.on('will-quit', () => {
     globalShortcut.unregisterAll();

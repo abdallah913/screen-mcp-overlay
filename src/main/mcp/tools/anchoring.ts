@@ -15,12 +15,13 @@ import {
     toPhysicalPoint,
     toPhysicalRect
 } from '../../../shared/geometry.js';
-import { clean, isAmbiguous, whereIn } from '../../../shared/uitree.js';
+import { clean, isAmbiguous, recoveredMatch, whereIn } from '../../../shared/uitree.js';
 import { coverVerdict, windowBlocker } from '../../../shared/windows.js';
 import { listDisplays, resolveDisplay } from '../../displays.js';
 import { store } from '../../store.js';
 import {
     StaleRefError,
+    collapsedControls,
     coverage,
     findElements,
     knownControl,
@@ -174,6 +175,12 @@ export interface ResolvedAnchor {
     covered?: string;
     /** The window it was found in, for the hints a response gives. */
     window?: string;
+    /**
+     * The open popup (menu, dropdown) it sits in, when it is in one: the
+     * top-level window its coverage and clicks are measured against, or the
+     * popup would count as covering its own items.
+     */
+    top?: string;
     /** A note about the window itself, e.g. that it was found on another desktop. */
     windowNote?: string;
 }
@@ -195,7 +202,12 @@ export function anchorNotes(t: ResolvedAnchor): string {
         lines.push(`WARNING: ${t.what} is scrolled out of view; scroll_window ${args} brings it into view.`);
     }
     if (t.covered) {
-        const front = t.window ? `focus_window {"window":"${t.window}"} brings it forward` : 'focus its window first';
+        // Focusing the window would close the menu the target is in.
+        const front = t.top
+            ? 'ask the user to move what covers the menu'
+            : t.window
+              ? `focus_window {"window":"${t.window}"} brings it forward`
+              : 'focus its window first';
         lines.push(`WARNING: ${t.what} is behind "${t.covered}", so the user cannot see it; ${front}.`);
     }
     return lines.length > 0 ? `\n${lines.join('\n')}` : '';
@@ -256,8 +268,17 @@ export async function resolveAnchor(a: AnchorInput): Promise<ResolvedAnchor> {
     }
     if (known) {
         const info = await usableWindow(known.selector.window);
-        const [found] = await findRanked(known.selector, info?.rect);
+        const ranked = await findRanked(known.selector, info?.rect);
+        // Several look-alikes (a "Remove" on every row) leave no way to tell
+        // which one the ref was, and guessing circles the wrong row.
+        const found = recoveredMatch(ranked, known.selector);
         if (found) return described(found, known.selector, info, {});
+        if (ranked.length > 1) {
+            throw new Error(
+                `anchor ${raw} no longer resolves, and ${ranked.length} controls now match ${JSON.stringify(known.name)}: ` +
+                    'look it up again (describe_window or find_ui_elements) and anchor to the fresh ref.'
+            );
+        }
     }
     if (live?.stale) throw new StaleRefError(raw);
     throw new Error(
@@ -337,6 +358,7 @@ async function described(
         offscreen: found.offscreen || undefined,
         covered: covered ?? undefined,
         window,
+        top: found.window,
         windowNote: extra.windowNote
     };
 }
@@ -372,10 +394,18 @@ export async function missHint(selector: AnchorSelector, info: WindowInfo | unde
             : Promise.resolve([])
     ]);
     if (hidden) return ` ${hiddenHint(hidden)}`;
+    // Nothing by that name anywhere, hidden or not: a closed menu or list
+    // does not expose its items at all, so name what can be opened.
+    const closed = await collapsedControls(selector.window, 8).catch(() => []);
+    const hints: string[] = [];
     if (closest.length > 0) {
-        return ` Closest names (not drawn): ${closest.map(s => `"${clean(s.name)}" [${s.role}]`).join(', ')}.`;
+        hints.push(`Closest names (not drawn): ${closest.map(s => `"${clean(s.name)}" [${s.role}]`).join(', ')}.`);
     }
-    return '';
+    if (closed.length > 0) {
+        const list = closed.map(e => `"${clean(e.name)}" [${e.role}] ${e.ref}`).join(', ');
+        hints.push(`It may be inside a closed menu or list: ${list}.`);
+    }
+    return hints.map(h => ` ${h}`).join('');
 }
 
 /** What must be opened first to reveal a match that exists but has no place on screen. */
@@ -397,19 +427,26 @@ function hiddenHint(e: ElementInfo): string {
 }
 
 /**
+ * A step badge's number: "3", or the 3 of a captioned "3. Click Save" or a
+ * "3/5 Click Save". Undefined for a step whose text is a label of its own.
+ */
+function stepNumber(a: Annotation): number | undefined {
+    if (a.type !== 'step') return undefined;
+    const m = /^(\d{1,3})(?:$|[.):]\s|\s*\/)/.exec(a.text ?? '');
+    return m ? Number(m[1]) : undefined;
+}
+
+/**
  * The highest numbered step badge on screen, so steps added with replace:false
  * carry on from it instead of starting again at 1.
  */
 function highestStep(list: Annotation[]): number {
-    return list.reduce(
-        (max, a) => (a.type === 'step' && /^\d{1,3}$/.test(a.text ?? '') ? Math.max(max, Number(a.text)) : max),
-        0
-    );
+    return list.reduce((max, a) => Math.max(max, stepNumber(a) ?? 0), 0);
 }
 
 /** " (steps 3-4)" for the numbered badges among new drawings, or ''. */
 export function stepRange(created: Annotation[]): string {
-    const nums = created.filter(a => a.type === 'step' && /^\d{1,3}$/.test(a.text ?? '')).map(a => Number(a.text));
+    const nums = created.map(stepNumber).filter((n): n is number => n !== undefined);
     if (nums.length === 0) return '';
     return nums.length === 1 ? ` (step ${nums[0]})` : ` (steps ${nums[0]}-${nums[nums.length - 1]})`;
 }

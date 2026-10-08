@@ -39,8 +39,9 @@ declare global {
     interface Window {
         overlayApi: {
             onState(cb: (s: OverlayFrame) => void): void;
-            reportClick(displayId: string, dip: { x: number; y: number }): void;
-            cancelClick(): void;
+            onPing(cb: (ids: string[]) => void): void;
+            reportClick(stepId: string, displayId: string, dip: { x: number; y: number }): void;
+            cancelClick(stepId: string): void;
             answer(id: string, answer: UserAnswer): void;
             hoverUi(over: boolean): void;
             stripRect(rect: Rect | null): void;
@@ -57,6 +58,7 @@ const stripText = document.getElementById('strip-text') as HTMLSpanElement;
 const stripTime = document.getElementById('strip-time') as HTMLSpanElement;
 const stripButtons = document.getElementById('strip-buttons') as HTMLSpanElement;
 const stripHint = document.getElementById('strip-hint') as HTMLSpanElement;
+const stripWait = document.getElementById('strip-wait') as HTMLDivElement;
 
 let frame: OverlayFrame | null = null;
 /** The pending click-mode step, if any. */
@@ -349,7 +351,7 @@ function stepButtons(step: StepView): HTMLButtonElement[] {
     switch (step.mode) {
         case 'click':
             return [
-                button('Cancel', step.keys.cancel ?? 'Esc', () => api.cancelClick()),
+                button('Cancel', step.keys.cancel ?? 'Esc', () => api.cancelClick(step.id)),
                 button("Can't find it", step.keys.stuck, answer({ kind: 'stuck' }))
             ];
         case 'choice':
@@ -366,12 +368,14 @@ function stepButtons(step: StepView): HTMLButtonElement[] {
 /**
  * The step strip: the prompt, how far along the walkthrough is, the time left
  * and the buttons that answer the step, so a user can say "done", "I can't find
- * it" or "skip" even to an agent in a terminal. Shown on the lead display only,
- * docked away from the step's target.
+ * it" or "skip" even to an agent in a terminal. Shown where main says (the lead
+ * display, or every display for a click with no target), docked away from the
+ * step's target. While the target is hidden it also says what it is waiting
+ * for, rather than the circle silently vanishing.
  */
 function updateStrip(targetRects: Rect[], others: Rect[]): void {
     const step = frame?.step ?? null;
-    if (!step || !frame?.lead) {
+    if (!step || !frame?.showStrip) {
         strip.classList.remove('visible');
         stripBox = null;
         stripKey = '';
@@ -387,6 +391,7 @@ function updateStrip(targetRects: Rect[], others: Rect[]): void {
     const remaining = step.count - step.collected;
     stripText.textContent = step.mode === 'click' && step.count > 1 ? `${prompt}  (${remaining} more to click)` : prompt;
     stripHint.textContent = step.mode === 'click' ? "This click only points: the app won't get it." : '';
+    stripWait.textContent = frame.waiting ?? '';
 
     const key = JSON.stringify([step.id, step.mode, step.options, step.keys]);
     if (key !== stripKey) {
@@ -507,6 +512,25 @@ function updatePings(): void {
     scheduleReping();
 }
 
+const GLOW_MS = 1200;
+/** Reduced-motion replays in progress: annotation id -> start. */
+const glows = new Map<string, number>();
+
+/**
+ * Replay the ping on request (the panel's "Show me") for whichever of these
+ * shapes this display draws. Reduced motion gets no expanding rings: the
+ * shape's halo brightens and fades back once, in place, instead.
+ */
+function replay(ids: string[]): void {
+    const drawn = new Set(shapes.map(a => a.id));
+    for (const id of ids) {
+        if (!drawn.has(id)) continue;
+        if (reducedMotion) glows.set(id, performance.now());
+        else ping(id);
+    }
+    scheduleDraw();
+}
+
 function scheduleReping(): void {
     if (repingTimer !== null) window.clearTimeout(repingTimer);
     repingTimer = null;
@@ -579,14 +603,20 @@ function scheduleDraw(): void {
  * Whether anything on screen actually changes between frames.
  *
  * A static overlay does not need repainting at 60fps, and repainting it anyway
- * cost about 5% of a core with nothing drawn. Only a running ping needs a loop.
+ * cost about 5% of a core with nothing drawn. Only a running ping or glow
+ * needs a loop.
  */
 function needsAnimation(now: number): boolean {
+    let running = false;
     for (const [id, start] of pings) {
-        if (now - start < PING_MS) return true;
-        pings.delete(id);
+        if (now - start < PING_MS) running = true;
+        else pings.delete(id);
     }
-    return false;
+    for (const [id, start] of glows) {
+        if (now - start < GLOW_MS) running = true;
+        else glows.delete(id);
+    }
+    return running;
 }
 
 function resize(): void {
@@ -612,6 +642,8 @@ motionQuery.addEventListener('change', () => {
     scheduleDraw();
 });
 
+api.onPing(replay);
+
 api.onState(state => {
     frame = state;
     const wasPicking = click !== null;
@@ -630,13 +662,13 @@ window.addEventListener(
         // A press on the strip's own buttons is an answer, not a point.
         if (strip.contains(e.target as Node)) return;
         e.preventDefault();
-        api.reportClick(frame.displayId, { x: e.clientX, y: e.clientY });
+        api.reportClick(click.id, frame.displayId, { x: e.clientX, y: e.clientY });
     },
     true
 );
 
 window.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && click) api.cancelClick();
+    if (e.key === 'Escape' && click) api.cancelClick(click.id);
 });
 
 // ---------------------------------------------------------------- rendering
@@ -645,6 +677,7 @@ function draw(now: number): void {
     // Called from scheduleDraw only; it decides whether another frame follows.
     ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
     drawScrim();
+    for (const a of shapes) drawGlow(a, now);
     for (const a of shapes) drawShape(a);
     for (const a of shapes) drawPing(a, now);
     for (const p of pointers) drawPointer(p);
@@ -794,6 +827,22 @@ function drawPing(a: Annotation, now: number): void {
         outlinePath(a, 4 + p * 26);
         ctx.stroke();
     }
+    ctx.restore();
+}
+
+/** The reduced-motion replay: a wide band behind the outline, up and back down once. */
+function drawGlow(a: Annotation, now: number): void {
+    const start = glows.get(a.id);
+    if (start === undefined || a.type === 'arrow' || a.type === 'label') return;
+    const t = (now - start) / GLOW_MS;
+    if (t >= 1) return;
+    ctx.save();
+    ctx.globalAlpha = Math.sin(Math.PI * t) * 0.5;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = colorOf(a);
+    ctx.lineWidth = 18;
+    outlinePath(a, 4);
+    ctx.stroke();
     ctx.restore();
 }
 

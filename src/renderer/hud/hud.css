@@ -356,6 +356,8 @@ button {
 
 #step-card[hidden],
 #step-progress[hidden],
+#step-show[hidden],
+#step-target[hidden],
 #step-count[hidden],
 #step-keys[hidden] { display: none; }
 
@@ -366,6 +368,8 @@ button {
     border-radius: 11px;
     background: rgba(255, 196, 61, 0.08);
     border: 1px solid rgba(255, 196, 61, 0.38);
+    /* Focused only so a question's number keys reach it; no ring needed. */
+    outline: none;
 }
 
 #step-head {
@@ -389,11 +393,22 @@ button {
 
 #step-kind { text-transform: uppercase; font-weight: 600; }
 #step-time { font-variant-numeric: tabular-nums; }
+#step-show { padding: 1px 7px; font-size: 11px; }
 
 #step-prompt {
     font-size: 14.5px;
     font-weight: 500;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* What is circled and where, e.g. "Save" [button], top-left of "Notepad". */
+#step-target,
+.msg .where {
+    margin-top: 2px;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--muted);
     overflow-wrap: anywhere;
 }
 

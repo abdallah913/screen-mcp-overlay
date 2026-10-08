@@ -1,5 +1,15 @@
-import type { AppStatus, HudMessage, StepView, UserAnswer } from '../../shared/types.js';
-import { choiceForKey, clickProgress, keysHint, sameText, stepButtons, stepHeading, timeLeft } from './step.js';
+import type { AppStatus, HudMessage, StepView } from '../../shared/types.js';
+import {
+    type CardAnswer,
+    choiceForKey,
+    clickProgress,
+    heldReplyNote,
+    keysHint,
+    sameText,
+    stepButtons,
+    stepHeading,
+    timeLeft
+} from './step.js';
 
 declare global {
     interface Window {
@@ -19,7 +29,9 @@ declare global {
             onStep(cb: (step: StepView | null) => void): void;
             onStepEnded(cb: (p: { id: string; outcome: string }) => void): void;
             onCollapsed(cb: (collapsed: boolean) => void): void;
-            answerStep(id: string, answer: UserAnswer): void;
+            onReplyReturned(cb: (text: string) => void): void;
+            answerStep(id: string, answer: CardAnswer): void;
+            showMe(id: string): void;
             composing(on: boolean): void;
             reportVoices(local: boolean): void;
             interrupt(): Promise<void>;
@@ -50,6 +62,8 @@ const cardProgress = document.getElementById('step-progress') as HTMLSpanElement
 const cardKind = document.getElementById('step-kind') as HTMLSpanElement;
 const cardTime = document.getElementById('step-time') as HTMLSpanElement;
 const cardPrompt = document.getElementById('step-prompt') as HTMLDivElement;
+const cardTarget = document.getElementById('step-target') as HTMLDivElement;
+const cardShow = document.getElementById('step-show') as HTMLButtonElement;
 const cardCount = document.getElementById('step-count') as HTMLDivElement;
 const cardButtons = document.getElementById('step-buttons') as HTMLDivElement;
 const cardKeys = document.getElementById('step-keys') as HTMLDivElement;
@@ -64,6 +78,11 @@ let step: StepView | null = null;
 const stepEntries = new Map<string, HTMLElement>();
 let ticker: number | undefined;
 let composing = false;
+/**
+ * The step that was pending when the text in the reply box was started (null:
+ * none was); undefined while the box is empty. See heldReplyNote.
+ */
+let typedFor: string | null | undefined;
 
 function atBottom(): boolean {
     return log.scrollHeight - log.scrollTop - log.clientHeight < 60;
@@ -94,6 +113,13 @@ function addMessage(m: HudMessage): void {
 }
 
 window.hudApi.onMessage(addMessage);
+
+/** A line from the panel itself, about something only it knows. */
+function note(text: string): void {
+    const body = bubble('system');
+    body.textContent = text;
+    scroll(true);
+}
 
 window.hudApi.onStream(({ id, delta, done }) => {
     const stick = atBottom();
@@ -205,24 +231,37 @@ window.hudApi.onCollapsed(collapsed => {
 function logStep(s: StepView): void {
     const last = log.lastElementChild as HTMLElement | null;
     const lastBody = last?.querySelector('.body') as HTMLElement | null;
+    const stick = atBottom();
     let body: HTMLElement;
     if (last?.classList.contains('guide') && !last.dataset.step && lastBody && sameText(lastBody.textContent ?? '', s.prompt)) {
         body = lastBody;
     } else {
-        const stick = atBottom();
         body = bubble('guide');
         body.textContent = s.prompt;
-        scroll(stick);
     }
+    // What is circled and where, so the log still says which control a step
+    // meant once its drawing is gone.
+    if (s.target) {
+        const where = document.createElement('div');
+        where.className = 'where';
+        where.textContent = s.target;
+        body.appendChild(where);
+    }
+    scroll(stick);
     (body.parentElement as HTMLElement).dataset.step = s.id;
     stepEntries.set(s.id, body);
 }
 
 window.hudApi.onStep(next => {
-    if (next && next.id !== step?.id) logStep(next);
+    const fresh = next !== null && next.id !== step?.id;
+    if (fresh) logStep(next);
     step = next;
     renderCard();
     updateComposer();
+    // A question's number keys work only while the reply box does not have
+    // focus, so an empty box gives focus up to the card; typing still goes
+    // to the box (see the keydown handler).
+    if (fresh && next.mode === 'choice' && document.activeElement === input && !input.value.trim()) card.focus();
 });
 
 window.hudApi.onStepEnded(({ id, outcome }) => {
@@ -232,10 +271,28 @@ window.hudApi.onStepEnded(({ id, outcome }) => {
     const tag = document.createElement('span');
     tag.className = 'outcome';
     tag.textContent = outcome;
-    body.appendChild(tag);
+    // Beside the instruction, above the where-line.
+    body.insertBefore(tag, body.querySelector('.where'));
 });
 
-function answer(a: UserAnswer): void {
+// Main hands back a reply that arrived after its step had ended.
+window.hudApi.onReplyReturned(text => {
+    const ended = 'That step had already ended, so your reply was not sent.';
+    // A locked box (this panel follows an editor) cannot take it back.
+    if (input.disabled) {
+        note(`${ended} You wrote: "${text}"`);
+        return;
+    }
+    note(`${ended} It is back in the reply box.`);
+    const current = input.value.trim();
+    input.value = current ? `${text}\n${current}` : text;
+    // Main has said what happened; the next Enter sends it wherever it goes now.
+    typedFor = step?.id ?? null;
+    resizeInput();
+    updateComposer();
+});
+
+function answer(a: CardAnswer): void {
     if (step) window.hudApi.answerStep(step.id, a);
 }
 
@@ -251,6 +308,10 @@ function renderCard(): void {
     cardProgress.textContent = heading.progress ?? '';
     cardKind.textContent = s.mode === 'choice' ? 'The agent asks' : s.mode === 'click' ? 'Point at it' : 'Your step';
     cardPrompt.textContent = heading.prompt;
+    cardTarget.hidden = !s.target;
+    cardTarget.textContent = s.target ?? '';
+    // Nothing drawn, nothing to point at again.
+    cardShow.hidden = s.targetIds.length === 0;
 
     const count = clickProgress(s);
     cardCount.hidden = !count;
@@ -283,20 +344,35 @@ function renderCard(): void {
     ticker = window.setInterval(tick, 1000);
 }
 
-// Number keys pick an option while the panel has focus, unless they are being
-// typed into a reply.
-document.addEventListener('keydown', e => {
-    if (!step || e.ctrlKey || e.altKey || e.metaKey) return;
-    if (document.activeElement === input && input.value) return;
-    const index = choiceForKey(step, e.key);
-    if (index === null) return;
-    e.preventDefault();
-    answer({ kind: 'choice', index });
+// Someone who looked away (or listens rather than reads) gets the target
+// pointed at again, and the step read again if steps are read aloud.
+cardShow.addEventListener('click', () => {
+    if (step) window.hudApi.showMe(step.id);
 });
 
-// Bringing the panel forward while a step is pending is reaching for the reply box.
+// Number keys pick an option while the panel has focus, but never from inside
+// the reply box: a reply such as "2 of them are open" would otherwise be sent
+// as the choice of option 2.
+document.addEventListener('keydown', e => {
+    if (!step || step.mode !== 'choice' || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (document.activeElement === input) return;
+    const index = choiceForKey(step, e.key);
+    if (index !== null) {
+        e.preventDefault();
+        answer({ kind: 'choice', index });
+        return;
+    }
+    // Any other character starts a typed reply. Focusing the box during
+    // keydown lets this same keystroke land in it.
+    if (e.key.length === 1 && e.key !== ' ' && !input.disabled) input.focus();
+});
+
+// Bringing the panel forward while a step is pending is reaching for the reply
+// box, except for a question, whose number keys need the focus elsewhere.
 window.addEventListener('focus', () => {
-    if (step && !input.disabled) input.focus();
+    if (!step || input.disabled) return;
+    if (step.mode === 'choice' && !input.value.trim()) card.focus();
+    else input.focus();
 });
 
 // --- composer ---------------------------------------------------------------
@@ -309,9 +385,22 @@ window.addEventListener('focus', () => {
  */
 function updateComposer(): void {
     const replying = step !== null;
-    const stop = busy && !(replying && input.value.trim());
-    input.disabled = mirroring && !replying;
-    sendBtn.disabled = mirroring && !replying;
+    const locked = mirroring && !replying;
+    // A reply left in a box that is about to lock (its step ended while this
+    // panel follows an editor) could be neither sent nor cleared. Move it to
+    // the log, where it can still be read and copied.
+    if (locked && !input.disabled && input.value.trim()) {
+        const why =
+            heldReplyNote(typedFor ?? null, step, { busy, mirroring }) ??
+            'This panel is now following your editor, so this was not sent.';
+        note(`${why} You wrote: "${input.value.trim()}"`);
+        input.value = '';
+        typedFor = undefined;
+        resizeInput();
+    }
+    const stop = stopping();
+    input.disabled = locked;
+    sendBtn.disabled = locked;
     input.placeholder = replying
         ? 'Reply to the agent…'
         : mirroring
@@ -319,22 +408,50 @@ function updateComposer(): void {
           : "Ask about what's on your screen…";
     sendBtn.textContent = stop ? 'Stop' : replying ? 'Reply' : 'Send';
     sendBtn.classList.toggle('stop', stop);
+    setComposing();
 }
 
+/** Whether the Send button reads Stop: the panel's agent is busy and there is no reply to send. */
+function stopping(): boolean {
+    return busy && !(step !== null && input.value.trim());
+}
+
+/** Tell main whether unsent text is being held; a locked box holds none. */
 function setComposing(): void {
-    const now = input.value.trim().length > 0;
+    const now = !input.disabled && input.value.trim().length > 0;
     if (now === composing) return;
     composing = now;
     window.hudApi.composing(now);
 }
 
-function submit(): void {
+/**
+ * Send what is in the box. `fromButton`: the Send/Stop button, which stops a
+ * busy agent when it reads Stop. Enter never stops one while there is text:
+ * someone pressing Enter means to send what they wrote.
+ */
+function submit(fromButton: boolean): void {
     const value = input.value.trim();
+    if (fromButton && stopping()) {
+        if (!mirroring) void window.hudApi.interrupt();
+        return;
+    }
+    if (value && typedFor !== undefined) {
+        const held = heldReplyNote(typedFor, step, { busy, mirroring });
+        if (held) {
+            note(held);
+            typedFor = step?.id ?? null;
+            return;
+        }
+    }
     if (step && value) {
         window.hudApi.answerStep(step.id, { kind: 'reply', text: value });
     } else {
         if (mirroring) return;
         if (busy) {
+            if (value) {
+                note('The agent is still working. Press Stop to interrupt it, or send this when it has finished.');
+                return;
+            }
             void window.hudApi.interrupt();
             return;
         }
@@ -342,19 +459,19 @@ function submit(): void {
         void window.hudApi.send(value);
     }
     input.value = '';
+    typedFor = undefined;
     resizeInput();
-    setComposing();
     updateComposer();
     scroll(true);
 }
 
-sendBtn.addEventListener('click', submit);
+sendBtn.addEventListener('click', () => submit(true));
 
 input.addEventListener('keydown', e => {
     // Enter sends; Shift+Enter makes a new line.
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        submit();
+        submit(false);
     }
     if (e.key === 'Escape') window.hudApi.hide();
 });
@@ -364,8 +481,9 @@ function resizeInput(): void {
     input.style.height = `${Math.min(input.scrollHeight, 140)}px`;
 }
 input.addEventListener('input', () => {
+    if (!input.value.trim()) typedFor = undefined;
+    else if (typedFor === undefined) typedFor = step?.id ?? null;
     resizeInput();
-    setComposing();
     updateComposer();
 });
 

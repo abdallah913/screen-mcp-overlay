@@ -459,8 +459,14 @@ export async function describeWindow(opts: {
         20000
     );
     // The root row is the window itself, already addressable by its own ref.
+    // Rows under an open popup live in that popup's own top-level window, and
+    // coverage must be measured against it, or the menu counts as covering its
+    // own items. The helper marks those rows; a popup's descendants inherit its
+    // mark in case only the popup row carries it.
+    let popupTop: string | undefined;
     for (const n of described.nodes) {
-        if (n.depth > 0) remember(n, opts.window);
+        if (n.depth <= 1) popupTop = n.popup ? n.window : undefined;
+        if (n.depth > 0) remember({ ...n, window: n.window ?? popupTop }, opts.window);
         else liveElementRefs.add(n.ref);
     }
     return described;
@@ -502,10 +508,6 @@ export async function elementAtPoint(x: number, y: number): Promise<PointHit> {
 }
 
 /**
- * How much of a window, or of a rect in it (virtual-screen physical), is hidden
- * behind other top-level windows. Our own windows never count as covering.
- */
-/**
  * The chat panel's window ref. Our own windows never count as covering a
  * target -- the overlay is click-through and drawn for the user -- except the
  * panel, which is opaque and really can sit on top of what they need to click.
@@ -516,6 +518,10 @@ export function setHudWindowRef(ref: string | undefined): void {
     hudRef = ref;
 }
 
+/**
+ * How much of a window, or of a rect in it (virtual-screen physical), is hidden
+ * behind other top-level windows, the chat panel included.
+ */
 export function coverage(window: string, rect?: Rect): Promise<Coverage> {
     return send<Coverage>('covered', { window, rect, ignore_pid: process.pid, hud: hudRef }, 4000);
 }
@@ -523,7 +529,9 @@ export function coverage(window: string, rect?: Rect): Promise<Coverage> {
 /** Collapsed expandable controls in a window: where a control that matched nothing may be. */
 export async function collapsedControls(window: string, limit = 8): Promise<ElementInfo[]> {
     const found = await send<ElementInfo[]>('collapsed', { window, limit }, 15000);
-    for (const e of found) liveElementRefs.add(e.ref);
+    // Listed so the agent can point the user at one, which needs a selector
+    // to follow it when the ref dies.
+    for (const e of found) remember(e, window);
     return found;
 }
 
@@ -551,11 +559,11 @@ export function suggestNames(
     return send<{ name: string; role: string }[]>('suggest', { window, name, role, limit }, 15000);
 }
 
-/** Send wheel notches to a window. Negative scrolls down, as a wheel does. */
 /**
- * Send wheel notches to a window. before/after are the vertical scroll
- * position (0..100) of the nearest scrollable element, when one reports it,
- * so a scroll that moved nothing can say so.
+ * Send wheel notches to a window; negative scrolls down, as a wheel does.
+ * before/after are the vertical scroll position (0..100) of the nearest
+ * scrollable element, when one reports it, so a scroll that moved nothing can
+ * say so.
  */
 export function scrollWindow(
     ref: string,

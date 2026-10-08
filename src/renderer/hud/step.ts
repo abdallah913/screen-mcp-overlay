@@ -9,9 +9,16 @@ import { parseProgress } from '../../shared/progress.js';
  * can be answered with more than a button.
  */
 
+/**
+ * What a card button sends. Cancel is not an answer: on a click step it ends
+ * the step the way Escape does, keeping any points already placed, so the agent
+ * hears the same thing whichever way the user backed out.
+ */
+export type CardAnswer = UserAnswer | { kind: 'cancel' };
+
 export interface StepButton {
     label: string;
-    answer: UserAnswer;
+    answer: CardAnswer;
     /** Shown as a key hint; also what the key does while the panel has focus. */
     key?: string;
     primary?: boolean;
@@ -31,7 +38,7 @@ export function stepButtons(step: StepView): StepButton[] {
         case 'click':
             // The overlay is capturing the click; this is the way out that does
             // not involve knowing about Escape.
-            return [{ label: 'Cancel', answer: { kind: 'skip' } }];
+            return [{ label: 'Cancel', answer: { kind: 'cancel' } }];
         case 'choice':
             return (step.options ?? []).map((label, index) => ({
                 label,
@@ -84,4 +91,31 @@ export function keysHint(step: StepView): string | null {
 export function sameText(a: string, b: string): boolean {
     const norm = (s: string): string => s.replace(/\s+/g, ' ').trim();
     return norm(a) === norm(b);
+}
+
+/**
+ * Why text in the reply box should not be sent as it stands, or null when it
+ * should. `typedFor` is the step that was pending when the user started typing
+ * (null: none was). A step can end or be replaced while someone types; sent
+ * anyway, a reply meant for it would answer a different step, interrupt the
+ * panel's own agent, or start a conversation with an agent that never saw the
+ * question. So the text is held once with this note, and pressing Enter again
+ * sends it wherever it goes now.
+ */
+export function heldReplyNote(
+    typedFor: string | null,
+    step: StepView | null,
+    panel: { busy: boolean; mirroring: boolean }
+): string | null {
+    if (typedFor === (step?.id ?? null)) return null;
+    if (typedFor === null) {
+        return 'The agent started a step while you were typing, so this was not sent. Press Enter again to send it as your reply to that step.';
+    }
+    if (step) {
+        return 'That step was replaced by a newer one before you sent this, so it was not sent. Press Enter again to send it as your reply to the new step.';
+    }
+    const ended = 'That step ended before you sent this, so it was not sent.';
+    if (panel.mirroring) return `${ended} This panel is following your editor; type it there.`;
+    if (panel.busy) return `${ended} The agent is still working; send it when it has finished.`;
+    return `${ended} Press Enter again to send it as a new message.`;
 }

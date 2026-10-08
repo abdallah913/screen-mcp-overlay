@@ -6,11 +6,19 @@ contextBridge.exposeInMainWorld('overlayApi', {
     onState(cb: (s: OverlayFrame) => void): void {
         ipcRenderer.on('overlay:state', (_e, s: OverlayFrame) => cb(s));
     },
-    reportClick(displayId: string, dip: { x: number; y: number }): void {
-        ipcRenderer.send('overlay:click', { displayId, dip });
+    onPing(cb: (ids: string[]) => void): void {
+        ipcRenderer.on('overlay:ping', (_e, ids: unknown) => {
+            if (Array.isArray(ids)) cb(ids.filter((id): id is string => typeof id === 'string'));
+        });
     },
-    cancelClick(): void {
-        ipcRenderer.send('overlay:cancel-click');
+    // A click or Cancel names the step it was made against, like an answer
+    // does: one in flight while the agent replaces the step must not land on
+    // the new step, whose prompt the user has not even seen yet.
+    reportClick(stepId: string, displayId: string, dip: { x: number; y: number }): void {
+        ipcRenderer.send('overlay:click', { id: stepId, displayId, dip });
+    },
+    cancelClick(stepId: string): void {
+        ipcRenderer.send('overlay:cancel-click', { id: stepId });
     },
     answer(id: string, answer: UserAnswer): void {
         ipcRenderer.send('overlay:step-answer', { id, answer });

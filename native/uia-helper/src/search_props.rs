@@ -12,6 +12,7 @@ use uiautomation::types::{TreeScope, UIProperty};
 use uiautomation::variants::Variant;
 use uiautomation::{UIAutomation, UIElement};
 use windows::Win32::UI::Accessibility::{IUIAutomationElement, UIA_PROPERTY_ID};
+use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
 
 use crate::model::Rect;
 
@@ -193,13 +194,32 @@ pub fn selected(el: &UIElement, cached: bool) -> Option<bool> {
 pub struct Focus(Option<(String, i32, Rect)>);
 
 impl Focus {
-    pub fn now(auto: &UIAutomation) -> Focus {
+    /// Focus as it bears on controls in `tops` (top-level window handles; 0
+    /// means anywhere on the desktop).
+    ///
+    /// Reading focus is a call into whatever app has it, which is often not
+    /// the one being searched, and a hung foreground app would make every
+    /// find and describe wait out its timeout for an answer that cannot mark
+    /// a single row. So it is read only when the foreground window is one of
+    /// `tops`, and never from a window that has stopped responding.
+    pub fn now(auto: &UIAutomation, tops: &[isize]) -> Focus {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.is_invalid() {
+            return Focus(None);
+        }
+        let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+        let root = if root.is_invalid() { foreground } else { root };
+        if !tops.iter().any(|&t| t == 0 || t == root.0 as isize) || crate::windows::is_hung(root) {
+            return Focus(None);
+        }
         // Not the value: the focused control is often a document, whose value
         // is its whole text.
         let req = request_for(auto, &[UIProperty::Name, UIProperty::ControlType, UIProperty::BoundingRectangle]);
-        let (el, cached) = match req.and_then(|r| auto.get_focused_element_build_cache(&r).ok()) {
-            Some(el) => (el, true),
-            None => match auto.get_focused_element() {
+        let built = req.map(|r| auto.get_focused_element_build_cache(&r));
+        let (el, cached) = match built {
+            Some(Ok(el)) => (el, true),
+            Some(Err(e)) if rank::unreachable(e.code()) => return Focus(None),
+            _ => match auto.get_focused_element() {
                 Ok(el) => (el, false),
                 Err(_) => return Focus(None),
             },

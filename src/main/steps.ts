@@ -88,8 +88,18 @@ export function setStepKeys(next: StepView['keys']): void {
     }
 }
 
+/**
+ * Put the step (or its absence) in the store. The store records it before its
+ * 'step' listeners (the tray, the panel, the step keys) run, so one that throws
+ * has not stopped the step from starting or ending; letting the throw through
+ * would turn a broken menu into a tool error, or an answer the agent never gets.
+ */
 function publish(): void {
-    store.setStep(pending ? { ...pending.view, collected: pending.got.length } : null);
+    try {
+        store.setStep(pending ? { ...pending.view, collected: pending.got.length } : null);
+    } catch {
+        // Only a listener failed; the step itself is published.
+    }
 }
 
 function settle(p: Pending, answer: StepAnswer): void {
@@ -97,8 +107,9 @@ function settle(p: Pending, answer: StepAnswer): void {
     pending = null;
     clearTimeout(p.timer);
     if (p.onAbort) p.signal?.removeEventListener('abort', p.onAbort);
-    publish();
+    // The answer goes to the agent before anything else runs.
     p.resolve(answer);
+    publish();
     const view = { ...p.view, collected: p.got.length };
     for (const listener of endedListeners) {
         try {
@@ -261,7 +272,9 @@ export function bindStepKeys(api: ShortcutApi, chords: () => { done: string; stu
     };
 
     const take = (accel: string, fn: () => void): boolean => {
-        if (!accel.trim()) return false;
+        // The chords come from a hand-editable file; a null there must
+        // disable the key, not throw out of the step's publication.
+        if (typeof accel !== 'string' || !accel.trim()) return false;
         try {
             // Never take over one of our own chords: a setting equal to
             // Ctrl+Shift+X would otherwise silently replace the panic button.
@@ -286,8 +299,10 @@ export function bindStepKeys(api: ShortcutApi, chords: () => { done: string; stu
             return;
         }
         const labels: StepView['keys'] = {};
-        // A choice is answered by picking an option, so done and stuck mean nothing there.
-        if (step.mode !== 'choice') {
+        // Only a watched step is answered with done or stuck. A choice is
+        // answered by picking an option, and a click step by pointing: "done"
+        // there would end it without the point the agent asked for.
+        if (step.mode === 'watch') {
             const { done, stuck } = chords();
             if (take(done, () => answerStep({ kind: 'done' }, step.id))) labels.done = keyLabel(done);
             if (take(stuck, () => answerStep({ kind: 'stuck' }, step.id))) labels.stuck = keyLabel(stuck);

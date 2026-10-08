@@ -57,12 +57,9 @@ export function settings(): Settings {
     if (cache) return cache;
     let loaded: Settings;
     try {
-        const stored = JSON.parse(readFileSync(file(), 'utf8')) as Partial<Settings>;
-        // Merged one level down so a file that sets only one chord keeps the
-        // default for the other.
-        loaded = { ...DEFAULTS, ...stored, stepKeys: { ...DEFAULTS.stepKeys, ...stored.stepKeys } };
+        loaded = normalizeSettings(JSON.parse(readFileSync(file(), 'utf8')));
     } catch {
-        loaded = { ...DEFAULTS };
+        loaded = normalizeSettings(undefined);
     }
     // An env var always wins over the stored preference for this run.
     if (process.env.SCREEN_OVERLAY_SHOW_IN_CAPTURE === '1') loaded.showInCapture = true;
@@ -78,6 +75,36 @@ export function settings(): Settings {
     }
     cache = loaded;
     return loaded;
+}
+
+/**
+ * Settings as stored, checked field by field. The file is edited by hand, and
+ * a value of the wrong type used to reach code that trusted it: a chord written
+ * as null to switch it off (the documented way is an empty string) threw from
+ * the tray and from step-key registration, which left steps that could never
+ * be answered. A field that is missing or of the wrong type gets its default,
+ * the rest of the file still counts, and a file that sets only one chord keeps
+ * the default for the other.
+ */
+export function normalizeSettings(stored: unknown): Settings {
+    const s = stored && typeof stored === 'object' ? (stored as Record<string, unknown>) : {};
+    const keys = s.stepKeys && typeof s.stepKeys === 'object' ? (s.stepKeys as Record<string, unknown>) : {};
+    const flag = (name: 'openAtLogin' | 'startHidden' | 'showInCapture' | 'readStepsAloud' | 'soundCues'): boolean =>
+        typeof s[name] === 'boolean' ? (s[name] as boolean) : DEFAULTS[name];
+    // null is what someone writes to switch a key off, so it counts as "".
+    const chord = (name: 'done' | 'stuck'): string =>
+        typeof keys[name] === 'string' ? (keys[name] as string) : keys[name] === null ? '' : DEFAULTS.stepKeys[name];
+    const rate = typeof s.speechRate === 'number' && Number.isFinite(s.speechRate) ? s.speechRate : DEFAULTS.speechRate;
+    return {
+        openAtLogin: flag('openAtLogin'),
+        startHidden: flag('startHidden'),
+        showInCapture: flag('showInCapture'),
+        token: typeof s.token === 'string' ? s.token : DEFAULTS.token,
+        readStepsAloud: flag('readStepsAloud'),
+        speechRate: Math.min(2, Math.max(0.5, rate)),
+        soundCues: flag('soundCues'),
+        stepKeys: { done: chord('done'), stuck: chord('stuck') }
+    };
 }
 
 export function updateSettings(patch: Partial<Settings>): Settings {

@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { AppStatus, HudMessage, StepView, UserAnswer } from '../shared/types.js';
+import type { AppStatus, HudMessage, StepView } from '../shared/types.js';
+import type { CardAnswer } from '../renderer/hud/step.js';
 
 contextBridge.exposeInMainWorld('hudApi', {
     onMessage(cb: (m: HudMessage) => void): void {
@@ -35,7 +36,11 @@ contextBridge.exposeInMainWorld('hudApi', {
     onCollapsed(cb: (collapsed: boolean) => void): void {
         ipcRenderer.on('hud:collapsed', (_e, collapsed: boolean) => cb(collapsed));
     },
-    answerStep: (id: string, answer: UserAnswer): void => ipcRenderer.send('hud:step-answer', { id, answer }),
+    onReplyReturned(cb: (text: string) => void): void {
+        ipcRenderer.on('hud:reply-returned', (_e, text: string) => cb(text));
+    },
+    answerStep: (id: string, answer: CardAnswer): void => ipcRenderer.send('hud:step-answer', { id, answer }),
+    showMe: (id: string): void => ipcRenderer.send('hud:show-me', id),
     composing: (on: boolean): void => ipcRenderer.send('hud:composing', on),
     reportVoices: (local: boolean): void => ipcRenderer.send('hud:voices', { local }),
     send: (prompt: string): Promise<void> => ipcRenderer.invoke('agent:send', prompt),

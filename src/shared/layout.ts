@@ -20,11 +20,14 @@ export interface OverlayFrame extends OverlayState {
     /** This display minus its taskbar, local DIPs: where the step strip may dock. */
     workArea: Rect;
     /**
-     * This overlay shows the step strip and plays the step's sound cues: the
-     * display holding the step's target, else the primary. One display only,
-     * or every monitor chimes at once and every monitor repeats the prompt.
+     * This overlay plays the step's sound cues: the display holding the step's
+     * target, else the primary. One display only, or every monitor chimes at once.
      */
     lead: boolean;
+    /** This overlay shows the step strip (see showsStrip). */
+    showStrip: boolean;
+    /** The step's targets are all hidden: what the strip says it is waiting for. */
+    waiting?: string;
 }
 
 // ------------------------------------------------------------------ rects
@@ -124,14 +127,76 @@ export function localPart(global: Rect, display: Rect): Rect | null {
 /**
  * Which display leads the step: the one holding the step's first target
  * annotation (hidden ones too, so the strip stays put while a menu closes),
- * else the primary.
+ * else the primary. A hidden target keeps the display it was last on, which
+ * may since have been unplugged; leading from there would put the strip on no
+ * monitor at all, so only displays in `live` count.
  */
-export function leadDisplay(step: StepView | null, annotations: Annotation[], primaryId: string): string {
+export function leadDisplay(
+    step: StepView | null,
+    annotations: Annotation[],
+    primaryId: string,
+    live: { has(id: string): boolean }
+): string {
     for (const id of step?.targetIds ?? []) {
         const a = annotations.find(x => x.id === id);
-        if (a) return a.displayId;
+        if (a && live.has(a.displayId)) return a.displayId;
     }
     return primaryId;
+}
+
+/**
+ * Whether a display shows the step strip. Normally the lead only, or every
+ * monitor would repeat the prompt. A click step with no target is the
+ * exception: every display takes the click and shows a crosshair, and the user
+ * may be looking at any of them, so each one says what the click is for.
+ */
+export function showsStrip(step: StepView | null, lead: boolean): boolean {
+    if (!step) return false;
+    return lead || (step.mode === 'click' && step.targetIds.length === 0);
+}
+
+const AWAY: Record<NonNullable<Annotation['hiddenReason']>, string> = {
+    minimized: 'it was minimised. Restore it to carry on.',
+    closed: 'it was closed.',
+    'other-desktop': 'it is on another virtual desktop.',
+    gone: 'it is no longer on screen.'
+};
+
+/**
+ * The strip's note while every target of the pending step is hidden, so the
+ * user is told why the circle went away instead of seeing it silently vanish:
+ * "Waiting for “Notepad” to come back: it was minimised. Restore it to carry on."
+ *
+ * A minimised, closed or other-desktop target took its window with it, so the
+ * window is named; one that is simply gone (a menu that closed) is named itself.
+ * Both come from the anchor's label, which quotes the control's name first and
+ * its window's title last: `"Save" [button] el_3, top-left of "Notepad"`, or
+ * `window 0x1A2B "Notepad"`.
+ */
+export function waitingNote(step: StepView | null, annotations: Annotation[]): string | undefined {
+    if (!step) return undefined;
+    const targets = step.targetIds.flatMap(id => annotations.filter(a => a.id === id));
+    if (targets.length === 0 || targets.some(a => !a.hidden)) return undefined;
+    const a = targets[0]!;
+    const reason = a.hiddenReason ?? 'gone';
+    const label = a.anchor?.label ?? '';
+    const name = reason === 'gone' ? controlName(label) ?? windowTitle(label) : windowTitle(label);
+    const subject = name ? `“${name}”` : reason === 'gone' ? 'the target' : 'the app';
+    return `Waiting for ${subject} to come back: ${AWAY[reason]}`;
+}
+
+/** The window title an anchor label ends with, if it names one. */
+function windowTitle(label: string): string | undefined {
+    if (!label.endsWith('"')) return undefined;
+    const window = /^window \S+ "(.+)"$/.exec(label);
+    if (window) return window[1];
+    const at = label.lastIndexOf(' of "');
+    return at >= 0 && at + 5 < label.length - 1 ? label.slice(at + 5, -1) : undefined;
+}
+
+/** The control name an element anchor's label starts with. */
+function controlName(label: string): string | undefined {
+    return /^"(.+?)" (?:\[[^\]]*\] )?\S+(?:, |$)/.exec(label)?.[1];
 }
 
 /**
@@ -485,6 +550,31 @@ export function dockStrip(size: Size, workArea: Rect, targets: Rect[], others: R
         }
     }
     return best;
+}
+
+// ------------------------------------------------------------ mouse input
+
+/**
+ * Whether an overlay window takes the mouse rather than letting it through.
+ * Click-through is the default: the overlay must never intercept the user's
+ * mouse. Two exceptions: every overlay while a click-mode step is pending, and
+ * the one overlay whose step strip is under the pointer, so its buttons can be
+ * pressed. Neither applies to a window whose page is not running (crashed,
+ * hung, not loaded yet): it draws nothing and reports nothing, so taking the
+ * mouse would only make it an invisible sheet that swallows clicks.
+ */
+export function takesMouse(w: { live: boolean; picking: boolean; hovered: boolean }): boolean {
+    return w.live && (w.picking || w.hovered);
+}
+
+/**
+ * Whether a global DIP point is over a display's step strip, which is given in
+ * that display's local DIPs. A little slack keeps a pointer resting on the
+ * strip's edge counted as over it.
+ */
+export function overStrip(p: Point, origin: Point, strip: Rect | null, slack = 6): boolean {
+    if (!strip) return false;
+    return contains(inflate({ ...strip, x: origin.x + strip.x, y: origin.y + strip.y }, slack), p);
 }
 
 /**

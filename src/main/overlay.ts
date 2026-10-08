@@ -1,7 +1,17 @@
 import { BrowserWindow, ipcMain, screen, type WebContents } from 'electron';
 import { join } from 'node:path';
 import type { DisplayInfo, Point, Rect } from '../shared/types.js';
-import { leadDisplay, localPart, parseUserAnswer, routeTo, type OverlayFrame } from '../shared/layout.js';
+import {
+    leadDisplay,
+    localPart,
+    overStrip,
+    parseUserAnswer,
+    routeTo,
+    showsStrip,
+    takesMouse,
+    waitingNote,
+    type OverlayFrame
+} from '../shared/layout.js';
 import { listDisplays } from './displays.js';
 import { hudBounds, hudWindow } from './hud.js';
 import { settings } from './settings.js';
@@ -20,7 +30,25 @@ interface OverlayWindow {
     win: BrowserWindow;
     /** The step strip's rect on this display (local DIPs) while it is shown. */
     strip: Rect | null;
+    /**
+     * The page is loaded and answering. A crashed, hung or failed page never
+     * takes the mouse (see takesMouse) and is reloaded.
+     */
+    live: boolean;
+    /** What setFocusable was last told, so hover changes don't restyle the window. */
+    focusable: boolean;
+    /** When the page was last (re)loaded, to slow down one that keeps dying. */
+    loadedAt: number;
+    reload: NodeJS.Timeout | null;
+    /** Grace period for a hung page to recover before it is restarted. */
+    hang: NodeJS.Timeout | null;
 }
+
+const PAGE = join(__dirname, '../renderer/overlay/index.html');
+/** How long a hung page gets to answer again before its renderer is killed and reloaded. */
+const HANG_GRACE_MS = 5000;
+/** A page that dies this soon after loading is crashing in a loop: retry that slowly. */
+const CRASH_LOOP_MS = 10_000;
 
 const windows = new Map<string, OverlayWindow>();
 // On by default so the overlay never appears in its own screenshots. Set
@@ -88,14 +116,99 @@ function createOverlayWindow(display: DisplayInfo): OverlayWindow {
     // screenshots never contain our own annotations. No hide/capture/show race.
     win.setContentProtection(contentProtection);
 
-    const entry: OverlayWindow = { display, win, strip: null };
-    void win.loadFile(join(__dirname, '../renderer/overlay/index.html'));
+    const entry: OverlayWindow = {
+        display,
+        win,
+        strip: null,
+        live: false,
+        focusable: false,
+        loadedAt: 0,
+        reload: null,
+        hang: null
+    };
+    watchPage(entry);
+    load(entry);
     win.once('ready-to-show', () => {
+        if (win.isDestroyed()) return;
+        applyMouse(entry);
         win.showInactive();
-        pushTo(entry);
     });
 
     return entry;
+}
+
+function load(entry: OverlayWindow): void {
+    // A fresh page has no strip until it says so, and it only reports one
+    // that differs from the last it sent, which for a new page is none.
+    entry.strip = null;
+    entry.loadedAt = Date.now();
+    entry.win.loadFile(PAGE).catch(() => {
+        // did-fail-load has already marked the page dead and scheduled a retry.
+    });
+}
+
+/**
+ * Keep a broken page from leaving a blank window on screen. A full-screen
+ * overlay with no running page draws nothing; during a click step it would
+ * also swallow every click on its monitor with no crosshair and no report. So
+ * a crashed, hung or failed page goes click-through at once and is reloaded,
+ * and takes the mouse again only once it is back.
+ */
+function watchPage(entry: OverlayWindow): void {
+    const wc = entry.win.webContents;
+    wc.on('did-finish-load', () => revive(entry));
+    wc.on('responsive', () => revive(entry));
+    wc.on('render-process-gone', () => {
+        markDead(entry);
+        scheduleReload(entry);
+    });
+    wc.on('did-fail-load', (_e, code, _description, _url, isMainFrame) => {
+        // -3 is a load aborted by the next one (our own reload), not a failure.
+        if (!isMainFrame || code === -3) return;
+        markDead(entry);
+        scheduleReload(entry);
+    });
+    wc.on('unresponsive', () => {
+        markDead(entry);
+        if (entry.hang) return;
+        entry.hang = setTimeout(() => {
+            entry.hang = null;
+            // Still hung: killing the renderer emits render-process-gone, which reloads it.
+            if (!entry.win.isDestroyed() && !entry.live) entry.win.webContents.forcefullyCrashRenderer();
+        }, HANG_GRACE_MS);
+    });
+}
+
+function revive(entry: OverlayWindow): void {
+    if (entry.hang) clearTimeout(entry.hang);
+    entry.hang = null;
+    if (entry.win.isDestroyed()) return;
+    entry.live = true;
+    applyMouse(entry);
+    pushTo(entry);
+}
+
+function markDead(entry: OverlayWindow): void {
+    entry.live = false;
+    if (hovered === entry) setHovered(null);
+    applyMouse(entry);
+}
+
+function scheduleReload(entry: OverlayWindow): void {
+    if (entry.reload || entry.win.isDestroyed()) return;
+    const delay = Date.now() - entry.loadedAt < CRASH_LOOP_MS ? CRASH_LOOP_MS : 500;
+    entry.reload = setTimeout(() => {
+        entry.reload = null;
+        if (!entry.win.isDestroyed()) load(entry);
+    }, delay);
+}
+
+function dispose(entry: OverlayWindow): void {
+    if (hovered === entry) setHovered(null);
+    if (entry.reload) clearTimeout(entry.reload);
+    if (entry.hang) clearTimeout(entry.hang);
+    entry.reload = entry.hang = null;
+    if (!entry.win.isDestroyed()) entry.win.destroy();
 }
 
 function currentState(entry: OverlayWindow): OverlayFrame {
@@ -110,6 +223,7 @@ function currentState(entry: OverlayWindow): OverlayFrame {
     const workArea = screen.getAllDisplays().find(d => String(d.id) === display.id)?.workArea ?? display.dipBounds;
     const hud = hudBounds();
     const hudHere = hud ? localPart(hud, display.dipBounds) : null;
+    const lead = leadDisplay(step, all, primary, origins) === display.id;
 
     return {
         displayId: display.id,
@@ -117,7 +231,7 @@ function currentState(entry: OverlayWindow): OverlayFrame {
         // straddling two monitors is drawn on both, and a monitor with nothing
         // on it can still point at the step. Anchored annotations whose target
         // vanished stay in the store but are not drawn; they come back if the
-        // window reappears.
+        // window reappears, and meanwhile the strip says what it is waiting for.
         annotations: routeTo(all.filter(a => !a.hidden), origins, here),
         step,
         // The chat panel is where the user types: a spotlight's scrim must
@@ -126,7 +240,9 @@ function currentState(entry: OverlayWindow): OverlayFrame {
         cues: settings().soundCues,
         others: displays.filter(d => d.id !== display.id).map(d => toLocal(d.dipBounds)),
         workArea: toLocal(workArea),
-        lead: leadDisplay(step, all, primary) === display.id
+        lead,
+        showStrip: showsStrip(step, lead),
+        waiting: waitingNote(step, all)
     };
 }
 
@@ -179,6 +295,8 @@ export function syncDisplays(): void {
         seen.add(d.id);
         const existing = windows.get(d.id);
         if (!existing || existing.win.isDestroyed()) {
+            // Click-through until its page is up; then revive() applies a
+            // click step that is already pending, crosshair and all.
             windows.set(d.id, createOverlayWindow(d));
             continue;
         }
@@ -189,8 +307,7 @@ export function syncDisplays(): void {
 
     for (const [id, entry] of windows) {
         if (seen.has(id)) continue;
-        if (hovered === entry) hovered = null;
-        if (!entry.win.isDestroyed()) entry.win.destroy();
+        dispose(entry);
         windows.delete(id);
     }
     // Every display's view of the others changed, not just the resized one.
@@ -232,28 +349,32 @@ export function initOverlay(): void {
         const entry = entryFor(e.sender);
         if (!entry) return;
         entry.strip = rect;
-        if (!rect && hovered === entry) setHovered(null);
+        // A strip that appears or re-docks under a pointer at rest gets no
+        // mousemove, so the renderer never reports the hover: the next step's
+        // strip often docks exactly where the last one's Done was pressed.
+        // Without this the click meant for it would fall through to the app.
+        if (rect && cursorOver(entry)) setHovered(entry);
+        else if (!rect && hovered === entry) setHovered(null);
     });
 }
 
-/**
- * Click-through is the default: the overlay must never intercept the user's
- * mouse. Two exceptions: every overlay while a click-mode step is pending, and
- * the one overlay whose step strip is under the pointer, so its buttons can be
- * pressed.
- */
 function applyMouse(entry: OverlayWindow): void {
     if (entry.win.isDestroyed()) return;
-    entry.win.setIgnoreMouseEvents(!(picking || hovered === entry), { forward: true });
+    const take = takesMouse({ live: entry.live, picking, hovered: hovered === entry });
+    entry.win.setIgnoreMouseEvents(!take, { forward: true });
+    const focusable = picking && entry.live;
+    if (focusable !== entry.focusable) {
+        entry.focusable = focusable;
+        entry.win.setFocusable(focusable);
+    }
 }
 
 function setPicking(on: boolean): void {
     if (picking === on) return;
     picking = on;
     for (const entry of windows.values()) {
-        applyMouse(entry);
         if (entry.win.isDestroyed()) continue;
-        entry.win.setFocusable(on);
+        applyMouse(entry);
         if (on) entry.win.showInactive();
     }
 }
@@ -265,19 +386,21 @@ function setPicking(on: boolean): void {
  *
  * A missed mouseleave (the pointer jumping to another monitor, a renderer that
  * stalls) would leave a full-screen window eating clicks, so a 250 ms poll of
- * the real cursor restores click-through as soon as it is off the strip.
+ * the real cursor restores click-through as soon as it is off the strip. The
+ * poll stops whenever nothing is hovered, however that came about.
  */
 function setHovered(entry: OverlayWindow | null): void {
-    if (hovered === entry) return;
-    const previous = hovered;
-    hovered = entry;
-    if (previous) applyMouse(previous);
-    if (entry) applyMouse(entry);
+    if (hovered !== entry) {
+        const previous = hovered;
+        hovered = entry;
+        if (previous) applyMouse(previous);
+        if (entry) applyMouse(entry);
+    }
 
     if (entry && !hoverFailsafe) {
         hoverFailsafe = setInterval(() => {
             const h = hovered;
-            if (!h || h.win.isDestroyed() || !h.strip || !cursorOver(h)) setHovered(null);
+            if (!h || h.win.isDestroyed() || !cursorOver(h)) setHovered(null);
         }, 250);
         hoverFailsafe.unref?.();
     } else if (!entry && hoverFailsafe) {
@@ -287,16 +410,8 @@ function setHovered(entry: OverlayWindow | null): void {
 }
 
 function cursorOver(entry: OverlayWindow): boolean {
-    const p = screen.getCursorScreenPoint();
     const b = entry.display.dipBounds;
-    const s = entry.strip!;
-    const slack = 6;
-    return (
-        p.x >= b.x + s.x - slack &&
-        p.x <= b.x + s.x + s.width + slack &&
-        p.y >= b.y + s.y - slack &&
-        p.y <= b.y + s.y + s.height + slack
-    );
+    return overStrip(screen.getCursorScreenPoint(), { x: b.x, y: b.y }, entry.strip);
 }
 
 /**
@@ -315,9 +430,7 @@ export function raiseOverlays(): void {
 }
 
 export function destroyOverlay(): void {
-    if (hoverFailsafe) clearInterval(hoverFailsafe);
-    hoverFailsafe = null;
-    hovered = null;
-    for (const { win } of windows.values()) if (!win.isDestroyed()) win.destroy();
+    for (const entry of windows.values()) dispose(entry);
     windows.clear();
+    setHovered(null);
 }

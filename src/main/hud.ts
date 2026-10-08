@@ -12,9 +12,9 @@ import type {
 } from '../shared/types.js';
 import { parseProgress } from '../shared/progress.js';
 import { listDisplays } from './displays.js';
-import { raiseOverlays } from './overlay.js';
+import { pingTargets, raiseOverlays } from './overlay.js';
 import { settings } from './settings.js';
-import { answerStep, currentStep, onStepEnded } from './steps.js';
+import { answerStep, cancelStep, currentStep, onStepEnded } from './steps.js';
 import { store } from './store.js';
 import { focusWindow, setHudWindowRef } from './uia.js';
 
@@ -38,10 +38,19 @@ const DODGE_SLACK = 16;
 const PILL = { width: 220, height: 44 };
 /** A pasted wall of text must not flood the agent's context. */
 export const REPLY_LIMIT = 500;
+/** Messages kept for a panel that has not loaded yet; older ones are dropped. */
+const QUEUE_LIMIT = 200;
+/** The pointer this close to the panel means the user is reaching for it. */
+const POINTER_SLACK = 24;
+/** How often a move held back by the pointer is tried again. */
+const POINTER_RECHECK_MS = 500;
 
 let hud: BrowserWindow | null = null;
 let queued: HudMessage[] = [];
 let seq = 0;
+/** Set when the app is quitting, the one time a close may really close the panel. */
+let quitting = false;
+let pointerRecheck: NodeJS.Timeout | null = null;
 
 /** Where the user put the panel. Dodging moves it away and always comes back here. */
 let home: Rect | null = null;
@@ -63,7 +72,12 @@ function nextId(): string {
     return `msg_${seq}`;
 }
 
-export function createHud(contentProtection: boolean): BrowserWindow {
+/**
+ * Create the panel. `startHidden` keeps it closed for a login launch: it loads
+ * and listens as usual but is not shown until asked for, or until a question
+ * needs answering.
+ */
+export function createHud(contentProtection: boolean, startHidden = false): BrowserWindow {
     const primary = screen.getPrimaryDisplay();
 
     hud = new BrowserWindow({
@@ -95,12 +109,24 @@ export function createHud(contentProtection: boolean): BrowserWindow {
 
     void hud.loadFile(join(__dirname, '../renderer/hud/index.html'));
     hud.once('ready-to-show', () => {
-        hud?.show();
+        // Hiding the window before this point does nothing (it is not shown
+        // yet), so a hidden start has to be decided here.
+        if (!startHidden) hud?.show();
         // Anything the MCP server posted before the window existed.
         for (const m of queued) hud?.webContents.send('hud:message', m);
         queued = [];
         send('hud:step', currentStep());
     });
+    // Alt+F4 on the panel means "put it away", not "destroy it": nothing
+    // recreates the window, and it carries the step card and the only
+    // free-text channel to a terminal agent. Hide it, as the close button
+    // does, unless the app is quitting or Windows is ending the session.
+    hud.on('close', e => {
+        if (quitting) return;
+        e.preventDefault();
+        hud?.hide();
+    });
+    hud.on('session-end', allowHudClose);
     hud.on('closed', () => {
         hud = null;
         setHudWindowRef(undefined);
@@ -148,12 +174,21 @@ function wire(): void {
         const answer = panelAnswer(payload?.answer);
         if (!answer || typeof payload.id !== 'string') return;
         if (answer.kind === 'reply') {
-            replyToStep(answer.text, payload.id);
+            // The step can end between the panel sending this and it arriving
+            // (a timeout, its UI state arrived, a newer step). Hand the text
+            // back rather than dropping what the user wrote; the panel says so.
+            if (!replyToStep(answer.text, payload.id)) send('hud:reply-returned', answer.text);
             return;
         }
         // Look up the target before answering: the tool clears its drawing as
         // soon as the step resolves.
         const step = currentStep();
+        if (answer.kind === 'cancel') {
+            // The same as Escape or the strip's Cancel, so the agent hears
+            // CANCELLED with the points already placed, whichever was used.
+            if (step?.id === payload.id) cancelStep('esc');
+            return;
+        }
         const target = step ? targetWindowRef(step.targetIds, store.list()) : undefined;
         if (answerStep(answer, payload.id) && target && hudWindow()?.isFocused()) {
             // Pressing a button focused the panel; the next step happens in the
@@ -171,6 +206,20 @@ function wire(): void {
         localVoice = p?.local === true;
         onVoices?.();
     });
+
+    // "Show me" on the card: point at the target again and, for someone
+    // listening rather than reading, say the step again. Neither answers it.
+    ipcMain.on('hud:show-me', (_e, id: unknown) => {
+        const step = currentStep();
+        if (!step || step.id !== id) return;
+        pingTargets(step.targetIds);
+        sayStep(step);
+    });
+}
+
+/** Let the panel close for real; called when the app quits. */
+export function allowHudClose(): void {
+    quitting = true;
 }
 
 /** A window's HWND in the decimal form the helper uses for refs. */
@@ -225,7 +274,7 @@ export function pushMessage(role: HudRole, textBody: string): HudMessage {
     const msg: HudMessage = { id: nextId(), role, text: textBody, at: Date.now() };
     const win = hudWindow();
     if (win) win.webContents.send('hud:message', msg);
-    else queued.push(msg);
+    else if (queued.push(msg) > QUEUE_LIMIT) queued = queued.slice(-QUEUE_LIMIT);
     return msg;
 }
 
@@ -312,7 +361,17 @@ export function replyToStep(textBody: string, id?: string): boolean {
 function stepChanged(): void {
     const step = store.getStep();
     send('hud:step', step);
-    if (step?.id === shownStep?.id) return;
+    if (step?.id === shownStep?.id) {
+        // Click mode makes the overlays focusable, and the one that took a
+        // click can come up over the panel; keep Cancel and the reply box
+        // reachable for the rest of a multi-click step.
+        if (step?.mode === 'click' && step.collected !== shownStep?.collected) {
+            const win = hudWindow();
+            if (win?.isVisible()) win.moveTop();
+        }
+        shownStep = step;
+        return;
+    }
     const previous = shownStep;
     shownStep = step;
 
@@ -331,11 +390,15 @@ function stepChanged(): void {
         if (step.mode === 'click' && win.isVisible()) win.moveTop();
     }
 
+    sayStep(step);
+}
+
+/** Read a step's instruction aloud, when the user asked for that. */
+function sayStep(step: StepView): void {
     const prefs = settings();
-    if (prefs.readStepsAloud) {
-        const line = parseProgress(step.prompt)?.rest ?? step.prompt;
-        if (speak(line, prefs.speechRate)) spokenFor = step.id;
-    }
+    if (!prefs.readStepsAloud) return;
+    const line = parseProgress(step.prompt)?.rest ?? step.prompt;
+    if (speak(line, prefs.speechRate)) spokenFor = step.id;
 }
 
 function stepEnded(view: StepView, answer: StepAnswer): void {
@@ -390,14 +453,22 @@ export function outcomeLabel(view: StepView, a: StepAnswer): string {
 }
 
 /**
+ * What the panel's card sends: an answer, or Cancel on a click step, which ends
+ * the step the way Escape does instead of answering it.
+ */
+export type PanelAnswer = UserAnswer | { kind: 'cancel' };
+
+/**
  * Validate an answer arriving from the panel's renderer. It is our own page,
  * but it is still the far side of an IPC boundary, so nothing is trusted to
  * have the right shape.
  */
-export function panelAnswer(raw: unknown): UserAnswer | null {
+export function panelAnswer(raw: unknown): PanelAnswer | null {
     if (!raw || typeof raw !== 'object') return null;
     const a = raw as Record<string, unknown>;
     switch (a.kind) {
+        case 'cancel':
+            return { kind: 'cancel' };
         case 'done':
             return { kind: 'done' };
         case 'skip':
@@ -436,23 +507,58 @@ export function targetWindowRef(ids: string[], annotations: Annotation[]): strin
  * is drawn over the panel while the control it points at stays hidden under
  * it. Move the panel to a free corner while that is so, and back afterwards.
  *
- * Never while the user is using it: focused, holding unsent text, or being
- * dragged. A panel that jumps away from the cursor is worse than one that
- * covers a target.
+ * Never while the user is using it: focused, holding unsent text, being
+ * dragged, or under the pointer. A panel that jumps away from the cursor is
+ * worse than one that covers a target.
  */
 function reconsiderPlacement(): void {
     const win = hudWindow();
     if (!win || !home || !win.isVisible()) return;
     if (win.isFocused() || composing || Date.now() < draggingUntil) return;
     const area = screen.getDisplayMatching(home).workArea;
-    place(dodgePlacement(home, area, drawnRects()));
+    const want = dodgePlacement(home, area, drawnRects());
+    if (samePlacement(currentPlacement(win), want)) return;
+    // Someone moving onto the unfocused panel is reaching for its buttons; a
+    // panel that jumps away then sends their click into the app underneath.
+    // Hold still, and look again once the pointer has moved off.
+    if (pointerNear(win.getBounds(), screen.getCursorScreenPoint())) {
+        if (!pointerRecheck) {
+            pointerRecheck = setTimeout(() => {
+                pointerRecheck = null;
+                reconsiderPlacement();
+            }, POINTER_RECHECK_MS);
+            pointerRecheck.unref?.();
+        }
+        return;
+    }
+    place(want);
 }
 
-function place(want: { bounds: Rect; collapsed: boolean }): void {
+/** Whether a point is on a rect or within reach of it. */
+export function pointerNear(bounds: Rect, p: { x: number; y: number }, slack = POINTER_SLACK): boolean {
+    return (
+        p.x >= bounds.x - slack &&
+        p.x <= bounds.x + bounds.width + slack &&
+        p.y >= bounds.y - slack &&
+        p.y <= bounds.y + bounds.height + slack
+    );
+}
+
+type Placement = { bounds: Rect; collapsed: boolean };
+
+function currentPlacement(win: BrowserWindow): Placement {
+    return placed ?? { bounds: win.getBounds(), collapsed: false };
+}
+
+function samePlacement(a: Placement, b: Placement): boolean {
+    return a.collapsed === b.collapsed && sameRect(a.bounds, b.bounds);
+}
+
+function place(want: Placement): void {
     const win = hudWindow();
     if (!win) return;
-    const current = placed ?? { bounds: win.getBounds(), collapsed: false };
-    if (current.collapsed === want.collapsed && sameRect(current.bounds, want.bounds)) return;
+    const current = currentPlacement(win);
+    if (samePlacement(current, want)) return;
     selfMoveUntil = Date.now() + 600;
     if (want.collapsed !== current.collapsed) {
         win.setMinimumSize(want.collapsed ? PILL.width : 320, want.collapsed ? PILL.height : 260);
