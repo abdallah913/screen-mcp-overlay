@@ -7,6 +7,9 @@ is the reasoning, the measurements and the things that turned out to be harder t
 
 - [Cheap first, screenshots on escalation](#cheap-first-screenshots-on-escalation)
 - [Driving a walkthrough](#driving-a-walkthrough)
+- [Talking back](#talking-back)
+- [Drawing guidance people can follow](#drawing-guidance-people-can-follow)
+- [Reading what is really there](#reading-what-is-really-there)
 - [Anchored annotations](#anchored-annotations--drawings-that-follow-their-target)
 - [Coordinates](#coordinates--the-part-that-usually-breaks)
 - [How it works](#how-it-works)
@@ -152,12 +155,19 @@ here instead. Measured as the model sees it (name, description and input schema 
 | | Tools | Characters | ~Tokens per turn |
 |---|---|---|---|
 | Early trim | 9 | 7,670 | 2,073 |
-| Before this pass | 14 | 12,673 | 3,425 |
-| Now | 13 | **10,153** | **2,744** |
+| Before the token pass | 14 | 12,673 | 3,425 |
+| After the token pass | 13 | 10,153 | 2,744 |
+| Now | 13 | **10,863** | **2,936** |
 
-That is with `until`, `automationId` on waits and title matching all *added*. `npm test` pins it with a
-budget (`TOOL_LIST_BUDGET` in [test/tools.test.mjs](../test/tools.test.mjs)), so growth is a deliberate
-choice rather than drift. Where it came from:
+The token pass added `until`, `automationId` on waits and title matching while shrinking the list. The
+guidance pass then spent ~710 characters deliberately: `then:` plans, `until.value` and the `changes`
+condition, `show_message` options, `scroll_window` by name, and the one followability rule in
+`highlight_and_wait`'s `prompt` description, since some clients drop server instructions. Everything
+else in that pass (talking back, the After block, captions, ranking, popups) costs nothing per turn: it
+lives in behaviour and in responses. `npm test` pins the list with a budget (`TOOL_LIST_BUDGET`, 11,000)
+and the server instructions with another (`INSTRUCTIONS_BUDGET`, 1,400) in
+[test/tools.test.mjs](../test/tools.test.mjs), so growth is a deliberate choice rather than drift.
+Where the token pass's savings came from:
 
 - **Schema noise.** The SDK's zod conversion puts a `$schema` URI on every tool and `±9007199254740991`
   bounds on every unbounded integer. Neither tells the model anything; together they were ~700
@@ -200,26 +210,46 @@ mouse or keyboard.
 through rather than only their visible part. The pointer does not move. Re-read with
 `describe_window` afterwards: refs and rectangles change once content scrolls.
 
-`highlight_and_wait` is the basic walkthrough step — circle a control with the instruction, wait until
-the user has done it, clear the circle — in one call where it used to take three:
+`highlight_and_wait` is the basic walkthrough step: circle a control with the instruction, wait until
+the user has done it, and confirm it, in one call where it used to take three:
 
 ```jsonc
 {
-  "window": "Paint", "name": "Export", "prompt": "Click Export",
+  "window": "Paint", "name": "Export", "prompt": "2/5 Click Export",
   "until": { "condition": "appears", "role": "window", "name": "Save as" }
 }
 ```
 
 With `until`, the overlay stays click-through: the user operates the application normally, and the call
-returns once the UI reaches that state (searched in the step's window unless `until.window` says
-otherwise; `role: "window"` alone watches for a new top-level window). Without `until`, it waits for a
-confirming click instead — and **that click is captured by the overlay, so the application never
-receives it**. The original version only had that mode, which made it a poor walkthrough step: the user
-clicked Export, nothing happened in the app, and the agent moved on to a dialog that never opened. In
-click mode the response says whether the click landed on the target, measured against the circle's live
-position.
+returns once the UI reaches that state. Without `until`, it waits for a confirming click instead, and
+**that click is captured by the overlay, so the application never receives it**. Click mode is for
+"show me which one", not for operating the app.
 
-Either way it clears only its own circle, rather than everything on screen.
+What makes a step trustworthy:
+
+- **An `until` that is already true cannot confirm anything.** It used to: `role: "window"` alone
+  matched any open window, so the step reported Met in 0.0 s and the agent moved on while the user was
+  still a step behind. Top-level waits now count only windows that were not open when the step began,
+  and a control-level `until` is checked before drawing: already true returns `NOT started` (pick a
+  state the user's action changes), or `Already done` when the target is gone too.
+- **`changes`** waits for a control's name, value or state to change, or, with no selector, for a
+  window to open or close. `until.value` matches a value or a state word (`checked`, `expanded`), so
+  "tick Dark mode" can be confirmed.
+- **The result says what changed.** An `After:` block lists windows opened or closed since the step
+  began, the actionable rows of a new dialog (capped, with a snapshotId), or a capped diff of the step's
+  window, so the agent rarely needs a describe_window between steps. A step that is NOT met gets a digest
+  instead of a guess about the name: what opened, what is in front, and whether the target is still
+  there, scrolled away or covered.
+- **On success the circle turns into a green check for a second** rather than vanishing, so the user
+  knows the step registered during the seconds the model takes to plan the next one.
+- **`then:`** hands over a known path in one call. Each step needs an `until`, the next step's window
+  defaults to whatever the last `until` matched, and the plan stops at the first step that is not met,
+  with one line per step.
+- **A prompt that starts with `n/N`** ("2/5 Click Export") is progress: the overlay and the panel show
+  it as a pill. A convention rather than a parameter, so it costs nothing in the tool list.
+
+Every outcome names what was circled and where (`Circled "Export" [button], top-left of "Paint"`), and
+a step clears only its own drawings.
 
 ### Sequencing with `wait_for_element`
 
@@ -252,6 +282,92 @@ latency. The tool says so in its result when you forget.
 Polling happens in the Electron process, not the helper: the helper is single-threaded, and blocking
 it would freeze the anchor tracker so annotations would stop following their targets. This costs CPU,
 never tokens.
+
+## Talking back
+
+A blocked tool call is the only channel an agent in a terminal has, and while it blocked, the user had no
+way to say "I can't find it": they watched a pulsing circle for two minutes. Now there is one **pending
+step** at a time ([steps.ts](../src/main/steps.ts)), shared by every client, and every way the user can
+answer it ends the same tool call:
+
+| Where | Done | Can't find it | Skip | Other |
+|---|---|---|---|---|
+| Step strip on screen | button | button | button | choice buttons |
+| Panel card | button | button | button | a typed reply; keys 1-4 for choices; Show me |
+| Keyboard | Ctrl+Shift+F9 | Ctrl+Shift+F10 | | Esc (click mode only) |
+
+The strip is the only interactive part of an otherwise click-through overlay. The renderer hit-tests
+forwarded mouse moves against its rectangle, and the main process lets that one window take clicks only
+while the pointer is over it, with a timer that restores click-through if the pointer leaves unseen. The
+step keys are registered only while a step is pending, and only the ones that registered are shown.
+Escape is grabbed only in click mode: during a watched step the user is in their app, where Escape
+closes dialogs.
+
+A step always resolves, never rejects, and every result leads with a status word the server
+instructions teach: `Met`, `NOT met`, `NOT started`, `DONE`, `STUCK`, `SKIPPED`, `REPLIED`, `CHOSE`,
+`CANCELLED`, `NO RESPONSE`, `PARTIAL` ([answers.ts](../src/main/mcp/tools/answers.ts)). None is an
+error. Escape and silence are the user's answer, and reporting them as tool failures made models repeat
+the same instruction at someone who had just said no. Done re-checks the `until` before reporting Met;
+STUCK says whether the target is hidden, scrolled away or covered.
+
+A step also ends when the client gives up. The MCP request's abort signal (Esc in Claude Code, a client
+timeout) ends it at once instead of leaving the overlay waiting, which in click mode used to mean every
+click on every monitor was swallowed until the timeout. Long waits send progress notifications, so a
+client that resets its timeout on progress keeps the call alive. A newer step supersedes an older one,
+and Ctrl+Shift+X clears the screen and ends the step.
+
+`wait_for_user_click` names what the user pointed at (`-> "Export As…" [menuitem] el_44 in "Paint"`)
+through UI Automation's ElementFromPoint, so a correction needs no describe and no geometry.
+`show_message {options}` asks a multiple-choice question that is answered on screen or in the panel.
+
+## Drawing guidance people can follow
+
+- **Captions never cover their target.** Placement tries above, right, left and below (below last for
+  menus and tabs, whose menus open downward), avoiding the target, other captions and the step strip.
+  Long text wraps to three lines, and a caption moved away from its target gets a leader line. It used
+  to flip *into* the target at the top of the screen: the most common first step, "Click File".
+- **Rings fit wide controls.** An ellipse inscribed in a padded 416x40 text field cut through both ends;
+  wide targets get a rounded rectangle whose radius always encloses the corners.
+- **An attention ping instead of an endless pulse:** expanding rings when a step appears, moves or comes
+  back, and every 15 s, with nothing animating in between, so the render loop stops. With reduced
+  motion, a thicker static halo. The caption no longer fades with the ring.
+- **Halo strokes and a contrast-checked palette.** The old red was about 1.1:1 against mid-grey UI.
+- **Drawings follow targets across monitors.** They are drawn on every display they touch, point at the
+  edge when the target is off every display, and say on the other displays where the step is.
+- **A target behind another window** is drawn dashed with "behind Chrome", and the agent is told,
+  instead of a confident circle on the covering window. **A scrolled-out target** gets a pointer rather
+  than a ring on unrelated UI, and `scroll_window {name}` brings it into view.
+- **The overlay's own UI moves out of the way.** The step strip docks away from the target, the panel
+  dodges to a free corner when a drawing lands under it (never while focused or in use), and a
+  spotlight never dims the panel.
+- **Old drawings fade.** After ten minutes with no agent activity and no pending step, drawings with no
+  expiry are drawn faded and the panel offers to clear them; targets gone for ten minutes are retired
+  rather than resurrected hours later.
+
+## Reading what is really there
+
+- **Name matching ranks matches.** Exact (ignoring case, `&` mnemonics and a trailing `…`) beats
+  starts-with beats contains, so `name: "Save"` circles Save rather than whichever of "Save as…" and
+  "Autosave" came first in tree order. An ambiguous name says what else it matched; a miss returns the
+  closest names (never drawn), or, when the control is inside a collapsed menu or an unselected tab,
+  what to open first.
+- **Menus and dropdowns are separate windows.** Win32 menus, WPF and XAML flyouts and most dropdowns
+  are top-level popups of the app's process, outside a search rooted at the app's window, so step 2 of
+  almost every walkthrough ("click File", then "Save as") stalled for the full timeout. Searches and
+  describes now look in the window's visible same-process popups first.
+- **describe_window's budget counts the rows it prints**, not the unnamed wrappers it walked past, and
+  it says when it stopped and which subtrees it never reached. Long lists are cut short in the walk
+  itself, with a count, so the budget reaches the buttons after them. Rows carry state words
+  (`checked`, `expanded`, `selected`, `focused`), and the diff reports them
+  (`~ Dark mode [checkbox] unchecked -> checked`).
+- **Window blockers have names.** A minimised window can still be named by title, with a note. One on
+  another virtual desktop, one running as administrator (UIPI blocks reading it) and one not responding
+  are marked as such, instead of failing as "not open" or "no accessibility provider".
+- **read_text reads the window it was asked about**, rendered by PrintWindow as capture_screen does,
+  and falls back to a screen crop with a warning when the render fails or comes back blank.
+- **Fewer cross-process calls.** Property reads are batched with UI Automation cache requests (with a
+  live read on any error), and bounded connection and transaction timeouts stop a hung app from wedging
+  the single-threaded helper.
 
 ## Anchored annotations — drawings that follow their target
 
@@ -433,8 +549,17 @@ typing into the panel directly.
 | `SCREEN_OVERLAY_CWD` | your home dir | Working directory for the panel's agent |
 | `SCREEN_OVERLAY_SHOW_IN_CAPTURE` | unset | Set to `1` to make annotations visible in screen recordings and shares |
 
-Preferences set from the tray menu (start at login, capture visibility) persist in
-`%APPDATA%\screen-mcp-overlay\settings.json`. An env var always wins for that run.
+Preferences persist in `%APPDATA%\screen-mcp-overlay\settings.json`; an env var always wins for that
+run. The tray menu sets most of them:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `openAtLogin` | `false` | Start with Windows (the panel stays closed) |
+| `showInCapture` | `false` | Annotations appear in screen recordings and shares |
+| `readStepsAloud` | `false` | Speak each step's instruction when it appears (local voices only) |
+| `speechRate` | `1` | Rate for spoken steps and `show_message {speak}` |
+| `soundCues` | `false` | A short tone when a step starts and when it is done |
+| `stepKeys` | `Control+Shift+F9`, `Control+Shift+F10` | Done and Can't-find-it keys while a step is pending; empty disables one |
 
 ---
 
@@ -556,7 +681,20 @@ without touching COM.
 
 ## Status
 
-v0.1. Working and verified end to end on Windows 11. Not yet done:
+v0.1. The base was verified end to end on Windows 11. Not yet done:
+
+- **The guidance pass is not yet verified on Windows.** It was built and tested off Windows: the
+  TypeScript against a fake helper, the Rust helper compiled for Windows but not run. Check first:
+  popup discovery per toolkit (classic Win32 menus, WPF, WinUI/XAML, Electron); that the step strip
+  takes clicks only under the pointer and the overlay never stays interactive; the speed of
+  cache-request batching against the old per-property reads; ScrollItemPattern and ScrollPattern
+  stepping; `covered` sampling with the panel on top; elevation and hang detection; and that the
+  bounded UIA timeouts never cut off a slow but healthy app. `scripts/describe-check.mjs`,
+  `delta-check.mjs` and `smoke.mjs` exercise much of it.
+- **Event-driven waits** — waits poll (400-500 ms; `changes` on a whole window at most once a second
+  over 80 nodes). UIA event subscriptions would cut latency further, but they mean COM event handlers
+  on UIA's own threads writing into a single-threaded helper, which cannot be tested off Windows and
+  would take every tool down if it deadlocked. Deferred until polling is measured to be the problem.
 
 - **Signing** — the installer and portable exe are unsigned, so SmartScreen will warn on first run
   ("More info" -> "Run anyway"). This needs a purchased code-signing certificate; there is no code
@@ -572,9 +710,12 @@ v0.1. Working and verified end to end on Windows 11. Not yet done:
 - **macOS / Linux** — the architecture is cross-platform and Electron handles most of it, but
   `WDA_EXCLUDEFROMCAPTURE` is Windows-only. macOS `setContentProtection` maps to
   `NSWindowSharingNone`; Linux has no equivalent and would need hide-then-capture.
-- **Wider test coverage** — `npm test` covers the pure modules where the subtle bugs live and the whole
-  MCP tool layer against a fake helper, including a budget on the size of the tool list. The scripts
-  in `scripts/` are still manual, and the Rust helper's tests cover only its control-type table.
+- **Wider test coverage** — `npm test` covers the pure modules where the subtle bugs live (geometry,
+  tree keys and diffing, window matching, caption layout), the step core and the panel's step plumbing,
+  and the whole MCP tool layer against a fake helper, with budgets on the tool list and the
+  instructions. The Rust helper's pure logic (ranking, similarity, coverage sampling, blank-render
+  detection, roles) has `#[cfg(test)]` tests that run on Windows. The scripts in `scripts/` are still
+  manual.
 - **Qt/QML coverage is unverified.** The diagnosis distinguishes "no provider" from "frame only", but
   no Qt application has actually been tested against it. Worth checking before relying on a
   tree-driven walkthrough of one, rather than discovering it mid-walkthrough.
