@@ -311,10 +311,10 @@ function stepChanged(): void {
 
     const win = hudWindow();
     if (win) {
-        // A question is answered here, so it must be seen. A step without a
-        // target has nothing on screen to caption. A targeted step is captioned
-        // where the user is looking, so a panel they hid stays hidden.
-        if (!win.isVisible() && (step.mode === 'choice' || step.targetIds.length === 0)) win.showInactive();
+        // A question is answered here, so it must be seen. Other steps are
+        // shown on the overlay where the user is looking, so a panel they hid
+        // stays hidden, and in click mode it would cover what they point at.
+        if (!win.isVisible() && step.mode === 'choice') win.showInactive();
         // The overlay is about to capture every click; keep the panel above it.
         if (step.mode === 'click' && win.isVisible()) win.moveTop();
     }
