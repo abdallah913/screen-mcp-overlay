@@ -381,7 +381,7 @@ through UI Automation's ElementFromPoint, so a correction needs no describe and 
   it says when it stopped and which subtrees it never reached. Long lists are cut short in the walk
   itself (eight rows of a run, plus any row that is selected, expanded or holds the focus, then a
   count of the rest), so the budget reaches the buttons after them. Rows skipped this way are not
-  read, so `since=` says so when it finds no changes. A control that vanishes mid-walk ends only its
+  read, so `since=` and a `changes` step that saw nothing say so, and point at naming the row. A control that vanishes mid-walk ends only its
   own branch; only a timeout or a dead provider stops the walk. Open popups get their own share of the budget. Rows carry state words
   (`checked`, `expanded`, `selected`, `focused`), and the diff reports them
   (`~ Dark mode [checkbox] unchecked -> checked`).

@@ -774,6 +774,15 @@ test('a describe the app stopped answering partway is not a change', async () =>
     assert.equal(/^Met/.test(text), false, text);
 });
 
+test('a "changes" step that saw nothing says which long-list rows it could not read', async () => {
+    const desktop = fakeDesktop();
+    const settings = { depth: 2, ref: 'el_40', name: 'Option 8', role: 'listitem', enabled: true, rect: rect(1, 1, 1, 1), more: 40 };
+    fakeHelper({ find_elements: finder(() => []), describe: () => ({ nodes: [...desktop.tree, settings], truncated: false }) }, desktop);
+    const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs: 1500 });
+    assert.match(text, /^NOT met: "changes" did not happen/);
+    assert.match(text, /\n40 row\(s\) of long lists were not read; to watch one, name it in until\./);
+});
+
 test('restoring a minimised window does not meet a window until', async () => {
     const desktop = fakeDesktop();
     let lists = 0;

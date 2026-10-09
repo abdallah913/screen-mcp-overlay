@@ -6,7 +6,7 @@ import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sd
 import type { Annotation, ClickResult, Rect, SnapshotNode, StepAnswer } from '../../../shared/types.js';
 import { rectContains } from '../../../shared/geometry.js';
 import { parseProgress } from '../../../shared/progress.js';
-import { clean, diffLines, elementLine, toSnapshotNodes, whereIn } from '../../../shared/uitree.js';
+import { clean, diffLines, elementLine, toSnapshotNodes, whereIn, type TreeRow } from '../../../shared/uitree.js';
 import { store } from '../../store.js';
 import { beginStep } from '../../steps.js';
 import { postToHud } from '../../hud.js';
@@ -364,7 +364,7 @@ async function clickLine(c: ClickResult, i: number): Promise<string> {
 
 // ------------------------------------------------------------- before and after
 
-async function snapshotOf(windowRef: string): Promise<{ id: string; nodes: SnapshotNode[] } | undefined> {
+async function snapshotOf(windowRef: string): Promise<{ id: string; nodes: TreeRow[] } | undefined> {
     try {
         // The same budget as describe_window's default, so since= diffs line up.
         const { nodes, unanswered } = await describeWindow({ window: windowRef, maxNodes: 120 });
@@ -523,9 +523,11 @@ async function failureDigest(ctx: {
     // Whether the window was read at both ends: an app that stopped answering
     // leaves only the window list to go on.
     let compared = false;
+    let unread = 0;
     if (ctx.start) {
         const snap = await snapshotOf(ctx.windowRef);
         compared = Boolean(snap);
+        unread = snap?.nodes.reduce((sum, n) => sum + (n.unread ?? 0), 0) ?? 0;
         const diff = snap && diffLines(ctx.start.nodes, snap.nodes);
         if (diff) {
             changed = true;
@@ -546,6 +548,9 @@ async function failureDigest(ctx: {
         // Without a snapshot only the window list was watched, so say just that.
         const what = compared ? 'Nothing changed' : 'No window opened or closed';
         out.push(`${what}: the user may still be working or looking elsewhere; rephrase rather than repeat.`);
+        // Rows skipped in long lists are in neither snapshot, so a box ticked
+        // far down a list cannot show as a change.
+        if (unread) out.push(`${unread} row(s) of long lists were not read; to watch one, name it in until.`);
     } else if (!top) {
         out.push('The control may be named differently; describe_window shows what is there.');
     }
