@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import type { Annotation, CaptureRecord, ClickRequest, Point, Rect, UiSnapshot } from '../shared/types.js';
+import type { Annotation, CaptureRecord, Point, Rect, StepView, UiSnapshot } from '../shared/types.js';
 
 /**
  * Single source of truth for everything drawn on screen. The MCP server, the
@@ -11,7 +11,7 @@ class Store extends EventEmitter {
     private annotations = new Map<string, Annotation>();
     private captures = new Map<string, CaptureRecord>();
     private snapshots = new Map<string, UiSnapshot>();
-    private clickRequest: ClickRequest | null = null;
+    private step: StepView | null = null;
     private seq = 0;
     private sweeper: NodeJS.Timeout | null = null;
 
@@ -60,7 +60,18 @@ class Store extends EventEmitter {
      * tick would burn the GPU for nothing while windows sit still.
      */
     applyTracking(
-        updates: { id: string; displayId: string; rect: Rect; to?: Point; hidden: boolean }[]
+        updates: {
+            id: string;
+            displayId: string;
+            rect: Rect;
+            to?: Point;
+            hidden: boolean;
+            /** Leave undefined to keep the current value. */
+            covered?: string | null;
+            offscreen?: boolean;
+            /** Why the target is hidden, when it is. */
+            hiddenReason?: Annotation['hiddenReason'];
+        }[]
     ): boolean {
         let changed = false;
         for (const u of updates) {
@@ -74,16 +85,55 @@ class Store extends EventEmitter {
                 a.rect.height !== u.rect.height ||
                 a.to?.x !== u.to?.x ||
                 a.to?.y !== u.to?.y ||
-                !!a.hidden !== u.hidden;
+                !!a.hidden !== u.hidden ||
+                // A minimised window the user then closes stays hidden, but
+                // "restore it" has become wrong advice.
+                (u.hidden && u.hiddenReason !== undefined && u.hiddenReason !== a.hiddenReason) ||
+                (u.covered !== undefined && (a.covered ?? null) !== u.covered) ||
+                (u.offscreen !== undefined && !!a.offscreen !== u.offscreen);
             if (!moved) continue;
             a.displayId = u.displayId;
             a.rect = u.rect;
             a.to = u.to;
+            if (u.hidden && !a.hidden) a.hiddenSince = Date.now();
+            if (!u.hidden) a.hiddenSince = undefined;
+            a.hiddenReason = u.hidden ? u.hiddenReason ?? a.hiddenReason : undefined;
             a.hidden = u.hidden;
+            if (u.covered !== undefined) a.covered = u.covered ?? undefined;
+            if (u.offscreen !== undefined) a.offscreen = u.offscreen || undefined;
             changed = true;
         }
         if (changed) this.emit('annotations');
         return changed;
+    }
+
+    /**
+     * Fade (or restore) every drawing that has no expiry: what an idle client
+     * left behind. Returns how many changed.
+     */
+    markStale(stale: boolean): number {
+        let n = 0;
+        for (const a of this.annotations.values()) {
+            if (a.expiresAt || !!a.stale === stale) continue;
+            a.stale = stale || undefined;
+            n += 1;
+        }
+        if (n > 0) this.emit('annotations');
+        return n;
+    }
+
+    /** Remove anchored drawings whose target has been gone longer than `ms`. */
+    retireHidden(ms: number): number {
+        const cutoff = Date.now() - ms;
+        let n = 0;
+        for (const [id, a] of this.annotations) {
+            if (a.hidden && a.hiddenSince !== undefined && a.hiddenSince < cutoff) {
+                this.annotations.delete(id);
+                n += 1;
+            }
+        }
+        if (n > 0) this.emit('annotations');
+        return n;
     }
 
     /** Drop expired annotations and keep a timer running only while needed. */
@@ -147,15 +197,16 @@ class Store extends EventEmitter {
         return this.snapshots.get(id);
     }
 
-    // ---- click requests ----------------------------------------------------
+    // ---- the pending step ---------------------------------------------------
 
-    setClickRequest(req: ClickRequest | null): void {
-        this.clickRequest = req;
-        this.emit('click-request');
+    /** Owned by steps.ts; everything else only reads it or listens for 'step'. */
+    setStep(step: StepView | null): void {
+        this.step = step;
+        this.emit('step');
     }
 
-    getClickRequest(): ClickRequest | null {
-        return this.clickRequest;
+    getStep(): StepView | null {
+        return this.step;
     }
 }
 

@@ -1,8 +1,21 @@
 import { app, clipboard, globalShortcut, ipcMain, Menu, nativeImage, Tray } from 'electron';
 import { join } from 'node:path';
 import { cleanupCaptureDir, initCaptureDir } from './capture.js';
-import { cancelClicks, hasPendingClick, initClicks } from './clicks.js';
-import { createHud, hudWindow, pushMessage, setHudContentProtection, setStatus, toggleHud } from './hud.js';
+import { initClicks } from './clicks.js';
+import { answerStep, bindStepKeys, cancelStep, currentStep, keyLabel } from './steps.js';
+import {
+    allowHudClose,
+    createHud,
+    hasLocalVoice,
+    hudWindow,
+    onVoicesKnown,
+    pushMessage,
+    setHudContentProtection,
+    setStatus,
+    stopSpeaking,
+    toggleHud
+} from './hud.js';
+import { startIdleWatch, stopIdleWatch } from './idle.js';
 import { disposeImageWorker } from './imageWorker.js';
 import {
     startMcpServer,
@@ -16,6 +29,7 @@ import {
     destroyOverlay,
     initOverlay,
     isContentProtected,
+    pushState,
     setContentProtection
 } from './overlay.js';
 import { store } from './store.js';
@@ -55,8 +69,7 @@ async function main(): Promise<void> {
     initOverlay();
     initClicks();
     initAgentHost();
-    createHud(isContentProtected());
-    if (startedHidden()) hudWindow()?.hide();
+    createHud(isContentProtected(), startedHidden());
     registerIpc();
     registerShortcuts();
 
@@ -79,6 +92,9 @@ async function main(): Promise<void> {
     // Keeps anchored annotations glued to the windows and controls they point at.
     startAnchorTracking();
 
+    // Fades what an agent that went quiet left on screen.
+    startIdleWatch(mcpActiveRequests);
+
     buildTray();
     publishStatus();
     setInterval(publishStatus, 2000).unref?.();
@@ -100,7 +116,10 @@ function publishStatus(): void {
 }
 
 function registerIpc(): void {
+    // The panel's Clear button is the same panic button as Ctrl+Shift+X: a
+    // click step left without its circle would take the next click anywhere.
     ipcMain.handle('app:clear-annotations', () => {
+        cancelStep('clear');
         store.clear();
     });
     ipcMain.handle('app:copy-mcp-url', () => {
@@ -113,20 +132,18 @@ function registerIpc(): void {
 
 function registerShortcuts(): void {
     // Toggle the chat panel.
-    globalShortcut.register('Control+Shift+O', () => toggleHud());
-    // Panic button: wipe everything drawn on screen.
-    globalShortcut.register('Control+Shift+X', () => store.clear());
-
-    // Escape is grabbed ONLY while a click request is pending. A permanent
-    // global registration would swallow Escape from every other application on
-    // the machine for as long as the overlay runs.
-    store.on('click-request', () => {
-        if (hasPendingClick()) {
-            globalShortcut.register('Escape', () => cancelClicks());
-        } else {
-            globalShortcut.unregister('Escape');
-        }
+    globalShortcut.register('Control+Shift+O', () => toggleHud(true));
+    // Panic button: wipe everything drawn on screen and end the pending step.
+    globalShortcut.register('Control+Shift+X', () => {
+        cancelStep('clear');
+        store.clear();
     });
+
+    // Done, Stuck and (in click mode) Escape, held only while a step is
+    // pending; see bindStepKeys for why.
+    bindStepKeys(globalShortcut, () => settings().stepKeys);
+    // The tray lists the keys that answer the current step.
+    store.on('step', refreshTrayMenu);
 }
 
 function buildTray(): void {
@@ -134,18 +151,56 @@ function buildTray(): void {
     const icon = nativeImage.createFromPath(join(__dirname, '..', 'tray.png'));
     tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
     tray.on('click', () => toggleHud());
-    tray.setToolTip('Screen MCP Overlay');
+    onVoicesKnown(refreshTrayMenu);
     refreshTrayMenu();
+}
+
+/** A menu label with its key shown at the right, when there is one. */
+function withKey(label: string, key: string | undefined): string {
+    return key ? `${label}\t${key}` : label;
 }
 
 function refreshTrayMenu(): void {
     if (!tray) return;
+    const prefs = settings();
+    const step = currentStep();
+    // A step lists only the keys that actually registered; between steps the
+    // configured ones are shown, so the user can learn them in advance.
+    const keys = step?.keys ?? { done: keyLabel(prefs.stepKeys.done), stuck: keyLabel(prefs.stepKeys.stuck) };
+    // Done and stuck answer a watched step only; see bindStepKeys.
+    const answerable = step?.mode === 'watch';
+    const noVoice = hasLocalVoice() === false;
+    tray.setToolTip(
+        noVoice && prefs.readStepsAloud
+            ? 'Screen MCP Overlay (no local voice installed, so steps are not read aloud)'
+            : 'Screen MCP Overlay'
+    );
     tray.setContextMenu(
         Menu.buildFromTemplate([
             { label: mcpUrl() || 'MCP server not running', enabled: false },
             { type: 'separator' },
             { label: 'Show / hide panel\tCtrl+Shift+O', click: () => toggleHud() },
-            { label: 'Clear annotations\tCtrl+Shift+X', click: () => store.clear() },
+            {
+                label: 'Clear and stop the current step\tCtrl+Shift+X',
+                click: () => {
+                    cancelStep('clear');
+                    store.clear();
+                }
+            },
+            {
+                label: withKey('I did the current step', keys.done || undefined),
+                enabled: answerable,
+                click: () => {
+                    if (step) answerStep({ kind: 'done' }, step.id);
+                }
+            },
+            {
+                label: withKey("I can't find it", keys.stuck || undefined),
+                enabled: answerable,
+                click: () => {
+                    if (step) answerStep({ kind: 'stuck' }, step.id);
+                }
+            },
             {
                 label: 'Copy MCP URL (includes access token)',
                 click: () => {
@@ -166,9 +221,30 @@ function refreshTrayMenu(): void {
                 }
             },
             {
+                label: noVoice ? 'Read steps aloud (no local voice installed)' : 'Read steps aloud',
+                type: 'checkbox',
+                checked: prefs.readStepsAloud,
+                click: menuItem => {
+                    updateSettings({ readStepsAloud: menuItem.checked });
+                    if (!menuItem.checked) stopSpeaking();
+                    refreshTrayMenu();
+                }
+            },
+            {
+                label: 'Sound cues',
+                type: 'checkbox',
+                checked: prefs.soundCues,
+                click: menuItem => {
+                    updateSettings({ soundCues: menuItem.checked });
+                    // The overlay plays the cues and reads the preference from its state.
+                    pushState();
+                    refreshTrayMenu();
+                }
+            },
+            {
                 label: 'Start automatically at login',
                 type: 'checkbox',
-                checked: settings().openAtLogin,
+                checked: prefs.openAtLogin,
                 click: menuItem => {
                     updateSettings({ openAtLogin: menuItem.checked });
                     applyOpenAtLogin(menuItem.checked);
@@ -181,11 +257,15 @@ function refreshTrayMenu(): void {
     );
 }
 
+// The panel ignores a close (Alt+F4) by hiding instead; quitting must still close it.
+app.on('before-quit', allowHudClose);
+
 app.on('will-quit', () => {
     globalShortcut.unregisterAll();
 });
 
 app.on('quit', () => {
+    stopIdleWatch();
     stopAnchorTracking();
     stopUia();
     void mcp?.close();

@@ -84,6 +84,11 @@ export function physicalToImagePoint(p: Point, capture: CaptureRecord): Point {
     return scalePoint(local, capture.imageScale);
 }
 
+/** Whether a point lies inside a rect, edges included. */
+export function rectContains(r: Rect, p: Point): boolean {
+    return p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height;
+}
+
 /** Clamp a rect so it stays inside the display. Keeps stray annotations visible. */
 export function clampRectToDisplay(r: Rect, display: DisplayInfo): Rect {
     const maxW = display.physicalSize.width;
@@ -107,10 +112,28 @@ export function clampRectToDisplay(r: Rect, display: DisplayInfo): Rect {
 
 /**
  * Pick the downscale factor for a capture. Large screenshots cost a lot of
- * tokens for no extra accuracy, so cap the long edge.
+ * tokens for no extra accuracy, so cap the long edge and, optionally, the area.
+ *
+ * The area cap matters for coordinates, not just cost. A model API that
+ * receives an image over its size limit shrinks it before the model sees it,
+ * and the model then reads coordinates in the shrunken image while
+ * `space:"image"` interprets them in ours. Claude models before the
+ * high-resolution generation rescale anything over 1568px on the long edge
+ * *or* ~1.15 megapixels, and a 16:9 frame at 1568px wide is 1.38MP, so the
+ * edge cap alone left every coordinate 7-9% short there.
  */
-export function fitScale(size: { width: number; height: number }, maxDimension: number): number {
+export function fitScale(
+    size: { width: number; height: number },
+    maxDimension: number,
+    maxPixels = Infinity
+): number {
     const longest = Math.max(size.width, size.height);
-    if (longest <= maxDimension) return 1;
-    return maxDimension / longest;
+    const area = size.width * size.height;
+    return Math.min(1, maxDimension / longest, Math.sqrt(maxPixels / Math.max(1, area)));
 }
+
+/**
+ * The default capture budget: the largest image every Claude model accepts
+ * without rescaling it. High-resolution models take up to 2576px when asked.
+ */
+export const DEFAULT_CAPTURE = { maxDimension: 1568, maxPixels: 1_150_000 } as const;

@@ -1,6 +1,6 @@
 {
   "name": "screen-mcp-overlay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A desktop overlay that lets Claude Code and any MCP client see your screen and draw guidance on it.",
   "license": "Apache-2.0",
   "main": "dist/main/index.js",
@@ -17,7 +17,7 @@
     "dist": "npm run icon && npm run build:native && npm run build && electron-builder --win",
     "dist:dir": "npm run icon && npm run build:native && npm run build && electron-builder --win --dir",
     "build:native": "cargo build --release --manifest-path native/uia-helper/Cargo.toml",
-    "build:test": "esbuild src/shared/geometry.ts src/shared/uitree.ts --bundle --platform=node --format=esm --outdir=dist-test --log-level=error",
+    "build:test": "node scripts/build-test.mjs",
     "test": "npm run build:test && node --test test/*.test.mjs"
   },
   "dependencies": {

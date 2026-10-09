@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { CaptureRecord, DisplayInfo, Rect } from '../shared/types.js';
 import { clampRectToDisplay, fitScale } from '../shared/geometry.js';
+import { nearlyUniform } from '../shared/windows.js';
 import { store } from './store.js';
 import { compositeGrid } from './imageWorker.js';
 import { printWindow } from './uia.js';
@@ -34,6 +35,14 @@ export function cleanupCaptureDir(): void {
     }
 }
 
+export interface WindowCapture {
+    record: CaptureRecord;
+    /** The raw window rect the image covers, virtual-screen physical, invisible resize border included. */
+    rect: Rect;
+    /** The render is one flat colour: how PrintWindow sees GPU and DirectX surfaces. */
+    blank: boolean;
+}
+
 /**
  * Capture one window's own content, whatever is sitting on top of it.
  *
@@ -42,21 +51,26 @@ export function cleanupCaptureDir(): void {
  * pixels -- which looks correct and gets annotated over confidently. PrintWindow
  * asks the window to draw itself instead, so the result is always the window
  * that was asked for.
+ *
+ * Two ways that can still go wrong are reported rather than hidden: the window
+ * refused to render, so the helper copied the screen (`record.fallback`, and
+ * then whatever covers the window is in the image), or it rendered blank.
  */
 export async function captureWindow(opts: {
     windowRef: string;
     maxDimension: number;
+    maxPixels?: number;
     grid: boolean;
-}): Promise<CaptureRecord> {
+}): Promise<WindowCapture> {
     const id = store.nextId('cap');
     const raw = join(captureDir, `${id}-raw.png`);
-    const rect = await printWindow(opts.windowRef, raw);
+    const { rect, fallback } = await printWindow(opts.windowRef, raw);
 
     let image = nativeImage.createFromPath(raw);
     if (image.isEmpty()) throw new Error('the window rendered an empty image');
 
     const size = image.getSize();
-    const downscale = fitScale(size, opts.maxDimension);
+    const downscale = fitScale(size, opts.maxDimension, opts.maxPixels);
     if (downscale < 1) {
         image = image.resize({
             width: Math.max(1, Math.round(size.width * downscale)),
@@ -66,6 +80,7 @@ export async function captureWindow(opts: {
     }
 
     const finalSize = image.getSize();
+    const blank = nearlyUniform(image.toBitmap(), finalSize.width, finalSize.height);
     const path = join(captureDir, `${id}.png`);
     let png = image.toPNG();
     if (opts.grid) png = await compositeGrid(png, gridStep(finalSize));
@@ -96,11 +111,12 @@ export async function captureWindow(opts: {
         imageScale: finalSize.width / Math.max(1, rect.width),
         path,
         createdAt: Date.now(),
-        windowRef: opts.windowRef
+        windowRef: opts.windowRef,
+        fallback
     };
     store.recordCapture(record);
     pushMessage('system', `Window captured: ${finalSize.width}x${finalSize.height}.`);
-    return record;
+    return { record, rect, blank };
 }
 
 export interface CaptureOptions {
@@ -109,6 +125,8 @@ export interface CaptureOptions {
     region?: Rect;
     /** Longest edge of the written PNG. Caps token cost. */
     maxDimension: number;
+    /** Area cap, so a model API never has to rescale the image. */
+    maxPixels?: number;
     /** Burn a labelled coordinate grid into the image to help agents aim. */
     grid: boolean;
 }
@@ -159,7 +177,7 @@ export async function captureDisplay(opts: CaptureOptions): Promise<CaptureRecor
     }
 
     const cropped = image.getSize();
-    const downscale = fitScale(cropped, opts.maxDimension);
+    const downscale = fitScale(cropped, opts.maxDimension, opts.maxPixels);
     if (downscale < 1) {
         image = image.resize({
             width: Math.max(1, Math.round(cropped.width * downscale)),

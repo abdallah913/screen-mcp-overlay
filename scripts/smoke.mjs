@@ -5,9 +5,8 @@
  * Run `npm start` in another terminal first.
  */
 
-import { connectOverlay, textOf } from './lib/client.mjs';
+import { captureIdOf, connectOverlay, pathOf, textOf } from './lib/client.mjs';
 import { statSync } from 'node:fs';
-
 
 const client = await connectOverlay('dev-script');
 console.log('connected to the overlay');
@@ -16,17 +15,21 @@ const { tools } = await client.listTools();
 console.log(`\ntools (${tools.length}):`);
 for (const t of tools) console.log(`  ${t.name} - ${(t.description ?? '').split('\n')[0]}`);
 
+console.log('\n--- list_windows ---');
+console.log(textOf(await client.callTool({ name: 'list_windows', arguments: {} })));
 
-console.log('\n--- list_displays ---');
-console.log(textOf(await client.callTool({ name: 'list_displays', arguments: {} })));
+// Window parameters take a title or "foreground" as well as a ref.
+console.log('\n--- describe_window("foreground"), first 6 lines ---');
+const tree = textOf(await client.callTool({ name: 'describe_window', arguments: { window: 'foreground', maxNodes: 40 } }));
+console.log(tree.split('\n').slice(0, 6).join('\n'));
 
 console.log('\n--- capture_screen (with grid) ---');
 const cap = await client.callTool({ name: 'capture_screen', arguments: { grid: true } });
 const capText = textOf(cap);
 console.log(capText);
 
-const captureId = /captureId: (\S+)/.exec(capText)?.[1];
-const path = /path: (.+)/.exec(capText)?.[1]?.trim();
+const captureId = captureIdOf(capText);
+const path = pathOf(capText);
 if (!captureId || !path) throw new Error('capture_screen did not return a captureId and path');
 console.log(`PNG on disk: ${statSync(path).size} bytes`);
 
@@ -65,6 +68,16 @@ console.log(
                 ttlMs: 4000,
                 shapes: [{ type: 'box', x: 0.7, y: 0.7, width: 0.25, height: 0.2, text: 'normalized, 4s ttl' }]
             }
+        })
+    )
+);
+
+console.log('\n--- annotate: anchored to the foreground window, sized to fit it ---');
+console.log(
+    textOf(
+        await client.callTool({
+            name: 'annotate',
+            arguments: { replace: false, ttlMs: 4000, anchor: { window: 'foreground' }, shapes: [{ type: 'box', text: 'fits the window' }] }
         })
     )
 );

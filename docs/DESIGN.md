@@ -7,6 +7,9 @@ is the reasoning, the measurements and the things that turned out to be harder t
 
 - [Cheap first, screenshots on escalation](#cheap-first-screenshots-on-escalation)
 - [Driving a walkthrough](#driving-a-walkthrough)
+- [Talking back](#talking-back)
+- [Drawing guidance people can follow](#drawing-guidance-people-can-follow)
+- [Reading what is really there](#reading-what-is-really-there)
 - [Anchored annotations](#anchored-annotations--drawings-that-follow-their-target)
 - [Coordinates](#coordinates--the-part-that-usually-breaks)
 - [How it works](#how-it-works)
@@ -26,16 +29,29 @@ is the reasoning, the measurements and the things that turned out to be harder t
 state, and an anchorable ref per line:
 
 ```
-Export Dialog [window]  800x600 @420,300
-  Format [combobox] "PNG"        el_3
-  Quality [slider] "80"          el_4
-  Export [button] disabled       el_5
-  Cancel [button]                el_6
+Export Dialog [window]  800x600@420,300
+  Format [combobox] "PNG"  el_3
+  Quality [slider] "80"  el_4
+  Export [button] disabled  el_5
+  Cancel [button]  el_6
 ```
 
 Measured on a full Chrome window: **512 tokens versus 1844 for a screenshot of the same window, 3.6x
 cheaper** — and more actionable, because every line can be pointed at directly. A focused dialog does
-better than 3.6x; a browser window is close to the worst case, since most of its tree is chrome.
+better than 3.6x; a browser window is close to the worst case, since most of its tree is chrome. (Both
+sides have shrunk since: screenshots now default to ~1.5k tokens, see [Coordinates](#coordinates--the-part-that-usually-breaks),
+and trees drop echo rows, below.)
+
+Chromium, Electron and WinUI put a `text` child inside nearly every button, link and list item, carrying
+the same label as its parent: `Save [button]` followed by `Save [text]`. That child is a row and a ref
+that say nothing new, in exactly the toolkits whose trees are biggest, so it is dropped. Only `text`
+echoes go, never one with a value or an AutomationId, and never a direct child of the window (Chromium's
+title-repeating wrapper is what the diagnosis below keys on). A value equal to its own name is not
+printed twice either.
+
+Search hits from `find_ui_elements` and `wait_for_element` use the same row shape plus a rectangle —
+`Export [button] disabled id=ExportBtn  80x24@250,150  el_2` — so there is one format to read, and every
+tool prints rectangles as `WxH@x,y`.
 
 When a tree comes back thin, `describe_window` says **why**. The two failure modes need different
 fallbacks and look identical from the node list alone: no accessibility provider attached at all,
@@ -115,15 +131,62 @@ about 19 levels down, and pruning unnamed containers leaves gaps, so indenting b
 forty columns — while ranking depths globally (the first thing tried here) gives siblings different
 indents and misrepresents the structure.
 
+### Naming windows
+
+Every `window` parameter takes a ref, a title substring, or `"foreground"`. Before that, the first move
+of almost every task was `list_windows`: a whole round trip, plus a response that grows by a line per open
+window, just to learn a number to pass to the next call. Now an agent goes straight to
+`describe_window {window: "Notepad"}`.
+
+Matching is in [src/shared/windows.ts](../src/shared/windows.ts): an exact title beats a substring, and
+among several matches the foreground window wins, then the frontmost (the list arrives in z-order). It
+guesses rather than reporting "ambiguous" because the chosen window's title is in every response, so a
+wrong guess is visible and cheap to correct. No match is an error that lists the open windows, so the
+agent can correct itself without a separate `list_windows`. A numeric ref skips the window list entirely.
+
+Anchors store the resolved ref, not the title — a title like Notepad's changes the moment the document
+is edited.
+
 ### Tool surface
 
-The tool list itself is context on every turn, so it is kept terse and the prose lives here instead.
-An early trim measured via `tools/list` took it from **11,104 chars across 10 tools to 7,670 across
-9** — about 2,073 tokens — *with* `describe_window` added and `list_displays` folded into
-`list_windows`. It has since grown back to **12,049 chars across 14 tools, about 3,256 tokens**, as
-`focus_window`, `scroll_window` and `highlight_and_wait` were added. `highlight_and_wait` is pure
-composition of `annotate` and `wait_for_user_click`, so folding it back would recover roughly 450
-tokens per turn at the cost of one extra call per walkthrough step.
+The tool list is resent on every turn of every conversation, so it is kept terse and the prose lives
+here instead. Measured as the model sees it (name, description and input schema per tool, serialised):
+
+| | Tools | Characters | ~Tokens per turn |
+|---|---|---|---|
+| Early trim | 9 | 7,670 | 2,073 |
+| Before the token pass | 14 | 12,673 | 3,425 |
+| After the token pass | 13 | 10,153 | 2,744 |
+| Now | 13 | **10,863** | **2,936** |
+
+The token pass added `until`, `automationId` on waits and title matching while shrinking the list. The
+guidance pass then spent ~710 characters deliberately: `then:` plans, `until.value` and the `changes`
+condition, `show_message` options, `scroll_window` by name, and the one followability rule in
+`highlight_and_wait`'s `prompt` description, since some clients drop server instructions. Everything
+else in that pass (talking back, the After block, captions, ranking, popups) costs nothing per turn: it
+lives in behaviour and in responses. `npm test` pins the list with a budget (`TOOL_LIST_BUDGET`, 11,000)
+and the server instructions with another (`INSTRUCTIONS_BUDGET`, 1,400) in
+[test/tools.test.mjs](../test/tools.test.mjs), so growth is a deliberate choice rather than drift.
+Where the token pass's savings came from:
+
+- **Schema noise.** The SDK's zod conversion puts a `$schema` URI on every tool and `±9007199254740991`
+  bounds on every unbounded integer. Neither tells the model anything; together they were ~700
+  characters a turn. [server.ts](../src/main/mcp/server.ts) strips them, and builds the list once
+  rather than re-converting every schema on every request.
+- **Descriptions versus responses.** A description is paid on every turn; a response only when the tool
+  runs. So descriptions say what a tool does and when to reach for it, and caveats that only matter in
+  the moment — an occluded window, an unscoped search, an app that ignores wheel messages — moved into
+  the responses that trigger them.
+- **Inference over parameters.** An anchor's `kind` and a shape's `fit` are inferred (a name means a
+  control, a ref means that element, otherwise a window; an anchored shape without a size fits its
+  target). Both still work if sent. `speak` became `show_message {speak: true}`, and `wait_for_element`
+  lost `pollMs`, which cost CPU, never tokens.
+- **Nested selectors go undescribed.** `name`, `automationId` and `role` are described once per tool;
+  the copies inside `until` are not.
+
+Responses were tightened the same way: `list_windows` is one line per window (`ref WxH@x,y title`)
+instead of three with the window class, and `capture_screen`, `annotate` and `find_ui_elements` dropped
+the boilerplate that repeated their own descriptions.
 
 ### Resources and prompts
 
@@ -147,11 +210,55 @@ mouse or keyboard.
 through rather than only their visible part. The pointer does not move. Re-read with
 `describe_window` afterwards: refs and rectangles change once content scrolls.
 
-`highlight_and_wait` is annotate plus wait plus clear in one call — the basic walkthrough step:
+`highlight_and_wait` is the basic walkthrough step: circle a control with the instruction, wait until
+the user has done it, and confirm it, in one call where it used to take three:
 
 ```jsonc
-{ "window": "330312", "name": "Export", "prompt": "Click Export when you are ready" }
+{
+  "window": "Paint", "name": "Export", "prompt": "2/5 Click Export",
+  "until": { "condition": "appears", "role": "window", "name": "Save as" }
+}
 ```
+
+With `until`, the overlay stays click-through: the user operates the application normally, and the call
+returns once the UI reaches that state. Without `until`, it waits for a confirming click instead, and
+**that click is captured by the overlay, so the application never receives it**. Click mode is for
+"show me which one", not for operating the app.
+
+What makes a step trustworthy:
+
+- **An `until` that is already true cannot confirm anything.** It used to: `role: "window"` alone
+  matched any open window, so the step reported Met in 0.0 s and the agent moved on while the user was
+  still a step behind. Top-level waits now count only windows that were not open when the step began,
+  and a control-level `until` is checked before drawing: already true returns `NOT started` (pick a
+  state the user's action changes), or `Already done` when the target is gone too.
+- **`changes`** waits for a control's name, value or state to change, or, with no selector, for the
+  window's tree to change or one of its app's windows to open or close. That includes a dialog
+  another process opens for it, such as a packaged app's file picker, which the app's window owns;
+  another app's window, even one the user brings to the front, does not count. A changed tree must
+  read the same on two polls, so a window that never stops changing (a playing track's slider) is not
+  a step done when time runs out; Done takes the first changed read at the user's word. A describe the
+  app stopped answering partway through is a check that could not run, not a change. Focus moving is not
+  a change (a click focuses things), and neither is a window being minimised or restored. `until.value` matches a value or a state word (`checked`,
+  `expanded`), so "tick Dark mode" can be confirmed.
+- **A check that could not run is not a "no".** When the final check fails (the app hung, the helper
+  restarted), the result says the `until` could not be checked rather than reporting NOT met.
+- **The result says what changed.** An `After:` block lists windows opened or closed since the step
+  began, the actionable rows of a new dialog (capped, with a snapshotId), or a capped diff of the step's
+  window, so the agent rarely needs a describe_window between steps. A step that is NOT met gets a digest
+  instead of a guess about the name: what opened, what is in front, and whether the target is still
+  there, scrolled away or covered.
+- **On success the circle turns into a green check for a second** rather than vanishing, so the user
+  knows the step registered during the seconds the model takes to plan the next one.
+- **`then:`** hands over a known path in one call. Each step needs an `until`, the next step's window
+  defaults to whatever the last `until` matched, and the plan stops at the first step that is not met,
+  with one line per step.
+- **A prompt that starts with `n/N`** ("2/5 Click Export") is progress: the overlay and the panel show
+  it as a pill, and the last step, once met, shows "All N steps done". A convention rather than a
+  parameter, so it costs nothing in the tool list.
+
+Every outcome names what was circled and where (`Circled "Export" [button], top-left of "Paint"`), and
+a step clears only its own drawings.
 
 ### Sequencing with `wait_for_element`
 
@@ -162,9 +269,14 @@ how long the app takes:
 { "condition": "appears", "name": "Export complete", "window": "330312", "timeoutMs": 120000 }
 ```
 
-Conditions are `appears`, `disappears` (a spinner finishing, a dialog closing) and `enabled`. On
-success it returns the matching control's ref, ready to anchor to. On timeout it returns `met:false`
-rather than erroring, so the agent can decide whether to escalate to a screenshot.
+Conditions are `appears`, `disappears` (a spinner finishing, a dialog closing) and `enabled`, matched by
+`name`, `role` or `automationId`. On success it returns the matching control's row, ready to anchor to.
+On timeout it returns `NOT met` rather than erroring, so the agent can decide what to do next.
+
+Searches see disabled controls. They used not to: the helper's base condition was `IsEnabled=true`, so
+a button greying out counted as `disappears` and a disabled one could never `appear`. An `enabled` wait
+on a role alone also used to stop at the first match, which could be a disabled control while an
+enabled one existed.
 
 `timeoutMs: 0` checks once and returns immediately — that is the assertion form, answering
 "is Export disabled?" in a few tokens rather than returning a tree to reason over. It is the same
@@ -180,35 +292,139 @@ Polling happens in the Electron process, not the helper: the helper is single-th
 it would freeze the anchor tracker so annotations would stop following their targets. This costs CPU,
 never tokens.
 
+## Talking back
+
+A blocked tool call is the only channel an agent in a terminal has, and while it blocked, the user had no
+way to say "I can't find it": they watched a pulsing circle for two minutes. Now there is one **pending
+step** at a time ([steps.ts](../src/main/steps.ts)), shared by every client, and every way the user can
+answer it ends the same tool call:
+
+| Where | Done | Can't find it | Skip | Other |
+|---|---|---|---|---|
+| Step strip on screen | button | button | button | choice buttons |
+| Panel card | button | button | button | a typed reply; keys 1-4 for choices; Show me |
+| Keyboard | Ctrl+Shift+F9 | Ctrl+Shift+F10 | | Esc (click mode only) |
+
+The strip is the only interactive part of an otherwise click-through overlay. The renderer hit-tests
+forwarded mouse moves against its rectangle, and the main process lets that one window take clicks only
+while the pointer is over it, with a timer that restores click-through if the pointer leaves unseen. The
+step keys are registered only while a step is pending, and only the ones that registered are shown.
+Escape is grabbed only in click mode: during a watched step the user is in their app, where Escape
+closes dialogs. The Done and Can't-find-it keys are grabbed only during watched steps, for the same
+reason in reverse: a click request or a question is answered by pointing or choosing. Messages from the
+overlay name the step they were shown for, so a click meant for a step that was just replaced never
+answers the new one. The panel card's **Show me** replays the ping on the target and re-reads the
+prompt.
+
+A step always resolves, never rejects, and every result leads with a status word the server
+instructions teach: `Met`, `NOT met`, `NOT started`, `DONE`, `STUCK`, `SKIPPED`, `REPLIED`, `CHOSE`,
+`CANCELLED`, `NO RESPONSE`, `PARTIAL` ([answers.ts](../src/main/mcp/tools/answers.ts)). None is an
+error. Escape and silence are the user's answer, and reporting them as tool failures made models repeat
+the same instruction at someone who had just said no. Done re-checks the `until` before reporting Met;
+STUCK says whether the target is hidden, scrolled away or covered.
+
+A step also ends when the client gives up. The MCP request's abort signal (Esc in Claude Code, a client
+timeout) ends it at once instead of leaving the overlay waiting, which in click mode used to mean every
+click on every monitor was swallowed until the timeout. Long waits send a progress notification every
+10 s when the client asked for progress, so a client that resets its timeout on progress keeps the call
+alive. The endpoint answers GET with 405: a stateless server never pushes, and a parked GET stream
+counted as an active request for as long as a client stayed connected. A newer step supersedes an older one,
+and Ctrl+Shift+X clears the screen and ends the step.
+
+`wait_for_user_click` names what the user pointed at (`-> "Export As…" [menuitem] el_44 in "Paint"`)
+through UI Automation's ElementFromPoint, so a correction needs no describe and no geometry.
+`show_message {options}` asks a multiple-choice question that is answered on screen or in the panel.
+
+## Drawing guidance people can follow
+
+- **Captions never cover their target.** Placement tries above, right, left and below (below last for
+  menus and tabs, whose menus open downward), avoiding the target, other captions and the step strip.
+  Long text wraps to three lines, and a caption moved away from its target gets a leader line. It used
+  to flip *into* the target at the top of the screen: the most common first step, "Click File".
+- **Rings fit wide controls.** An ellipse inscribed in a padded 416x40 text field cut through both ends;
+  wide targets get a rounded rectangle whose radius always encloses the corners.
+- **An attention ping instead of an endless pulse:** expanding rings when a step appears, moves or comes
+  back, and every 15 s, with nothing animating in between, so the render loop stops. With reduced
+  motion, a thicker static halo. The caption no longer fades with the ring.
+- **Halo strokes and a contrast-checked palette.** The old red was about 1.1:1 against mid-grey UI.
+- **Drawings follow targets across monitors.** They are drawn on every display they touch, point at the
+  edge when the target is off every display, and say on the other displays where the step is.
+- **A target behind another window** is drawn dashed with "behind Chrome", and the agent is told,
+  instead of a confident circle on the covering window. **A scrolled-out target** gets a pointer rather
+  than a ring on unrelated UI, and `scroll_window {name}` brings it into view.
+- **The overlay's own UI moves out of the way.** The step strip docks away from the target, the panel
+  dodges to a free corner when a drawing lands under it (never while focused or in use), and a
+  spotlight never dims the panel.
+- **Old drawings fade.** After ten minutes with no agent activity and no pending step, drawings with no
+  expiry are drawn faded and the panel offers to clear them; targets gone for ten minutes are retired
+  rather than resurrected hours later.
+
+## Reading what is really there
+
+- **Name matching ranks matches.** Exact (ignoring case, `&` mnemonics and a trailing `…`) beats
+  starts-with beats contains, so `name: "Save"` circles Save rather than whichever of "Save as…" and
+  "Autosave" came first in tree order. An ambiguous name says what else it matched; a miss returns the
+  closest names (never drawn), or, when the control is inside a collapsed menu or an unselected tab,
+  what to open first.
+- **Menus and dropdowns are separate windows.** Win32 menus, WPF and XAML flyouts and most dropdowns
+  are top-level popups of the app's process, outside a search rooted at the app's window, so step 2 of
+  almost every walkthrough ("click File", then "Save as") stalled for the full timeout. Searches and
+  describes now look in the window's visible same-process popups first. A popup has to belong to the
+  window: a menu created by its thread, a window it owns, or one strictly overlapping it. Shell windows
+  (the taskbar, the desktop) never count, which matters for Explorer, whose process owns both. A
+  control in a popup is measured for coverage against that popup, and a submenu opened from its menu
+  does not count as covering it, nor does an open dropdown around one of its own rows (Chromium lists
+  a `<select>`'s options in the page's tree); the app's own dropdown over a button in its main window
+  does. A
+  drawing on a menu item is re-found when the menu reopens, not reported as its app closing.
+- **describe_window's budget counts the rows it prints**, not the unnamed wrappers it walked past, and
+  it says when it stopped and which subtrees it never reached. Long lists are cut short in the walk
+  itself (eight rows of a run, plus any row that is selected, expanded or holds the focus, then a
+  count of the rest), so the budget reaches the buttons after them. Rows skipped this way are not
+  read, so `since=` and a `changes` step that saw nothing say so, and point at naming the row. A control that vanishes mid-walk ends only its
+  own branch; only a timeout or a dead provider stops the walk. Open popups get their own share of the budget. Rows carry state words
+  (`checked`, `expanded`, `selected`, `focused`), and the diff reports them
+  (`~ Dark mode [checkbox] unchecked -> checked`).
+- **Window blockers have names.** A minimised window can still be named by title, with a note. One on
+  another virtual desktop, one running as administrator (UIPI blocks reading it) and one not responding
+  are marked as such, instead of failing as "not open" or "no accessibility provider".
+- **read_text reads the window it was asked about**, rendered by PrintWindow as capture_screen does,
+  and falls back to a screen crop with a warning when the render fails or comes back blank.
+- **Fewer cross-process calls.** Property reads are batched with UI Automation cache requests (with a
+  live read on any error, but not after a timeout or a dead provider), and bounded connection and
+  transaction timeouts stop a hung app from wedging the single-threaded helper. The anchor tracker's
+  calls are held to one second, under its own deadline, and skip a window Windows reports as hung.
+
 ## Anchored annotations — drawings that follow their target
 
 Fixed coordinates go stale the moment a window moves. Pass an `anchor` and they stop being fixed:
 
 ```jsonc
 {
-  "anchor": { "kind": "element", "ref": "el_7" },   // from find_ui_elements
-  "shapes": [{ "type": "circle", "fit": true, "pad": 10, "text": "click here" }]
+  "anchor": { "window": "Notepad", "name": "Save" },
+  "shapes": [{ "type": "circle", "pad": 10, "text": "click here" }]
 }
 ```
 
-`fit: true` snaps the shape to the target's own rectangle. Without it, `x`/`y`/`width`/`height` are
-offsets from the target's top-left in physical pixels. Either way a background tracker re-reads the
+A rectangle shape with no size snaps to the target's own rectangle, grown by `pad`. Given a size,
+`x`/`y`/`width`/`height` are offsets from the target's top-left in physical pixels. Either way a background tracker re-reads the
 target's rectangle every 120 ms and moves the drawing with it, across monitors if need be. If the
 target closes or is minimised the annotation hides itself, and reappears if the target comes back.
 
-Three anchor kinds, increasing in robustness:
+Three anchor forms, increasing in robustness. The kind is inferred from what is given (an explicit
+`kind` is still accepted):
 
 | Anchor | Survives | Use when |
 |---|---|---|
-| `window` (ref from `list_windows`) | the window moving | pointing at a region of an app |
-| `element` (ref from `find_ui_elements`) | moving, resizing **and** relayout | pointing at a specific control |
-| `name` (`{kind:"name", window, name}` or `automationId`) | all of the above, **plus the control being recreated** | almost always |
+| `{window}` | the window moving | pointing at a region of an app |
+| `{ref}` (a ref from `describe_window` or `find_ui_elements`) | moving, resizing **and** relayout | pointing at a specific control |
+| `{window, name}` (or `automationId`, `role`) | all of the above, **plus the control being recreated** | almost always |
 
 Prefer `automationId` over `name` when the app sets one: it is the app's own handle, so it survives
 relabelling and translation where a name match does not. `describe_window` and `find_ui_elements`
 show `id=...` on rows that have one — on VS Code, 12 of 92 rows do.
 
-`kind: "name"` resolves the selector and draws in **one call**, replacing the
+A `{window, name}` anchor resolves the selector and draws in **one call**, replacing the
 find_ui_elements-read-result-then-annotate round trip. It also stores the selector, so when the ref
 stops resolving the tracker re-finds the control by name (throttled to every 2 s, since that costs a
 tree search). That is what lets an anchored drawing survive a helper restart, and it is the first
@@ -219,6 +435,13 @@ screenshot, ask for it by name and get its exact rectangle. Coverage is good for
 and surprisingly good for Electron ones (VS Code exposes ~2800 nodes), thinner for browser *page*
 content, and absent for canvas and game UIs — so reading coordinates off a screenshot remains the
 fallback, not a deprecated path.
+
+Roles are the short names of all 41 UIA control types (`button`, `slider`, `menu`, `dataitem`, …, plus
+aliases such as `textbox` and `dialog`). The helper used to name twenty, and the gaps failed silently in
+both directions: a slider came back as `[other]`, and filtering by an unlisted role dropped the filter
+and matched every control with the right name. An unknown role is now an error that lists the real ones,
+so the agent learns the vocabulary from the one call that needed it rather than from every tool
+description.
 
 ## Coordinates — the part that usually breaks
 
@@ -243,6 +466,21 @@ tagged with the `captureId`:
 shape lands in the wrong place, the bug is in that one file.
 
 Verified working on a 2560×1440 display at 1.25× scaling captured down to 1200×675.
+
+### The default capture size
+
+The contract only holds if the model sees the image at the size it was written. A model API that
+receives an image over its limit shrinks it first, and the model then reads coordinates in the shrunken
+image while `space:"image"` interprets them in ours. Claude models before the high-resolution generation
+rescale anything over **1568px on the long edge or ~1.15 megapixels**; the old default capped only the
+edge, and a 16:9 frame at 1568px wide is 1.38MP, so on those models every coordinate came back 7-9%
+short.
+
+The default now fits both limits — a 1920×1080 display captures at 1430×804 — which also cuts a
+screenshot from ~1.8k to ~1.5k tokens. High-resolution models (Opus 4.7 and later, Sonnet 5 and later)
+accept up to 2576px with 1:1 coordinates; pass `maxDimension` to use that, and the area cap no longer
+applies. A downscaled capture says so in its response, since that is the usual reason small text is
+unreadable.
 
 ---
 
@@ -284,6 +522,13 @@ It is deliberately restricted: it may use the overlay tools plus `Read`, `Glob` 
 `Bash`, `Write`, `Edit` and everything else are refused by `canUseTool` in
 [src/main/agent/claude.ts](../src/main/agent/claude.ts). The panel is for guiding you around your
 screen, not for editing your machine.
+
+The overlay half of that allow-list is `TOOL_NAMES` from [tools.ts](../src/main/mcp/tools.ts), not a
+copy. The copy it replaced had drifted: it named `list_displays`, which no longer existed, and left out
+nine tools that did, so the panel was refused `describe_window` and every other cheap way to read the
+screen — while its system prompt told it to start every task with a screenshot. The panel's prompt now
+carries only what is specific to the panel and defers to the MCP server's instructions for the rest, so
+there is one place that describes how to use the tools.
 
 ## Following a session from your editor
 
@@ -330,8 +575,17 @@ typing into the panel directly.
 | `SCREEN_OVERLAY_CWD` | your home dir | Working directory for the panel's agent |
 | `SCREEN_OVERLAY_SHOW_IN_CAPTURE` | unset | Set to `1` to make annotations visible in screen recordings and shares |
 
-Preferences set from the tray menu (start at login, capture visibility) persist in
-`%APPDATA%\screen-mcp-overlay\settings.json`. An env var always wins for that run.
+Preferences persist in `%APPDATA%\screen-mcp-overlay\settings.json`; an env var always wins for that
+run. The tray menu sets most of them:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `openAtLogin` | `false` | Start with Windows (the panel stays closed) |
+| `showInCapture` | `false` | Annotations appear in screen recordings and shares |
+| `readStepsAloud` | `false` | Speak each step's instruction when it appears (local voices only) |
+| `speechRate` | `1` | Rate for spoken steps and `show_message {speak}` |
+| `soundCues` | `false` | A short tone when a step starts and when it is done |
+| `stepKeys` | `Control+Shift+F9`, `Control+Shift+F10` | Done and Can't-find-it keys while a step is pending; empty disables one |
 
 ---
 
@@ -368,7 +622,8 @@ npm run dist           # installer + portable exe
 npm run dist:dir       # unpacked app only, for quick checks
 
 node scripts/smoke.mjs         # end-to-end MCP client test against a running overlay
-npm test                       # 30 unit tests: coordinate geometry + tree keys and diffing
+npm test                       # 71 tests: geometry, tree keys and diffing, window matching, and every
+                               # MCP tool end to end against a fake helper (runs on any OS)
 node scripts/anchor-check.mjs  # anchors a box to a window, moves it, checks the box follows
 node scripts/describe-check.mjs # describe_window vs screenshot cost, selector anchors
 node scripts/wait-check.mjs    # wait_for_element against a real app opening and closing
@@ -391,7 +646,7 @@ node scripts/visual-check.mjs  # draw calibration markers, then re-capture to ey
 native/
   uia-helper/  Rust: window enumeration + UI Automation queries (JSON lines over stdio)
 src/
-  shared/      types, coordinate conversion, UI-tree keys and diffing (all pure, all tested)
+  shared/      types, coordinate conversion, UI-tree keys and diffing, window matching (pure, tested)
   main/        Electron main: displays, capture, overlay windows, store, clicks
                uia.ts (helper client) + anchors.ts (the tracking loop)
     mcp/       HTTP MCP server + tool definitions
@@ -400,7 +655,14 @@ src/
   renderer/
     overlay/   canvas that draws the annotations
     hud/       chat panel
+test/
+  support/     Electron stub + harness that bundles the real MCP server for Node
 ```
+
+`npm test` runs on any OS. The tool tests drive the real server and every handler; only the helper
+process is replaced, through `useHelperTransport` in [uia.ts](../src/main/uia.ts), by canned responses.
+The Rust helper's own tests (`cargo test`) need Windows; elsewhere,
+`cargo check --tests --target x86_64-pc-windows-gnu` at least compiles them.
 
 ---
 
@@ -430,6 +692,13 @@ display refresh rate forever; it now only loops while something is actually anim
 tracker polled at a fixed 120 ms whether or not anything moved; it now backs off to 600 ms after
 eight quiet ticks and snaps straight back on any change, so drag latency stays imperceptible.
 
+The helper's element cache was the third, slower leak. Every ref it hands out keeps a COM reference to
+the element alive, which pins memory in the *target application's* accessibility provider as well as
+in the helper, and nothing was ever evicted: a describe adds up to a thousand, and a fifteen-minute
+`wait_for_element` adds a few on every poll. It is now capped at 5,000 with least-recently-used eviction.
+The anchor tracker re-reads its refs on every tick, which counts as use, so a ref with a drawing on it is
+never the one evicted.
+
 Worth naming because the obvious fix was the wrong one: UIA event subscriptions
 (`AddAutomationEventHandler`) were the planned answer, and would have meant COM apartment threading
 in the helper. Measuring first showed the helper's own CPU was **unmeasurable — 0.00s over 10
@@ -438,7 +707,20 @@ without touching COM.
 
 ## Status
 
-v0.1. Working and verified end to end on Windows 11. Not yet done:
+v0.1. The base was verified end to end on Windows 11. Not yet done:
+
+- **The guidance pass is not yet verified on Windows.** It was built and tested off Windows: the
+  TypeScript against a fake helper, the Rust helper compiled for Windows but not run. Check first:
+  popup discovery per toolkit (classic Win32 menus, WPF, WinUI/XAML, Electron); that the step strip
+  takes clicks only under the pointer and the overlay never stays interactive; the speed of
+  cache-request batching against the old per-property reads; ScrollItemPattern and ScrollPattern
+  stepping; `covered` sampling with the panel on top; elevation and hang detection; and that the
+  bounded UIA timeouts never cut off a slow but healthy app. `scripts/describe-check.mjs`,
+  `delta-check.mjs` and `smoke.mjs` exercise much of it.
+- **Event-driven waits** — waits poll (400-500 ms; `changes` on a whole window at most once a second
+  over 80 nodes). UIA event subscriptions would cut latency further, but they mean COM event handlers
+  on UIA's own threads writing into a single-threaded helper, which cannot be tested off Windows and
+  would take every tool down if it deadlocked. Deferred until polling is measured to be the problem.
 
 - **Signing** — the installer and portable exe are unsigned, so SmartScreen will warn on first run
   ("More info" -> "Run anyway"). This needs a purchased code-signing certificate; there is no code
@@ -454,16 +736,18 @@ v0.1. Working and verified end to end on Windows 11. Not yet done:
 - **macOS / Linux** — the architecture is cross-platform and Electron handles most of it, but
   `WDA_EXCLUDEFROMCAPTURE` is Windows-only. macOS `setContentProtection` maps to
   `NSWindowSharingNone`; Linux has no equivalent and would need hide-then-capture.
-- **Wider test coverage** — `npm test` covers the two pure modules where the subtle bugs live:
-  `geometry.ts` (14 cases) and `uitree.ts` (16 cases — structural keys, the ancestor-rename
-  regression, diff classification, tree diagnosis). The scripts in `scripts/` are still manual, and
-  the Rust helper has no tests.
+- **Wider test coverage** — `npm test` covers the pure modules where the subtle bugs live (geometry,
+  tree keys and diffing, window matching, caption layout), the step core and the panel's step plumbing,
+  and the whole MCP tool layer against a fake helper, with budgets on the tool list and the
+  instructions. The Rust helper's pure logic (ranking, similarity, coverage sampling, blank-render
+  detection, roles) has `#[cfg(test)]` tests that run on Windows. The scripts in `scripts/` are still
+  manual.
 - **Qt/QML coverage is unverified.** The diagnosis distinguishes "no provider" from "frame only", but
   no Qt application has actually been tested against it. Worth checking before relying on a
   tree-driven walkthrough of one, rather than discovering it mid-walkthrough.
 - **Port conflicts** — if a foreign process holds 7777 you get a panel message and nothing works.
   Falling back to an ephemeral port and rewriting the registered config would be better.
-- **Cross-run anchors** — `kind:"name"` selectors now survive a helper restart, but element refs
+- **Cross-run anchors** — `{window, name}` selectors now survive a helper restart, but element refs
   still die with the app. Stable `AutomationId`s on your own controls would make selectors exact
   rather than fuzzy name matches, and immune to localisation and label edits. Persisting a *selector*
   (window title + control name + role) and re-resolving it on a later run would let a saved

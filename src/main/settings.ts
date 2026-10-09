@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 /**
  * A tiny preferences file in userData. Deliberately not electron-store: there
- * are three booleans and adding a dependency for them is not worth it.
+ * are a handful of flags and adding a dependency for them is not worth it.
  */
 
 export interface Settings {
@@ -20,13 +20,31 @@ export interface Settings {
      * so the URLs written into agent configs keep working across restarts.
      */
     token: string;
+    /** Read each step's instruction aloud when it appears. */
+    readStepsAloud: boolean;
+    /** Speech rate for steps read aloud, 0.5 to 2. */
+    speechRate: number;
+    /** A short sound when a step starts and when it is done. */
+    soundCues: boolean;
+    /**
+     * Global accelerators (Electron syntax) for answering a pending step,
+     * registered only while one is pending. Empty string disables one.
+     */
+    stepKeys: { done: string; stuck: string };
 }
 
 const DEFAULTS: Settings = {
     openAtLogin: false,
     startHidden: false,
     showInCapture: process.env.SCREEN_OVERLAY_SHOW_IN_CAPTURE === '1',
-    token: ''
+    token: '',
+    readStepsAloud: false,
+    speechRate: 1,
+    soundCues: false,
+    // Chords nothing common claims. Ctrl+Shift+H is VS Code's Replace in Files,
+    // Ctrl+Shift+Enter is an array formula in Excel, and Ctrl+Alt chords are
+    // AltGr on many European layouts, where they type characters.
+    stepKeys: { done: 'Control+Shift+F9', stuck: 'Control+Shift+F10' }
 };
 
 let cache: Settings | undefined;
@@ -39,9 +57,9 @@ export function settings(): Settings {
     if (cache) return cache;
     let loaded: Settings;
     try {
-        loaded = { ...DEFAULTS, ...JSON.parse(readFileSync(file(), 'utf8')) };
+        loaded = normalizeSettings(JSON.parse(readFileSync(file(), 'utf8')));
     } catch {
-        loaded = { ...DEFAULTS };
+        loaded = normalizeSettings(undefined);
     }
     // An env var always wins over the stored preference for this run.
     if (process.env.SCREEN_OVERLAY_SHOW_IN_CAPTURE === '1') loaded.showInCapture = true;
@@ -57,6 +75,36 @@ export function settings(): Settings {
     }
     cache = loaded;
     return loaded;
+}
+
+/**
+ * Settings as stored, checked field by field. The file is edited by hand, and
+ * a value of the wrong type used to reach code that trusted it: a chord written
+ * as null to switch it off (the documented way is an empty string) threw from
+ * the tray and from step-key registration, which left steps that could never
+ * be answered. A field that is missing or of the wrong type gets its default,
+ * the rest of the file still counts, and a file that sets only one chord keeps
+ * the default for the other.
+ */
+export function normalizeSettings(stored: unknown): Settings {
+    const s = stored && typeof stored === 'object' ? (stored as Record<string, unknown>) : {};
+    const keys = s.stepKeys && typeof s.stepKeys === 'object' ? (s.stepKeys as Record<string, unknown>) : {};
+    const flag = (name: 'openAtLogin' | 'startHidden' | 'showInCapture' | 'readStepsAloud' | 'soundCues'): boolean =>
+        typeof s[name] === 'boolean' ? (s[name] as boolean) : DEFAULTS[name];
+    // null is what someone writes to switch a key off, so it counts as "".
+    const chord = (name: 'done' | 'stuck'): string =>
+        typeof keys[name] === 'string' ? (keys[name] as string) : keys[name] === null ? '' : DEFAULTS.stepKeys[name];
+    const rate = typeof s.speechRate === 'number' && Number.isFinite(s.speechRate) ? s.speechRate : DEFAULTS.speechRate;
+    return {
+        openAtLogin: flag('openAtLogin'),
+        startHidden: flag('startHidden'),
+        showInCapture: flag('showInCapture'),
+        token: typeof s.token === 'string' ? s.token : DEFAULTS.token,
+        readStepsAloud: flag('readStepsAloud'),
+        speechRate: Math.min(2, Math.max(0.5, rate)),
+        soundCues: flag('soundCues'),
+        stepKeys: { done: chord('done'), stuck: chord('stuck') }
+    };
 }
 
 export function updateSettings(patch: Partial<Settings>): Settings {

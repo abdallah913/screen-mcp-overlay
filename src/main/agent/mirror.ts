@@ -2,6 +2,7 @@ import { readdirSync, statSync, unwatchFile, watchFile, createReadStream } from 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { HudRole } from '../../shared/types.js';
+import { SELF_LOGGING, summarise } from './summary.js';
 
 /**
  * Live-mirrors a Claude Code session from an editor into the overlay panel.
@@ -81,11 +82,12 @@ export function renderEntry(entry: unknown): MirroredMessage[] {
     if (!Array.isArray(content)) return out;
 
     for (const raw of content) {
-        const block = raw as { type?: string; text?: string; name?: string; content?: unknown };
+        const block = raw as { type?: string; text?: string; name?: string; input?: unknown; content?: unknown };
         if (block.type === 'text' && block.text?.trim()) {
             out.push({ role: e.type === 'user' ? 'user' : 'assistant', text: block.text.trim() });
-        } else if (block.type === 'tool_use' && block.name) {
-            out.push({ role: 'tool', text: `⚙ ${block.name}` });
+        } else if (block.type === 'tool_use' && block.name && !SELF_LOGGING.test(block.name)) {
+            // The step tools already show as a step card or guidance line.
+            out.push({ role: 'tool', text: summarise(block.name, block.input) });
         }
         // tool_result blocks are skipped: they are the bulk of a transcript and
         // reading them back adds noise without telling the user anything new.
