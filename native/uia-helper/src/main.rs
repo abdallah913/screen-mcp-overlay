@@ -80,6 +80,11 @@ struct Request {
     /// compares describes, and focus moving alone must not read as a change.
     #[serde(default)]
     ignore_focus: bool,
+    /// covered: the target is a list, tree or menu row, which an open
+    /// dropdown draws in its own popup even when the app reports the row in
+    /// its main window's tree.
+    #[serde(default)]
+    row: bool,
 }
 
 #[derive(Serialize)]
@@ -224,7 +229,7 @@ fn main() {
             "covered" => match parse_hwnd(req.window.as_deref()) {
                 Ok(h) => {
                     let hud = req.hud.as_deref().and_then(|r| parse_hwnd(Some(r)).ok());
-                    reply(req.id, winops::covered(h, req.rect, ignore_pid(&req), hud))
+                    reply(req.id, winops::covered(h, req.rect, ignore_pid(&req), hud, req.row))
                 }
                 Err(e) => reply::<()>(req.id, Err(e)),
             },

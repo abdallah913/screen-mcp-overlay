@@ -147,10 +147,11 @@ function scrollReport(notches: number, before?: number, after?: number): string 
     }
     // Three notches move a long document well under 1%, so whole percents
     // would read as nothing moved: as many decimals as tell the two apart.
+    // The helper waits for both to settle, so any difference is real movement.
     let places = 0;
-    while (places < 2 && before.toFixed(places) === after.toFixed(places)) places += 1;
+    while (places < 4 && before.toFixed(places) === after.toFixed(places)) places += 1;
     const pct = (v: number): string => `${Number(v.toFixed(places))}%`;
-    if (Math.abs(after - before) < 0.01) {
+    if (after === before) {
         return (
             `Scrolled ${notches} notch(es), but nothing moved (still at ${pct(after)}): it is already at the end, ` +
             'or the app ignores wheel messages without the pointer over it. Ask the user to scroll.'

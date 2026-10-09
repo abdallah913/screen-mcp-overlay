@@ -274,7 +274,15 @@ test('while every step target is hidden, the strip says what it is waiting for',
     // A menu that closed: the window is still there, so the control is named.
     const menuItem = { ref: 'el_9', label: 'Save As…', app: 'Notepad' };
     assert.match(waitingNote(step, [anchored(menuItem)]), /^Waiting for “Save As…” to come back: it is no longer on screen/);
-    assert.match(waitingNote(step, [anchored({ ...menuItem, label: '' })]), /^Waiting for “Notepad”/, 'a control with no name: its window');
+    assert.equal(
+        waitingNote(step, [anchored({ ...menuItem, label: '' })]),
+        'Waiting for the target in “Notepad” to come back: it is no longer on screen.',
+        'a control with no name: where it was, not as if the window had gone'
+    );
+    const row = { ref: 'el_5', label: `Alice Smith, Re: Q3 budget, ${'attached is the draft '.repeat(10)}2:14 PM`, app: 'Mail' };
+    const note = waitingNote(step, [anchored(row)]);
+    assert.ok(note.length < 120, note);
+    assert.match(note, /^Waiting for “Alice Smith, Re: Q3 budget, attached is.*…” to come back/);
     // A bare ref nothing was known about: no name, no title, and never the ref.
     assert.equal(waitingNote(step, [anchored({ ref: 'el_4', label: '' }, { hiddenReason: 'closed' })]), 'Waiting for the app to come back: it was closed.');
     assert.match(waitingNote(step, [anchored({ ref: 'el_4', label: '' })]), /^Waiting for the target/);

@@ -171,6 +171,25 @@ test('a truncated describe names the subtrees it never reached', async () => {
     assert.match(text, /\(truncated: the walk stopped at maxNodes before reaching "File name", "Buttons"\./);
 });
 
+test('a describe the app stopped answering says so, not "raise maxNodes"', async () => {
+    const desktop = fakeDesktop();
+    fakeHelper({ describe: () => ({ nodes: desktop.tree.slice(0, 2), truncated: false, unanswered: true }) }, desktop);
+    const { text } = await call('describe_window', { window: 'Notepad' });
+    assert.match(text, /\(the app stopped answering partway, so this is only part of the window: describe it again once it responds\)/);
+    assert.equal(/maxNodes/.test(text), false, text);
+});
+
+test('coverage of a list row tells the helper it is a row', async () => {
+    const desktop = fakeDesktop();
+    desktop.controls = [control('el_4', 'PDF', { role: 'listitem' }), control('el_5', 'Export')];
+    const { calls } = fakeHelper({}, desktop);
+    await call('annotate', { anchor: { window: 'Notepad', name: 'PDF' }, shapes: [{ type: 'circle' }] });
+    await call('annotate', { anchor: { window: 'Notepad', name: 'Export' }, shapes: [{ type: 'circle' }] });
+    const rows = calls.filter(c => c.op === 'covered').map(c => c.params.row);
+    // A dropdown's option is drawn in its popup; a button under that popup is covered by it.
+    assert.deepEqual(rows, [true, false]);
+});
+
 test('describe rows show state, popups and offscreen rows', async () => {
     const desktop = fakeDesktop();
     desktop.tree.push(

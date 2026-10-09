@@ -255,9 +255,10 @@ const PANEL = "the overlay's chat panel";
  * every menu step would warn that the item is behind its menu.
  */
 async function coverageOf(windowRef: string, rect: Rect, controlRef?: string): Promise<Coverage | null> {
-    const top = (controlRef && knownControl(controlRef)?.top) || windowRef;
+    const known = controlRef ? knownControl(controlRef) : undefined;
+    const top = known?.top || windowRef;
     try {
-        return await coverage(top, rect);
+        return await coverage(top, rect, known?.selector.role);
     } catch {
         // Best effort: a failed read must not cost the step.
         return null;
@@ -366,7 +367,9 @@ async function clickLine(c: ClickResult, i: number): Promise<string> {
 async function snapshotOf(windowRef: string): Promise<{ id: string; nodes: SnapshotNode[] } | undefined> {
     try {
         // The same budget as describe_window's default, so since= diffs line up.
-        const { nodes } = await describeWindow({ window: windowRef, maxNodes: 120 });
+        const { nodes, unanswered } = await describeWindow({ window: windowRef, maxNodes: 120 });
+        // Part of the window would diff as rows removed that are still there.
+        if (unanswered) return undefined;
         const snap = toSnapshotNodes(nodes);
         const id = store.recordSnapshot({ id: store.nextId('snap'), windowRef, at: Date.now(), nodes: snap });
         return { id, nodes: snap };
@@ -517,8 +520,12 @@ async function failureDigest(ctx: {
     if (status && !(ctx.warnedCovered && status.startsWith('WARNING:'))) out.push(status);
 
     let changed = false;
+    // Whether the window was read at both ends: an app that stopped answering
+    // leaves only the window list to go on.
+    let compared = false;
     if (ctx.start) {
         const snap = await snapshotOf(ctx.windowRef);
+        compared = Boolean(snap);
         const diff = snap && diffLines(ctx.start.nodes, snap.nodes);
         if (diff) {
             changed = true;
@@ -537,7 +544,7 @@ async function failureDigest(ctx: {
         );
     } else if (!changed && !closed.length) {
         // Without a snapshot only the window list was watched, so say just that.
-        const what = ctx.start ? 'Nothing changed' : 'No window opened or closed';
+        const what = compared ? 'Nothing changed' : 'No window opened or closed';
         out.push(`${what}: the user may still be working or looking elsewhere; rephrase rather than repeat.`);
     } else if (!top) {
         out.push('The control may be named differently; describe_window shows what is there.');
@@ -848,7 +855,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
                     'with its name, or ask the user to scroll.'
             );
         }
-        const c = await coverageOf(target.top ?? windowRef, target.rect);
+        const c = await coverageOf(target.top ?? windowRef, target.rect, target.ref);
         const covered = c && coveredNote(c, target.what, windowTitle);
         if (covered) {
             warnings.push(covered);
@@ -952,7 +959,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         // Done, or the step's own clock running out: give the UI one last
         // look, so a state that arrived a moment ago still counts.
         const lastLook = answer.kind === 'done' || answer.kind === 'timeout';
-        if (lastLook) last.abort();
+        if (lastLook) last.abort(answer.kind);
         else stop.abort();
         const settled = await waiting;
         if (lastLook) {

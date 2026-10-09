@@ -722,21 +722,31 @@ test('an unselected "changes" ignores a window minimised, and windows of other a
     assert.equal(/- window 200/.test(text), false, 'a minimised window is not reported closed');
 });
 
-test('an unselected "changes" counts a dialog another process opens in front of the app', async () => {
+/** Run an unselected "changes" step while `extra` opens in front of Notepad. */
+async function changesWith(extra, timeoutMs) {
     const desktop = fakeDesktop();
     let lists = 0;
-    // A packaged app's file picker belongs to PickerHost, not to the app.
-    const picker = { ...desktop.windows[1], ref: '800', title: 'Open', pid: 98, rect: rect(300, 250, 400, 300), foreground: true };
     fakeHelper(
         {
             find_elements: finder(() => []),
             list_windows: () =>
-                ++lists > 3 ? [{ ...desktop.windows[0], foreground: false }, ...desktop.windows.slice(1), picker] : desktop.windows
+                ++lists > 3 ? [{ ...desktop.windows[0], foreground: false }, ...desktop.windows.slice(1), extra] : desktop.windows
         },
         desktop
     );
-    const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs: 5000 });
-    assert.match(text, /^Met: "changes" after [\d.]+s\.\nOpen \[window\]/);
+    return (await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs })).text;
+}
+
+test('an unselected "changes" counts a dialog another process opens for the app', async () => {
+    // A packaged app's file picker belongs to PickerHost, but Notepad's window owns it.
+    const picker = { ...fakeDesktop().windows[1], ref: '800', title: 'Open', pid: 98, rect: rect(300, 250, 400, 300), foreground: true, owner: '100' };
+    assert.match(await changesWith(picker, 5000), /^Met: "changes" after [\d.]+s\.\nOpen \[window\]/);
+});
+
+test('an unselected "changes" ignores another app the user brings up in front', async () => {
+    // Win+E over a maximised Notepad: in front, but nobody's dialog.
+    const explorer = { ...fakeDesktop().windows[1], ref: '810', title: 'File Explorer', pid: 97, rect: rect(300, 250, 400, 300), foreground: true };
+    assert.match(await changesWith(explorer, 2500), /^NOT met: "changes" did not happen/);
 });
 
 test('a window that never stops changing does not meet "changes" when the step times out', async () => {
@@ -747,6 +757,21 @@ test('a window that never stops changing does not meet "changes" when the step t
     fakeHelper({ find_elements: finder(() => []), describe: () => ({ nodes: ticking(), truncated: false }) }, desktop);
     const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs: 2500 });
     assert.match(text, /^NOT met: "changes" did not happen/);
+});
+
+test('a describe the app stopped answering partway is not a change', async () => {
+    const desktop = fakeDesktop();
+    let reads = 0;
+    fakeHelper(
+        {
+            find_elements: finder(() => []),
+            // Every read after the first two comes back cut short, every time.
+            describe: () => (++reads > 2 ? { nodes: desktop.tree.slice(0, 1), truncated: false, unanswered: true } : { nodes: desktop.tree, truncated: false })
+        },
+        desktop
+    );
+    const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs: 2500 });
+    assert.equal(/^Met/.test(text), false, text);
 });
 
 test('restoring a minimised window does not meet a window until', async () => {

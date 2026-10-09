@@ -31,6 +31,8 @@ export interface WindowInfo {
     elevated: boolean;
     /** Not responding. */
     hung: boolean;
+    /** The window that owns this one, possibly another process's. */
+    owner?: string;
 }
 
 export interface ElementInfo {
@@ -78,6 +80,8 @@ export interface Described {
     nodes: DescribedNode[];
     /** The node budget ran out before the walk finished. */
     truncated: boolean;
+    /** The app stopped answering partway, so the rows are only part of it. */
+    unanswered?: boolean;
     /** Names of the first subtrees the walk never reached. */
     unvisited?: string[];
 }
@@ -523,12 +527,18 @@ export function setHudWindowRef(ref: string | undefined): void {
     hudRef = ref;
 }
 
+/** Rows a dropdown or menu draws in its own popup, whichever tree the app reports them in. */
+const ROW_ROLES = new Set(['listitem', 'menuitem', 'treeitem', 'dataitem']);
+
 /**
  * How much of a window, or of a rect in it (virtual-screen physical), is hidden
- * behind other top-level windows, the chat panel included.
+ * behind other top-level windows, the chat panel included. A row's `role` lets
+ * an open dropdown around it count as where it is drawn, not as covering it.
  */
-export function coverage(window: string, rect?: Rect): Promise<Coverage> {
-    return send<Coverage>('covered', { window, rect, ignore_pid: process.pid, hud: hudRef }, 4000);
+export function coverage(window: string, rect?: Rect, role?: string): Promise<Coverage> {
+    // An agent's own spelling ("list item") counts as the helper's ("listitem").
+    const row = role !== undefined && ROW_ROLES.has(role.toLowerCase().replace(/[\s_-]/g, ''));
+    return send<Coverage>('covered', { window, rect, ignore_pid: process.pid, hud: hudRef, row }, 4000);
 }
 
 /** Collapsed expandable controls in a window: where a control that matched nothing may be. */

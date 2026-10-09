@@ -544,6 +544,13 @@ fn is_desktop(root: HWND) -> bool {
     shell || class_of(root) == "WorkerW"
 }
 
+fn encloses(outer: &Rect, inner: &Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x + inner.width <= outer.x + outer.width
+        && inner.y + inner.height <= outer.y + outer.height
+}
+
 fn contains(r: &Rect, x: i32, y: i32) -> bool {
     x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height
 }
@@ -645,7 +652,7 @@ fn covering_name(hwnd: HWND, hud: Option<HWND>) -> String {
 /// forward, which closes the menu. A main window's own dropdown is not: an
 /// autocomplete list hanging over the circled Submit button hides it from the
 /// user like any other window, and the user would aim at the list entry.
-pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND>) -> Result<Coverage, String> {
+pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND>, row: bool) -> Result<Coverage, String> {
     if !exists(hwnd) {
         return Err(CLOSED.into());
     }
@@ -666,8 +673,19 @@ pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND
     }
 
     let ours = Ours { pid: ignore_pid, hud };
-    let chain: Vec<isize> =
-        if is_popup(target) { popups_of(target).into_iter().map(|(h, _)| h.0 as isize).collect() } else { Vec::new() };
+    // A target in a menu shares it with the submenus opened from it. A row of
+    // an open dropdown lives in the dropdown's popup even when the app lists
+    // it in its main window's tree (Chromium's <select>, a combo box's list),
+    // so a popup wholly around a row is where it is drawn. Anything else of
+    // the app's under its own dropdown, a button under an autocomplete list,
+    // is covered by it.
+    let chain: Vec<isize> = if is_popup(target) {
+        popups_of(target).into_iter().map(|(h, _)| h.0 as isize).collect()
+    } else if row {
+        popups_of(target).into_iter().filter(|(_, r)| encloses(r, &area)).map(|(h, _)| h.0 as isize).collect()
+    } else {
+        Vec::new()
+    };
     let samples: Vec<Sample> = grid_points(&area)
         .into_iter()
         .map(|(x, y)| match root_at(x, y, ours) {
@@ -785,6 +803,16 @@ mod tests {
         let (fraction, _, by) = tally(&samples);
         assert!(fraction > 0.5);
         assert_eq!(by, vec![5]);
+    }
+
+    #[test]
+    fn a_dropdown_row_lives_in_the_popup_around_it() {
+        let list = Rect { x: 100, y: 200, width: 300, height: 400 };
+        let option = Rect { x: 110, y: 240, width: 280, height: 24 };
+        assert!(encloses(&list, &option));
+        // A button the list only hangs over is not drawn in it.
+        let button = Rect { x: 90, y: 580, width: 80, height: 30 };
+        assert!(!encloses(&list, &button));
     }
 
     #[test]

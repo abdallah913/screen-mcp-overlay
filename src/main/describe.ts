@@ -39,6 +39,9 @@ async function lookup(opts: DescribeOptions): Promise<WindowInfo | undefined> {
  * exist; naming the subtrees never reached tells it where to search instead.
  */
 function truncationNote(d: Described): string {
+    if (d.unanswered) {
+        return '\n(the app stopped answering partway, so this is only part of the window: describe it again once it responds)';
+    }
     if (!d.truncated) return '';
     const names = (d.unvisited ?? []).map(n => `"${clean(n)}"`).filter(n => n !== '""');
     const where = names.length

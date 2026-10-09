@@ -18,8 +18,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    EnumWindows, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
 };
 
 use crate::model::{Rect, WindowInfo};
@@ -238,6 +238,10 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _: LPARAM) -> BOOL {
         cloaked: is_cloaked(hwnd),
         elevated: is_elevated(pid),
         hung: is_hung(hwnd),
+        owner: GetWindow(hwnd, GW_OWNER)
+            .ok()
+            .filter(|o| !o.is_invalid())
+            .map(|o| format!("{}", o.0 as isize)),
     });
     TRUE
 }

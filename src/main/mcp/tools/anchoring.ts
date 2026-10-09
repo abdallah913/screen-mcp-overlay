@@ -350,7 +350,7 @@ async function described(
     const window = selector?.window ?? info?.ref;
     const covered =
         window && !found.offscreen
-            ? await coverage(found.window ?? window, found.rect).then(coverVerdict).catch(() => null)
+            ? await coverage(found.window ?? window, found.rect, found.role).then(coverVerdict).catch(() => null)
             : null;
 
     return {

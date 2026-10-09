@@ -34,6 +34,10 @@ pub struct WindowInfo {
     pub elevated: bool,
     /// Not responding (IsHungAppWindow).
     pub hung: bool,
+    /// The window that owns this one, which may be another process's: a
+    /// packaged app's file picker is owned by the app window that opened it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// The control that contains a hidden match: what must be opened first.
@@ -119,6 +123,9 @@ pub struct DescribedNode {
 pub struct Described {
     pub nodes: Vec<DescribedNode>,
     pub truncated: bool,
+    /// The app stopped answering partway, so the rows are only part of it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unanswered: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unvisited: Vec<String>,
 }

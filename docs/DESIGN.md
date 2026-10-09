@@ -234,9 +234,11 @@ What makes a step trustworthy:
   state the user's action changes), or `Already done` when the target is gone too.
 - **`changes`** waits for a control's name, value or state to change, or, with no selector, for the
   window's tree to change or one of its app's windows to open or close. That includes a dialog
-  another process opens in front of it, such as a packaged app's file picker; a window another app
-  opens behind it, like a reminder, does not count. A changed tree must read the same twice, so a
-  window that never stops changing (a playing track's slider) is not a step done. Focus moving is not
+  another process opens for it, such as a packaged app's file picker, which the app's window owns;
+  another app's window, even one the user brings to the front, does not count. A changed tree must
+  read the same on two polls, so a window that never stops changing (a playing track's slider) is not
+  a step done when time runs out; Done takes the first changed read at the user's word. A describe the
+  app stopped answering partway through is a check that could not run, not a change. Focus moving is not
   a change (a click focuses things), and neither is a window being minimised or restored. `until.value` matches a value or a state word (`checked`,
   `expanded`), so "tick Dark mode" can be confirmed.
 - **A check that could not run is not a "no".** When the final check fails (the app hung, the helper
@@ -371,7 +373,9 @@ through UI Automation's ElementFromPoint, so a correction needs no describe and 
   window: a menu created by its thread, a window it owns, or one strictly overlapping it. Shell windows
   (the taskbar, the desktop) never count, which matters for Explorer, whose process owns both. A
   control in a popup is measured for coverage against that popup, and a submenu opened from its menu
-  does not count as covering it; the app's own dropdown over a control in its main window does. A
+  does not count as covering it, nor does an open dropdown around one of its own rows (Chromium lists
+  a `<select>`'s options in the page's tree); the app's own dropdown over a button in its main window
+  does. A
   drawing on a menu item is re-found when the menu reopens, not reported as its app closing.
 - **describe_window's budget counts the rows it prints**, not the unnamed wrappers it walked past, and
   it says when it stopped and which subtrees it never reached. Long lists are cut short in the walk

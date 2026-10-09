@@ -169,8 +169,9 @@ const AWAY: Record<NonNullable<Annotation['hiddenReason']>, string> = {
  *
  * A minimised, closed or other-desktop target took its window with it, so the
  * window is named; one that is simply gone (a menu that closed) is named itself,
- * else its window. Names come from the anchor's own fields, never its ref: a
- * user has no idea what "el_3" or "0x1A2B" is.
+ * and its window only says where it was: that window is still on screen. Names
+ * come from the anchor's own fields, never its ref: a user has no idea what
+ * "el_3" or "0x1A2B" is.
  */
 export function waitingNote(step: StepView | null, annotations: Annotation[]): string | undefined {
     if (!step) return undefined;
@@ -178,9 +179,20 @@ export function waitingNote(step: StepView | null, annotations: Annotation[]): s
     if (targets.length === 0 || targets.some(a => !a.hidden)) return undefined;
     const a = targets[0]!;
     const reason = a.hiddenReason ?? 'gone';
-    const name = (reason === 'gone' ? a.anchor?.label || a.anchor?.app : a.anchor?.app)?.trim();
-    const subject = name ? `“${name}”` : reason === 'gone' ? 'the target' : 'the app';
+    const label = quoted(a.anchor?.label);
+    const app = quoted(a.anchor?.app);
+    const subject =
+        reason !== 'gone' ? (app ?? 'the app') : (label ?? (app ? `the target in ${app}` : 'the target'));
     return `Waiting for ${subject} to come back: ${AWAY[reason]}`;
+}
+
+/** Long enough for a window title; a mail row's name can run to hundreds of characters. */
+const NOTE_NAME_MAX = 60;
+
+function quoted(name: string | undefined): string | undefined {
+    const t = name?.trim().replace(/\s+/g, ' ');
+    if (!t) return undefined;
+    return `“${t.length > NOTE_NAME_MAX ? `${t.slice(0, NOTE_NAME_MAX - 1).trimEnd()}…` : t}”`;
 }
 
 /**

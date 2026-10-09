@@ -1075,9 +1075,7 @@ impl Session {
                 if w.rows.len() == at + 1 && w.rows[at].name.trim().is_empty() {
                     w.rows.truncate(at);
                 }
-                // A call that went unanswered cuts the walk short without
-                // spending its budget.
-                w.truncated |= w.stopped || w.unreachable.get();
+                w.truncated |= w.stopped;
                 w.stopped = false;
             }
             // A popup's provider can disconnect as the popup closes, which
@@ -1094,11 +1092,14 @@ impl Session {
         w.top_rect = rect_of(hwnd_of(raw));
         w.pass(max_nodes, max_nodes, EXTRA_WALK_TIME);
         self.walk(&mut w, &root, 1);
-        let truncated = w.truncated || w.stopped || w.unreachable.get();
+        // An app that stopped answering cut the walk short without spending
+        // its budget: "raise maxNodes" would be the wrong advice for it.
+        let unanswered = w.unreachable.get();
+        let truncated = w.truncated || w.stopped;
         // Naming what was missed means asking the app again, which an app
         // that stopped answering would make wait out the timeout per name.
-        let unvisited = if truncated && !w.unreachable.get() { w.unvisited() } else { Vec::new() };
-        Ok(Described { nodes: w.rows, truncated, unvisited })
+        let unvisited = if truncated && !unanswered { w.unvisited() } else { Vec::new() };
+        Ok(Described { nodes: w.rows, truncated, unanswered, unvisited })
     }
 
     /// Re-read current rectangles. This is the tracker's hot path, and the

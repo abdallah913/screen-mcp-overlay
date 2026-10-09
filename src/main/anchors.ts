@@ -354,7 +354,11 @@ async function refreshCoverage(
         const key = `${window}|${spec.ref}`;
         let verdict = byTarget.get(key);
         if (!verdict) {
-            verdict = coverage(window, spec.kind === 'window' ? undefined : live.rect)
+            verdict = coverage(
+                window,
+                spec.kind === 'window' ? undefined : live.rect,
+                spec.kind === 'window' ? undefined : (knownControl(spec.ref)?.selector.role ?? spec.selector?.role)
+            )
                 .then(coverVerdict)
                 .catch(() => undefined);
             byTarget.set(key, verdict);

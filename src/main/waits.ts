@@ -1,6 +1,5 @@
 import type { SnapshotNode } from '../shared/types.js';
 import { toSnapshotNodes, type TreeRow } from '../shared/uitree.js';
-import { rectContains } from '../shared/geometry.js';
 import {
     describeWindow,
     findElements,
@@ -50,7 +49,10 @@ export interface WaitRequest {
     baseline?: WindowInfo[];
     /** Stop at once: the request went away, or the user answered the step. */
     signal?: AbortSignal;
-    /** Check once more right now, then return: the user says they are done. */
+    /**
+     * Check once more right now, then return. Aborted with reason 'done' when
+     * the user says they are done, which a debounce may take at their word.
+     */
     lastCheck?: AbortSignal;
     /** Asked between checks; a reason ends the wait unmet. */
     giveUp?: () => string | null;
@@ -195,8 +197,6 @@ export function windowSignature(nodes: DescribedNode[]): string {
 /** Small: a "changes" check re-reads the window every poll, and the tracker shares the helper. */
 const CHANGES_MAX_NODES = 80;
 const CHANGES_MIN_POLL_MS = 1000;
-/** Before the final look's second read: long enough for a redraw to settle. */
-const FINAL_SETTLE_MS = 300;
 
 /**
  * One check: `hit` is the satisfying control (null when success has no
@@ -208,10 +208,10 @@ interface Probe {
 }
 
 /**
- * `final` is the check whose answer stands: the user pressed Done, or time ran
- * out. A debounce that wants a second look cannot have one then.
+ * `final` is the check whose answer stands, and why: the user pressed Done,
+ * or time ran out. A debounce that wants a second look cannot have one then.
  */
-type Check = ((final: boolean) => Promise<Probe>) & { slow?: boolean };
+type Check = ((final: false | 'done' | 'timeout') => Promise<Probe>) & { slow?: boolean };
 
 const refList = (refs: Iterable<string>): string => [...refs].sort().join(',');
 
@@ -224,20 +224,15 @@ function opened(windows: WindowInfo[], before: string): Probe {
 
 /**
  * A window another process opened for the step's app, if one came up: a
- * packaged app's file picker or "Open with" is not the app's own process. It
- * counts when it is in front and centred over the app's window, as a dialog
- * is; one that opens behind, like a reminder, is not the user's doing.
+ * packaged app's file picker or "Open with" is not the app's own process, but
+ * the app's window owns it. A window the user opens from the taskbar has no
+ * such owner, so it is not the step done.
  */
 function openedFor(windows: WindowInfo[], before: Set<string>, home: string): WindowInfo | undefined {
-    const app = windows.find(w => w.ref === home);
-    if (!app) return undefined;
-    return windows.find(
-        w =>
-            w.foreground &&
-            w.pid !== app.pid &&
-            !before.has(w.ref) &&
-            rectContains(app.rect, { x: w.rect.x + w.rect.width / 2, y: w.rect.y + w.rect.height / 2 })
-    );
+    const pid = windows.find(w => w.ref === home)?.pid;
+    if (pid === undefined) return undefined;
+    const app = new Set(windows.filter(w => w.pid === pid).map(w => w.ref));
+    return windows.find(w => w.pid !== pid && w.owner !== undefined && app.has(w.owner) && !before.has(w.ref));
 }
 
 /** Windows whose title contains `needle`, or all of them. */
@@ -321,8 +316,13 @@ function makeCheck(req: WaitRequest): Check {
     let everyWindow = req.baseline ? new Set(req.baseline.map(w => w.ref)) : undefined;
     // Focus is left out: the user switching into the app moves it, and so
     // would decide which rows of a long list the helper keeps.
-    const signature = async (): Promise<string> =>
-        windowSignature((await describeWindow({ window: req.window!, maxNodes: CHANGES_MAX_NODES, ignoreFocus: true })).nodes);
+    const signature = async (): Promise<string> => {
+        const d = await describeWindow({ window: req.window!, maxNodes: CHANGES_MAX_NODES, ignoreFocus: true });
+        // Part of a tree differs from the whole one without anything changing:
+        // a check that could not run, not a change.
+        if (d.unanswered) throw new Error('the app stopped answering');
+        return windowSignature(d.nodes);
+    };
     const check: Check = async final => {
         const all = await listAllWindows();
         everyWindow ??= new Set(all.map(w => w.ref));
@@ -338,15 +338,11 @@ function makeCheck(req: WaitRequest): Check {
             pending = undefined;
             return { hit: false };
         }
-        if (pending === sig) return { hit: null };
-        if (final) {
-            // The user pressing Done a moment after their change is the normal
-            // case, so the last look takes its second sighting now rather than
-            // at the next poll. A window that never stops changing (a playing
-            // track's slider, a live log) must not read as the step done.
-            await pause(FINAL_SETTLE_MS, [req.signal]);
-            return { hit: (await signature()) === sig ? null : false };
-        }
+        // Done a moment after the change is the normal case, so the user's word
+        // stands in for the second sighting. Time running out says nothing of
+        // the kind: a window that never stops changing (a playing track's
+        // slider, a live log) must not read as the step done.
+        if (pending === sig || final === 'done') return { hit: null };
         pending = sig;
         return { hit: false };
     };
@@ -411,7 +407,8 @@ export async function waitForElement(req: WaitRequest): Promise<WaitOutcome> {
 
         let hit: ElementInfo | null | false = false;
         try {
-            const probe = await unlessAborted(check(final), req.signal);
+            const why = !final ? false : last && req.lastCheck?.reason === 'done' ? 'done' : 'timeout';
+            const probe = await unlessAborted(check(why), req.signal);
             if (probe === undefined) return { met: false, waitedMs: elapsed(), polls, ended: 'aborted' };
             hit = probe.hit;
             seen = probe.seen;
