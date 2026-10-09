@@ -45,7 +45,7 @@ export function registerAct(server: McpServer): void {
             title: 'Scroll a window',
             description:
                 'Scroll a window by wheel notches without moving the pointer, or bring the control named by ' +
-                'name/automationId/role into view. Refs and rects change afterwards.',
+                'name/automationId (role narrows it) into view. Refs and rects change afterwards.',
             inputSchema: {
                 window: z.string().describe(WINDOW),
                 notches: z.number().int().min(-30).max(30).default(-3).describe('Negative scrolls down.'),
@@ -60,7 +60,15 @@ export function registerAct(server: McpServer): void {
                 const blocker = w.window && windowBlocker(w.window, 'scroll');
                 if (blocker) throw new Error(blocker);
 
-                if (args.name || args.automationId || args.role) {
+                // "The first button" is no place to scroll to, and the helper
+                // finds a control to scroll into view by name or id only.
+                if (args.role && !args.name && !args.automationId) {
+                    throw new Error(
+                        'role only narrows name or automationId: give one of those to bring a control into view, ' +
+                            'or omit role to scroll by notches'
+                    );
+                }
+                if (args.name || args.automationId) {
                     // UIA's ScrollItemPattern scrolls the right pane by exactly
                     // enough, which wheel notches at the window centre cannot.
                     // It moves the view, like the wheel; it never clicks.

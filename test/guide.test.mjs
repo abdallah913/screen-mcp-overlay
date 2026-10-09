@@ -416,6 +416,17 @@ test('enabled reports a control that is there but disabled', async () => {
 
 const pointed = { window: 'Notepad', name: 'Save', prompt: 'Click Save', timeoutMs: 60000 };
 
+test('a click step whose circle is cleared ends instead of taking the next click', async () => {
+    fakeHelper();
+    const { result, step } = await pending('highlight_and_wait', pointed);
+    // Another client clears the drawing: nothing is left to click.
+    store.clear([step.targetIds[0]]);
+    const { text, isError } = await result;
+    assert.equal(isError, false);
+    assert.match(text, /^NOT done: the circle was cleared before the user clicked, so the user could not click it\./);
+    assert.equal(currentStep(), null, 'the overlay no longer takes clicks');
+});
+
 test('a click on the circle is the target, and leaves a check mark', async () => {
     fakeHelper();
     const { result, step } = await pending('highlight_and_wait', pointed);
@@ -551,6 +562,39 @@ test('then runs the steps in order with n/N progress, one line per step', async 
     assert.match(lines[0], /^Step 1\/2: Met: "appears" after [\d.]+s\. Circled "File" \[menuitem\]/);
     assert.match(lines[1], /^Step 2\/2: Met: "appears" after/);
     assert.equal(store.list().filter(a => a.type === 'circle').length, 0);
+});
+
+test('a plan numbers its steps itself, whatever prefix a prompt carried', async () => {
+    const met = new Set();
+    fakeHelper({
+        find_elements: p => {
+            if (['File', 'Save as'].includes(p.name)) return [{ ...save, name: p.name, role: 'menuitem' }];
+            if (met.has(p.name)) return [saved];
+            met.add(p.name);
+            return [];
+        }
+    });
+    const prompts = [];
+    const labels = [];
+    const onStep = () => currentStep() && prompts.push(currentStep().prompt);
+    const listen = () => store.list().forEach(a => a.text && /steps done/.test(a.text) && labels.push(a.text));
+    store.on('step', onStep);
+    store.on('annotations', listen);
+    const { text } = await call('highlight_and_wait', {
+        window: 'Notepad',
+        name: 'File',
+        // "1/1" with a step after it would mark the walkthrough done after step 1.
+        prompt: '1/1 Open the File menu',
+        until: { condition: 'appears', name: 'Menu open' },
+        then: [{ name: 'Save as', prompt: '5/5 Click Save as', until: { condition: 'appears', name: 'Dialog open' } }],
+        timeoutMs: 5000
+    });
+    store.off('step', onStep);
+    store.off('annotations', listen);
+    assert.deepEqual([...new Set(prompts)], ['1/2 Open the File menu', '2/2 Click Save as']);
+    assert.match(text, /^Step 1\/2: Met/);
+    assert.match(text, /\nStep 2\/2: Met/);
+    assert.equal(labels.some(l => /All 1 steps done/.test(l)), false, labels.join(' | '));
 });
 
 test('then stops at the first step that is not met', async () => {
@@ -781,6 +825,66 @@ test('a "changes" step that saw nothing says which long-list rows it could not r
     const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs: 1500 });
     assert.match(text, /^NOT met: "changes" did not happen/);
     assert.match(text, /\n40 row\(s\) of long lists were not read; to watch one, name it in until\./);
+});
+
+test('a change the user makes while the step is being drawn still counts', async () => {
+    const desktop = fakeDesktop();
+    let changed = false;
+    fakeHelper(
+        {
+            find_elements: finder(() => []),
+            describe: p => {
+                // The step's own snapshot is the read after the baseline: the
+                // user, quick on a slow app, has acted by then.
+                if (p.max_nodes === 120) changed = true;
+                return {
+                    nodes: changed ? [...desktop.tree, { depth: 2, ref: 'el_20', name: 'Bold', role: 'checkbox', enabled: true, rect: rect(1, 1, 1, 1) }] : desktop.tree,
+                    truncated: false
+                };
+            }
+        },
+        desktop
+    );
+    const { result } = await pending('highlight_and_wait', { ...watched, until: { condition: 'changes' } });
+    answerStep({ kind: 'done' });
+    assert.match((await result).text, /^Met: "changes"/);
+});
+
+test('a change to a control made while the step is being drawn still counts', async () => {
+    let state = 'unchecked';
+    fakeHelper({
+        find_elements: finder(p => (p.name === 'Dark mode' ? [{ ref: 'el_7', name: 'Dark mode', role: 'checkbox', state, rect: rect(1, 1, 1, 1), enabled: true }] : [])),
+        describe: p => {
+            if (p.max_nodes === 120) state = 'checked';
+            return { nodes: fakeDesktop().tree, truncated: false };
+        }
+    });
+    const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes', name: 'Dark mode' }, timeoutMs: 3000 });
+    assert.match(text, /^Met: "changes"/);
+});
+
+test('a digest written while the helper is failing does not report every window closed', async () => {
+    const desktop = fakeDesktop();
+    let failing = false;
+    const fail = () => {
+        throw new Error('UI Automation helper timed out after 8000ms');
+    };
+    fakeHelper(
+        {
+            find_elements: finder(() => (failing ? fail() : [])),
+            list_windows: () => (failing ? fail() : desktop.windows)
+        },
+        desktop
+    );
+    const { result } = await pending('highlight_and_wait', watched);
+    await new Promise(r => setTimeout(r, 100));
+    failing = true;
+    answerStep({ kind: 'done' });
+    const { text, isError } = await result;
+    assert.equal(isError, false);
+    assert.match(text, /could not be checked/);
+    assert.equal(/^- window /m.test(text), false, text);
+    assert.equal(/Since the step began|No window opened or closed|named differently/.test(text), false, text);
 });
 
 test('restoring a minimised window does not meet a window until', async () => {

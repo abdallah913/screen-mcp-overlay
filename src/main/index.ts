@@ -116,7 +116,10 @@ function publishStatus(): void {
 }
 
 function registerIpc(): void {
+    // The panel's Clear button is the same panic button as Ctrl+Shift+X: a
+    // click step left without its circle would take the next click anywhere.
     ipcMain.handle('app:clear-annotations', () => {
+        cancelStep('clear');
         store.clear();
     });
     ipcMain.handle('app:copy-mcp-url', () => {

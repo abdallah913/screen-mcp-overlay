@@ -56,6 +56,12 @@ export interface WaitRequest {
     lastCheck?: AbortSignal;
     /** Asked between checks; a reason ends the wait unmet. */
     giveUp?: () => string | null;
+    /**
+     * For "changes" on a control or a window's tree: what it looked like
+     * before the user was shown the step (see changesBaseline). Without it
+     * the first poll sets the baseline, which may already hold the change.
+     */
+    since?: string;
 }
 
 export interface WaitOutcome {
@@ -123,7 +129,7 @@ export function isTopLevelWait(
     return req.role === 'window' || (req.condition === 'changes' && !req.name && !req.role);
 }
 
-function hasSelector(req: WaitRequest): boolean {
+function hasSelector(req: Pick<WaitRequest, 'name' | 'role' | 'automationId'>): boolean {
     return Boolean(req.name || req.role || req.automationId);
 }
 
@@ -135,7 +141,9 @@ const asElement = (w: WindowInfo): ElementInfo => ({
     enabled: true
 });
 
-function controlMatches(req: WaitRequest): Promise<ElementInfo[]> {
+type Selected = Pick<WaitRequest, 'condition' | 'window' | 'name' | 'role' | 'automationId' | 'value'>;
+
+function controlMatches(req: Selected): Promise<ElementInfo[]> {
     // "Any control of this role appeared" can short-circuit on the first match,
     // which turns a whole-tree walk into an early exit. "enabled" cannot: the
     // first match may be a disabled one while an enabled one exists, and nor
@@ -235,6 +243,33 @@ function openedFor(windows: WindowInfo[], before: Set<string>, home: string): Wi
     return windows.find(w => w.pid !== pid && w.owner !== undefined && app.has(w.owner) && !before.has(w.ref));
 }
 
+/** A window's tree, as a whole-window "changes" compares it. */
+async function treeChangesSignature(window: string): Promise<string> {
+    // Focus is left out: the user switching into the app moves it, and so
+    // would decide which rows of a long list the helper keeps.
+    const d = await describeWindow({ window, maxNodes: CHANGES_MAX_NODES, ignoreFocus: true });
+    // Part of a tree differs from the whole one without anything changing:
+    // a check that could not run, not a change.
+    if (d.unanswered) throw new Error('the app stopped answering');
+    return windowSignature(d.nodes);
+}
+
+/**
+ * What a "changes" wait compares against, read before the step is shown: a
+ * user quick to act on a slow app would otherwise have their change folded
+ * into the first poll's baseline, and the step would wait for a second one.
+ * Undefined when there is nothing to read, or the read failed (the first poll
+ * sets it then, as before).
+ */
+export async function changesBaseline(req: Selected): Promise<string | undefined> {
+    if (req.condition !== 'changes' || isTopLevelWait(req) || (!req.window && !hasSelector(req))) return undefined;
+    try {
+        return hasSelector(req) ? controlSignature(await controlMatches(req)) : await treeChangesSignature(req.window!);
+    } catch {
+        return undefined;
+    }
+}
+
 /** Windows whose title contains `needle`, or all of them. */
 const titled = (windows: WindowInfo[], needle: string | undefined): WindowInfo[] =>
     needle ? windows.filter(w => w.title.toLowerCase().includes(needle)) : windows;
@@ -288,7 +323,7 @@ function makeCheck(req: WaitRequest): Check {
     }
 
     if (hasSelector(req)) {
-        let before: string | undefined;
+        let before = req.since;
         return async () => {
             const matches = await controlMatches(req);
             const now = controlSignature(matches);
@@ -310,19 +345,11 @@ function makeCheck(req: WaitRequest): Check {
         }
         return list.filter(sameApp);
     };
-    let tree: string | undefined;
+    let tree = req.since;
     let pending: string | undefined;
     let windows = req.baseline ? refList(appWindows(req.baseline).map(w => w.ref)) : undefined;
     let everyWindow = req.baseline ? new Set(req.baseline.map(w => w.ref)) : undefined;
-    // Focus is left out: the user switching into the app moves it, and so
-    // would decide which rows of a long list the helper keeps.
-    const signature = async (): Promise<string> => {
-        const d = await describeWindow({ window: req.window!, maxNodes: CHANGES_MAX_NODES, ignoreFocus: true });
-        // Part of a tree differs from the whole one without anything changing:
-        // a check that could not run, not a change.
-        if (d.unanswered) throw new Error('the app stopped answering');
-        return windowSignature(d.nodes);
-    };
+    const signature = (): Promise<string> => treeChangesSignature(req.window!);
     const check: Check = async final => {
         const all = await listAllWindows();
         everyWindow ??= new Set(all.map(w => w.ref));

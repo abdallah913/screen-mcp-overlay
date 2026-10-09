@@ -313,6 +313,17 @@ test('a dead ref whose selector now matches several look-alikes is not guessed',
 
 // --- scrolling and hidden drawings ---------------------------------------------------
 
+test('scroll_window takes role only to narrow a name', async () => {
+    const { calls } = fakeHelper();
+    const { text, isError } = await call('scroll_window', { window: 'Notepad', role: 'button' });
+    assert.equal(isError, true);
+    assert.match(text, /role only narrows name or automationId/);
+    assert.equal(calls.some(c => c.op === 'scroll_into_view' || c.op === 'scroll_window'), false);
+    const narrowed = await call('scroll_window', { window: 'Notepad', name: 'Export', role: 'button' });
+    assert.match(narrowed.text, /^Scrolled into view: Export \[button\]/);
+    assert.equal(calls.find(c => c.op === 'scroll_into_view').params.role, 'button');
+});
+
 test('scroll_window says how far the view moved', async () => {
     fakeHelper({ scroll_window: () => ({ scrolled: true, before: 0, after: 31.4 }) });
     const { text } = await call('scroll_window', { window: 'Notepad', notches: -3 });

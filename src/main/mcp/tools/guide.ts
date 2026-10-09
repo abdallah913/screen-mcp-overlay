@@ -23,7 +23,14 @@ import {
     type PointHit,
     type WindowInfo
 } from '../../uia.js';
-import { isTopLevelWait, waitForElement, type WaitCondition, type WaitOutcome, type WaitRequest } from '../../waits.js';
+import {
+    changesBaseline,
+    isTopLevelWait,
+    waitForElement,
+    type WaitCondition,
+    type WaitOutcome,
+    type WaitRequest
+} from '../../waits.js';
 import { answerText } from './answers.js';
 import { CONDITIONS, DEFAULT_COLORS, WINDOW, guarded, isWindowRole, selectorFields, text } from './common.js';
 import { anchorNotes, placeAnchored, resolveAnchor, type ResolvedAnchor } from './anchoring.js';
@@ -502,18 +509,19 @@ async function failureDigest(ctx: {
     warnedCovered?: boolean;
 }): Promise<string> {
     const out: string[] = [];
-    let now: WindowInfo[] = [];
+    let now: WindowInfo[] | undefined;
     try {
         now = await listAllWindows();
     } catch {
-        // Leave the window part out rather than fail the report.
+        // Leave the window part out rather than fail the report: against an
+        // empty list, every window would read as closed.
     }
-    const delta = windowDelta(ctx.before, now);
+    const delta = now ? windowDelta(ctx.before, now) : { opened: [], closed: [], minimized: [] };
     const { closed } = delta;
     const opened = delta.opened.filter(onScreen);
     const listed = windowLines(delta);
     if (listed.length) out.push(`Since the step began:\n${listed.join('\n')}`);
-    const front = now.find(w => w.foreground);
+    const front = now?.find(w => w.foreground);
     if (front) out.push(`Foreground: ${quote(front.title)}.`);
 
     const status = await targetStatus(ctx.circleId, ctx.windowRef, ctx.windowTitle);
@@ -544,6 +552,9 @@ async function failureDigest(ctx: {
                 : `A new window ${quote(w.title)} appeared; if the control is in it, pass ` +
                   `until.window:${JSON.stringify(clean(w.title))}.`
         );
+    } else if (!compared && !now) {
+        // Neither the window nor the window list could be read: nothing is
+        // known to have changed or not, so say nothing either way.
     } else if (!changed && !closed.length) {
         // Without a snapshot only the window list was watched, so say just that.
         const what = compared ? 'Nothing changed' : 'No window opened or closed';
@@ -874,6 +885,14 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         if (elsewhere) warnings.push(elsewhere);
     }
 
+    // What "changes" compares against, and the After block's starting point,
+    // are read before the user is shown the step: one quick to act on a slow
+    // app would otherwise have their change taken as how things started.
+    const since = plan ? await changesBaseline(plan) : undefined;
+    // A snapshot of the step window, for the After block and the failure
+    // digest; only when the until searches that window, since it costs a describe.
+    const start = plan && plan.window === windowRef && !isTopLevelWait(plan) ? await snapshotOf(windowRef) : undefined;
+
     let drawn: Annotation[] = [];
     if (target) {
         drawn = placeAnchored(target, [{ type: 'circle', fit: true, pad: 8, pulse: true, text: spec.prompt }], {
@@ -895,10 +914,6 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
     };
     // With keep, the circle outlives the step, but it is still this step's.
     const ours = new Set(drawn.map(a => a.id));
-
-    // A snapshot of the step window, for the After block and the failure
-    // digest; only when the until searches that window, since it costs a describe.
-    const start = plan && plan.window === windowRef && !isTopLevelWait(plan) ? await snapshotOf(windowRef) : undefined;
 
     const progress = parseProgress(spec.prompt);
     // A walkthrough's last step, when it is met, closes the whole walkthrough on screen.
@@ -925,7 +940,17 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
             goneFor = gone?.() ?? null;
             if (goneFor) step.end();
         });
+        // Cleared by another client, or retired by the tracker: with nothing
+        // to point at, the next click anywhere would read as the target.
+        const removed = (): void => {
+            if (circleId && !store.list().some(x => x.id === circleId)) {
+                goneFor ??= 'the circle was cleared before the user clicked';
+                step.end();
+            }
+        };
+        store.on('annotations', removed);
         const a = await step.answer;
+        store.off('annotations', removed);
         const stretch = stopWatching();
         const waited = Date.now() - startedAt;
         const verdict =
@@ -946,6 +971,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
     const last = new AbortController();
     const waiting = waitForElement({
         ...plan,
+        since,
         timeoutMs: opts.timeoutMs,
         pollMs: 400,
         signal: stop.signal,
@@ -1053,7 +1079,13 @@ async function clickVerdict(
     const on = named ? `, on ${named}` : '';
     // Read the live annotation: the tracker may have moved it since it was drawn.
     const circle = circleId ? store.list().find(x => x.id === circleId) : undefined;
-    if (!circle) return { ok: true, text: `The user clicked at ${where}${on}.` };
+    if (!circleId) return { ok: true, text: `The user clicked at ${where}${on}.` };
+    if (!circle) {
+        return {
+            ok: false,
+            text: `The user clicked at ${where}${on}, but the circle had been cleared by then, so it was not a click on the target.`
+        };
+    }
 
     // The circle was not drawn, so whatever they clicked, it was not the target.
     if (circle.hidden) {
@@ -1139,7 +1171,9 @@ async function runPlan(
         const label = `Step ${n}/${total}: `;
         const remaining = deadline - Date.now();
         if (i > 0 && (opts.signal.aborted || remaining < 1000)) break;
-        const prompt = parseProgress(s.prompt) ? s.prompt : `${n}/${total} ${s.prompt}`;
+        // The plan's own count wins over whatever prefix a prompt carried, so
+        // the pill, the "All N steps done" mark and the labels here agree.
+        const prompt = `${n}/${total} ${parseProgress(s.prompt)?.rest ?? s.prompt}`;
         let r: StepResult;
         try {
             r = await runStep(

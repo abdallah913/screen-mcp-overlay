@@ -69,6 +69,8 @@ export function fakeHelper(overrides = {}, desktop = fakeDesktop()) {
             return { element, window: win ? { ref: win.ref, title: win.title } : null };
         },
         scroll_into_view: p => {
+            // As the real helper: it finds what to scroll by name or id only.
+            if (!p.name && !p.automation_id) throw new Error('scroll_into_view needs a name or automationId');
             const element = controls.find(c => (p.automation_id ? c.automation_id === p.automation_id : c.name.toLowerCase().includes((p.name ?? '').toLowerCase())));
             if (!element) throw new Error('no such control');
             return { scrolled: true, element };
