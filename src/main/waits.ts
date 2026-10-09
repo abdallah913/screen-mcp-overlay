@@ -171,10 +171,24 @@ export function withoutFocus(state: string | undefined): string | undefined {
     return kept.length > 0 ? kept.join(',') : undefined;
 }
 
-/** What a selected control looks like, for "changes": gone counts as a change. */
-export function controlSignature(matches: Pick<ElementInfo, 'name' | 'value' | 'enabled' | 'state'>[]): string {
-    const m = matches[0];
-    return m ? JSON.stringify([m.name, m.value ?? '', m.enabled, withoutFocus(m.state) ?? '']) : '';
+type Looks = Pick<ElementInfo, 'name' | 'value' | 'enabled' | 'state'>;
+
+const controlKey = (m: Looks): string => JSON.stringify([m.name, m.value ?? '', m.enabled, withoutFocus(m.state) ?? '']);
+
+/**
+ * What the selected controls look like, for "changes": every match, since
+ * `role: "checkbox"` selects them all and the user may tick any one. Sorted,
+ * so the helper ranking them differently (after a scroll or a resize) is not
+ * a change; gone counts as one.
+ */
+export function controlSignature(matches: Looks[]): string {
+    return matches.length ? JSON.stringify(matches.map(controlKey).sort()) : '';
+}
+
+/** The match that is not as it was, to report as the one that changed. */
+function changedMatch(matches: ElementInfo[], before: string | undefined): ElementInfo | null {
+    const was = new Set<string>(before ? (JSON.parse(before) as string[]) : []);
+    return matches.find(m => !was.has(controlKey(m))) ?? matches[0] ?? null;
 }
 
 /**
@@ -328,7 +342,7 @@ function makeCheck(req: WaitRequest): Check {
             const matches = await controlMatches(req);
             const now = controlSignature(matches);
             before ??= now;
-            return { hit: now === before ? false : (matches[0] ?? null) };
+            return { hit: now === before ? false : changedMatch(matches, before) };
         };
     }
 

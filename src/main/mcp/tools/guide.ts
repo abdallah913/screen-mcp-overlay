@@ -1075,10 +1075,13 @@ async function clickVerdict(
     windowTitle: string
 ): Promise<{ ok: boolean; text: string }> {
     const where = `${click.physical.x},${click.physical.y} on display ${click.displayId}`;
+    // The circle as it was when the user clicked: the tracker may have moved it
+    // since it was drawn, and moves it again while the click is being named,
+    // which can take seconds on a slow app.
+    const atClick = circleId ? store.list().find(x => x.id === circleId) : undefined;
+    const circle = atClick ? { ...atClick } : undefined;
     const named = await nameClick(click);
     const on = named ? `, on ${named}` : '';
-    // Read the live annotation: the tracker may have moved it since it was drawn.
-    const circle = circleId ? store.list().find(x => x.id === circleId) : undefined;
     if (!circleId) return { ok: true, text: `The user clicked at ${where}${on}.` };
     if (!circle) {
         return {

@@ -81,14 +81,16 @@ function clampBox(b: Rect, view: Rect, margin: number): Rect {
 // ---------------------------------------------------------------- routing
 
 /**
- * The area a shape occupies. An arrow spans its tail and head; a label is a
- * point, its text placed separately.
+ * The area a shape occupies. An arrow spans its tail and head, at least 1 DIP
+ * thick: a level or upright one would otherwise have no area, read as a point
+ * at its tail, and not be drawn on the display its head crosses onto. A label
+ * is a point, its text placed separately.
  */
 export function shapeBounds(a: Annotation): Rect {
     if (a.type === 'arrow' && a.to) {
         const x = Math.min(a.rect.x, a.to.x);
         const y = Math.min(a.rect.y, a.to.y);
-        return { x, y, width: Math.abs(a.to.x - a.rect.x), height: Math.abs(a.to.y - a.rect.y) };
+        return { x, y, width: Math.max(1, Math.abs(a.to.x - a.rect.x)), height: Math.max(1, Math.abs(a.to.y - a.rect.y)) };
     }
     if (a.type === 'label') return { x: a.rect.x, y: a.rect.y, width: 0, height: 0 };
     return a.rect;

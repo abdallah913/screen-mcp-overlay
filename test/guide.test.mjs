@@ -377,6 +377,32 @@ test('until "changes" on a control fires when its value or state changes', async
     assert.match(text, /^Met: "changes" after/);
 });
 
+test('until "changes" on a role watches every control it matches', async () => {
+    let probes = 0;
+    const box = (ref, name, state) => ({ ref, name, role: 'checkbox', state, rect: rect(1, 1, 1, 1), enabled: true });
+    fakeHelper({
+        find_elements: finder(p => {
+            if (p.role !== 'checkbox') return [];
+            // The user ticks the second of two boxes; the first stays as it was.
+            return [box('el_6', 'Autosave', 'unchecked'), box('el_7', 'Dark mode', ++probes >= 3 ? 'checked' : 'unchecked')];
+        })
+    });
+    const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes', role: 'checkbox' }, timeoutMs: 5000 });
+    assert.match(text, /^Met: "changes" after/);
+    assert.match(text, /Dark mode \[checkbox\]/, 'names the control that changed');
+});
+
+test('until "changes" on a role is not met by the matches coming back in another order', async () => {
+    let probes = 0;
+    const boxes = [
+        { ref: 'el_6', name: 'Autosave', role: 'checkbox', state: 'unchecked', rect: rect(1, 1, 1, 1), enabled: true },
+        { ref: 'el_7', name: 'Dark mode', role: 'checkbox', state: 'checked', rect: rect(1, 1, 1, 1), enabled: true }
+    ];
+    fakeHelper({ find_elements: finder(p => (p.role === 'checkbox' ? (++probes >= 3 ? [...boxes].reverse() : boxes) : [])) });
+    const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes', role: 'checkbox' }, timeoutMs: 1500 });
+    assert.match(text, /^NOT met: "changes" did not happen/);
+});
+
 test('until "changes" without a selector fires on a dialog opening', async () => {
     const desktop = fakeDesktop();
     let lists = 0;
@@ -415,6 +441,27 @@ test('enabled reports a control that is there but disabled', async () => {
 // --- click mode ----------------------------------------------------------------
 
 const pointed = { window: 'Notepad', name: 'Save', prompt: 'Click Save', timeoutMs: 60000 };
+
+test('a click is judged against the circle where it was when the user clicked', async () => {
+    let moved = false;
+    fakeHelper({
+        element_at_point: () => {
+            // While the click is being named the app reflows, and the tracker
+            // moves the circle away from where the user clicked.
+            const [circle] = store.list().filter(a => a.type === 'circle');
+            if (circle && !moved) {
+                moved = true;
+                store.applyTracking([{ id: circle.id, displayId: circle.displayId, rect: { ...circle.rect, x: circle.rect.x + 600 }, hidden: false }]);
+            }
+            return { element: null, window: { ref: '100', title: 'Untitled - Notepad' } };
+        }
+    });
+    const { result } = await pending('highlight_and_wait', pointed);
+    addClick(click(160, 160));
+    const { text } = await result;
+    assert.ok(moved, 'the circle moved during the lookup');
+    assert.match(text, /^The user clicked the target/);
+});
 
 test('a click step whose circle is cleared ends instead of taking the next click', async () => {
     fakeHelper();

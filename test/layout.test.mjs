@@ -211,6 +211,26 @@ test('every display gets every drawing, in its own coordinates', () => {
     assert.equal(classify(shapeBounds(onD2[0]), VIEW, [{ x: -1920, y: 0, width: 1920, height: 1080 }]), 'here');
 });
 
+test('a level or upright arrow crossing onto another display is drawn there too', () => {
+    const side = new Map([
+        ['d1', { x: 0, y: 0 }],
+        ['d2', { x: 1920, y: 0 }]
+    ]);
+    const level = ann({ id: 'h', type: 'arrow', displayId: 'd1', rect: { x: 1800, y: 500, width: 0, height: 0 }, to: { x: 2100, y: 500 } });
+    const [onD2] = routeTo([level], side, { x: 1920, y: 0 });
+    assert.equal(classify(shapeBounds(onD2), VIEW, [{ x: -1920, y: 0, width: 1920, height: 1080 }]), 'here');
+    const [onD1] = routeTo([level], side, { x: 0, y: 0 });
+    assert.equal(classify(shapeBounds(onD1), VIEW, [{ x: 1920, y: 0, width: 1920, height: 1080 }]), 'here');
+
+    const stacked = new Map([
+        ['d1', { x: 0, y: 0 }],
+        ['d2', { x: 0, y: 1080 }]
+    ]);
+    const upright = ann({ id: 'v', type: 'arrow', displayId: 'd1', rect: { x: 500, y: 1000, width: 0, height: 0 }, to: { x: 500, y: 1200 } });
+    const [below] = routeTo([upright], stacked, { x: 0, y: 1080 });
+    assert.equal(classify(shapeBounds(below), VIEW, [{ x: 0, y: -1080, width: 1920, height: 1080 }]), 'here');
+});
+
 test('a shape mostly off every display is "off"; one on another monitor is "elsewhere"', () => {
     const others = [{ x: 1920, y: 0, width: 1920, height: 1080 }];
     assert.equal(classify({ x: 2000, y: 100, width: 50, height: 50 }, VIEW, others), 'elsewhere');
