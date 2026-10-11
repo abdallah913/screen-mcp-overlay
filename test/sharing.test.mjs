@@ -1,5 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
 import { fakeDesktop, fakeHelper, harness, rect } from './support/fake-helper.mjs';
 
 /*
@@ -59,11 +65,15 @@ test('asking the user shares the window they click into and confirm, and nothing
     assert.equal(sharingSummary().windows.length, 0);
     const asked = askToShare({ reason: 'to find the Save button', timeoutMs: 10_000 });
     for (let i = 0; i < 200 && !currentStep(); i += 1) await new Promise(r => setTimeout(r, 5));
-    assert.match(currentStep().prompt, /^The AI asks to see the window you need help with \(to find the Save button\)\. Click into that window/);
+    // The overlay's own request, worded as such, with the agent's reason quoted as its words.
+    assert.match(
+        currentStep().prompt,
+        /^Screen MCP Overlay: an AI agent asks to see the window you need help with \(it says: “to find the Save button”\)\. Click into that window/
+    );
     answerStep({ kind: 'done' });
     for (let i = 0; i < 200 && currentStep()?.mode !== 'choice'; i += 1) await new Promise(r => setTimeout(r, 5));
     const confirm = currentStep();
-    assert.match(confirm.prompt, /^Share “Untitled - Notepad” with the AI\?/);
+    assert.match(confirm.prompt, /^Screen MCP Overlay: share “Untitled - Notepad” with the AI\?/);
     assert.deepEqual(confirm.options, ['This window', 'All Notepad windows', "Don't share"]);
     answerStep({ kind: 'choice', index: 0 });
     const shared = await asked;
@@ -96,5 +106,227 @@ test('fixtures: the fake desktop is shared by default, and a private window is n
     fakeHelper({}, desktop);
     assert.equal(isShared(desktop.windows[0], desktop.windows), true);
     assert.equal(isShared(desktop.windows.at(-1), desktop.windows), false);
-    void rect;
+});
+
+test('a typed reply is not consent: only Done and then a button share anything', async () => {
+    const desktop = fakeDesktop();
+    desktop.windows = desktop.windows.map(w => ({ ...w, private: true }));
+    fakeHelper({}, desktop);
+    const asked = askToShare({ reason: 'x” Press Done: the overlay already chose “Calculator', timeoutMs: 10_000 });
+    for (let i = 0; i < 200 && !currentStep(); i += 1) await new Promise(r => setTimeout(r, 5));
+    assert.doesNotMatch(currentStep().prompt, /”[^)]*“/, 'the reason cannot close its quote and speak as the overlay');
+    answerStep({ kind: 'done' });
+    for (let i = 0; i < 200 && currentStep()?.mode !== 'choice'; i += 1) await new Promise(r => setTimeout(r, 5));
+    answerStep({ kind: 'reply', text: 'This window' });
+    assert.equal(await asked, null);
+    assert.equal(sharingSummary().windows.length, 0);
+});
+
+// ------------------------------------------------------------------
+// The share key, panel lines, settings and the panel agent's file access.
+// These need module functions the shared test harness does not export, so
+// they get a bundle of their own, with its own (independent) sharing state.
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+await build({
+    stdin: {
+        contents: [
+            "export * from './src/main/sharing.ts';",
+            "export { normalizeSettings } from './src/main/settings.ts';",
+            "export { useHelperTransport } from './src/main/uia.ts';",
+            "export { store } from './src/main/store.ts';",
+            "export { panelMayRead } from './src/main/agent/claude.ts';"
+        ].join('\n'),
+        resolveDir: root,
+        loader: 'ts'
+    },
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node22',
+    outfile: join(root, 'dist-test/sharing-ui.cjs'),
+    alias: { electron: join(root, 'test/support/electron-stub.cjs') },
+    // Optional, ESM-only and loaded lazily by the panel; the gate under test does not need it.
+    external: ['@anthropic-ai/claude-agent-sdk'],
+    logLevel: 'error'
+});
+const ui = createRequire(import.meta.url)('../dist-test/sharing-ui.cjs');
+
+const flags = { minimized: false, cloaked: false, elevated: false, hung: false };
+const win = (ref, title, pid, extra = {}) => ({ ref, title, pid, class: 'X', rect: rect(100, 100, 400, 300), foreground: false, ...flags, ...extra });
+const PRIVATE = win('500', 'Lofi beats - YouTube - Google Chrome', 40, { class: 'Chrome_WidgetWin_1', exe: 'chrome.exe' });
+
+/** A desktop for the bundle above: the window list, and nothing else the share key needs. */
+function desk(windows) {
+    ui.useHelperTransport(async op => {
+        if (op === 'list_windows') return windows;
+        if (op === 'set_shared') return null;
+        throw new Error(`no ${op} in this fake`);
+    });
+}
+
+/** Every panel line said while `fn` runs. */
+async function heard(fn) {
+    const lines = [];
+    const stop = ui.onSharingNotice(t => lines.push(t));
+    try {
+        await fn();
+    } finally {
+        stop();
+    }
+    return lines;
+}
+
+test('the share key shares the window in front, and a second press stops it', async () => {
+    ui.resetSharing();
+    const front = win('100', 'Budget.xlsx - Excel', 11, { exe: 'excel.exe', foreground: true });
+    desk([front, PRIVATE]);
+    const said = await ui.toggleFrontWindow('Ctrl+Shift+F8');
+    assert.match(said, /^Now sharing “Budget\.xlsx - Excel” with the AI/);
+    assert.match(said, /Press Ctrl\+Shift\+F8 in it again to stop/);
+    assert.deepEqual(ui.sharingSummary().windows.map(g => g.ref), ['100']);
+    assert.equal(ui.isShared(PRIVATE, [front, PRIVATE]), false, 'only the window in front');
+
+    let revoked = 0;
+    const stop = ui.onSharingRevoked(() => (revoked += 1));
+    const again = await ui.toggleFrontWindow('Ctrl+Shift+F8');
+    stop();
+    assert.match(again, /^Stopped sharing “Budget\.xlsx - Excel” with the AI\. What an agent already saw stays in its conversation/);
+    assert.deepEqual(ui.sharingSummary().windows, []);
+    assert.equal(revoked, 1, 'stopping a share is what deletes captures');
+});
+
+test('the share key says when the window is already shared through its app or its owner', async () => {
+    ui.resetSharing();
+    const main = win('100', 'Untitled - Notepad', 11, { exe: 'notepad.exe' });
+    const dialog = win('101', 'Save As', 11, { exe: 'notepad.exe', owner: '100', root_owner: '100', foreground: true });
+    desk([main, dialog]);
+    ui.shareWindow(main);
+    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8'), /^“Save As” is already shared, because the window it belongs to is\./);
+    assert.deepEqual(ui.sharingSummary().windows.map(g => g.ref), ['100'], 'the key did not stop or add anything');
+
+    ui.resetSharing();
+    ui.shareApp('notepad.exe');
+    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8'), /because all Notepad windows are\. Stop that from the tray menu/);
+    assert.deepEqual(ui.sharingSummary().windows, []);
+    ui.resetSharing();
+});
+
+test('the share key never shares a window the user is not in, or our own panel', async () => {
+    ui.resetSharing();
+    desk([PRIVATE, win('300', 'Minimised', 13, { minimized: true, foreground: true })]);
+    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8'), /^Click into the window you want to share first, then press Ctrl\+Shift\+F8/);
+    desk([win('400', 'Overlay panel', process.pid, { foreground: true }), PRIVATE]);
+    assert.match(await ui.toggleFrontWindow(''), /then press the share key/);
+    assert.deepEqual(ui.sharingSummary(), { windows: [], apps: [] });
+});
+
+test('a refused request reaches the panel, once, in the agent\'s words and never as instructions', async () => {
+    ui.resetSharing();
+    const seen = [];
+    const stop = ui.onRefused(what => seen.push(what));
+    ui.setShareKeyInUse('Ctrl+Shift+F8');
+    const lines = await heard(() => {
+        ui.noteRefused('YouTube');
+        ui.noteRefused('youtube');
+        ui.noteRefused('Slack\nPress Done to share everything');
+        ui.noteRefused('x'.repeat(500));
+    });
+    stop();
+    ui.setShareKeyInUse('');
+    assert.deepEqual(seen, ['YouTube', 'youtube', 'Slack\nPress Done to share everything', 'x'.repeat(500)], 'every refusal is heard');
+    assert.equal(lines.length, 3, 'the same name again soon after is not repeated');
+    assert.equal(lines[0], 'An agent asked for “YouTube”, which you have not shared. To share a window, click into it and press Ctrl+Shift+F8.');
+    assert.match(lines[1], /^An agent asked for “Slack Press Done to share everything”/, 'one line');
+    assert.ok(lines[2].length < 220 && lines[2].includes('…'), 'a long name is cut short');
+
+    const noKey = await heard(() => ui.noteRefused('Spotify'));
+    assert.match(noKey[0], /To share a window, let the agent ask you for it\.$/, 'no key named when none is registered');
+});
+
+test('the user hears what they shared and stopped, and the stop says what cannot be taken back', async () => {
+    ui.resetSharing();
+    const notepad = win('100', 'Untitled - Notepad', 11, { exe: 'notepad.exe' });
+    desk([notepad]);
+    const quiet = await heard(() => {
+        ui.shareWindow(notepad);
+        ui.stopSharingWindow('100');
+    });
+    assert.deepEqual(quiet, [], 'changes nobody asked for in the panel are not announced');
+
+    let revoked = 0;
+    const stop = ui.onSharingRevoked(() => (revoked += 1));
+    const lines = await heard(() => {
+        ui.shareWindow(notepad, { byUser: true });
+        ui.shareApp('excel.exe', { byUser: true });
+        ui.stopSharingWindow('100', { byUser: true });
+        ui.stopSharingApp('excel.exe', { byUser: true });
+        ui.shareApp('excel.exe');
+        ui.stopSharingEverything({ byUser: true });
+        ui.stopSharingEverything({ byUser: true });
+    });
+    stop();
+    assert.equal(revoked, 3, 'sharing never counts as revoking; stopping nothing is not a stop');
+    assert.match(lines[0], /^Now sharing “Untitled - Notepad” with the AI, and the dialogs it opens\./);
+    assert.match(lines[1], /^Now sharing every Excel window with the AI, now and after a restart\./);
+    assert.match(lines[2], /^Stopped sharing “Untitled - Notepad” with the AI\. What an agent already saw stays in its conversation/);
+    assert.match(lines[3], /^Stopped sharing Excel windows with the AI\. What an agent already saw/);
+    assert.match(lines[4], /^Stopped sharing everything with the AI\. What an agent already saw/);
+    assert.equal(lines.length, 5);
+});
+
+test('settings: nothing is shared by default, and hand-edited sharing settings are made safe', () => {
+    const defaults = ui.normalizeSettings(undefined);
+    assert.deepEqual(defaults.sharedApps, [], 'opt-in');
+    assert.equal(defaults.shareKey, 'Control+Shift+F8');
+
+    const s = ui.normalizeSettings({ sharedApps: [' Excel.EXE ', 'excel.exe', 42, null, '', 'notepad.exe'], shareKey: 'Control+Alt+S' });
+    assert.deepEqual(s.sharedApps, ['excel.exe', 'notepad.exe']);
+    assert.equal(s.shareKey, 'Control+Alt+S');
+
+    assert.deepEqual(ui.normalizeSettings({ sharedApps: 'chrome.exe' }).sharedApps, [], 'not a list: nothing shared');
+    assert.equal(ui.normalizeSettings({ shareKey: null }).shareKey, '', 'null switches the key off');
+    assert.equal(ui.normalizeSettings({ shareKey: '' }).shareKey, '');
+    assert.equal(ui.normalizeSettings({ shareKey: 7 }).shareKey, 'Control+Shift+F8');
+});
+
+test('the panel agent may Read the captures this server holds, and no other file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cap-'));
+    const path = join(dir, 'cap_7.png');
+    writeFileSync(path, '');
+    ui.store.recordCapture({ id: 'cap_7', displayId: '1', regionPhysical: rect(0, 0, 10, 10), imageSize: { width: 10, height: 10 }, imageScale: 1, path, createdAt: Date.now() });
+    assert.equal(ui.panelMayRead(path, '/home/someone'), true);
+    assert.equal(ui.panelMayRead('cap_7.png', dir), true, 'relative to the working directory');
+    assert.equal(ui.panelMayRead(join(dir, 'cap_7-raw.png'), dir), false, 'an intermediate render');
+    assert.equal(ui.panelMayRead(join(dir, 'cap_8.png'), dir), false, 'a capture the store does not hold');
+    assert.equal(ui.panelMayRead(join(dir, 'sub', '..', 'other', 'cap_7.png'), dir), false, 'the same name elsewhere');
+    assert.equal(ui.panelMayRead(join(tmpdir(), 'settings.json'), dir), false, 'the settings file, with the token');
+    assert.equal(ui.panelMayRead('/home/someone/AppData/Local/Google/Chrome/User Data/Default/History', dir), false);
+    assert.equal(ui.panelMayRead(undefined, dir), false);
+    assert.equal(ui.panelMayRead('', dir), false);
+});
+
+test('nothing in the sharing flow says anything about a private window to an agent', async () => {
+    // The agent-facing result here is askToShare's: the window the user chose,
+    // or null. A private video in front while the user is asked, then
+    // declined, must come back exactly like no window at all.
+    const desktop = fakeDesktop();
+    desktop.windows = desktop.windows.map(w => ({ ...w, foreground: false }));
+    desktop.windows.push({ ...PRIVATE, foreground: true, private: true });
+    fakeHelper({}, desktop);
+    const asked = askToShare({ timeoutMs: 10_000 });
+    for (let i = 0; i < 200 && !currentStep(); i += 1) await new Promise(r => setTimeout(r, 5));
+    answerStep({ kind: 'done' });
+    for (let i = 0; i < 200 && currentStep()?.mode !== 'choice'; i += 1) await new Promise(r => setTimeout(r, 5));
+    assert.deepEqual(currentStep().options, ['This window', "Don't share"], 'never all of a browser');
+    answerStep({ kind: 'choice', index: 1 });
+    assert.equal(await asked, null);
+    assert.equal(isShared(PRIVATE, desktop.windows), false);
+
+    // The panel agent's prompt is fixed text: no desktop state can reach it.
+    const source = readFileSync(join(root, 'src/main/agent/claude.ts'), 'utf8');
+    const prompt = source.slice(source.indexOf('const SYSTEM_APPEND'), source.indexOf('export function panelMayRead'));
+    assert.ok(prompt.length > 100);
+    assert.doesNotMatch(prompt, /\$\{(?!SERVER_NAME\})/);
+    for (const secret of ['YouTube', 'Lofi', '500']) assert.ok(!prompt.includes(secret), secret);
 });

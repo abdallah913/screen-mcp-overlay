@@ -1,9 +1,11 @@
 # Screen MCP Overlay
 
-A desktop overlay that lets Claude Code — or any MCP client — **see your screen and draw on it**.
+A desktop overlay that lets Claude Code — or any MCP client — **see the windows you share and draw on
+your screen**.
 
-Ask *"how do I export this?"* and the agent looks at your screen, then circles the button and
-numbers the steps directly on your real desktop. The overlay is click-through, so you keep working
+Ask *"how do I export this?"* and the agent looks at the window you shared, then circles the button and
+numbers the steps directly on your real desktop. **Nothing is visible to the agent until you share it**:
+a window you have not shared does not exist as far as it can tell. The overlay is click-through, so you keep working
 underneath it, and it hides itself from screen capture, so its own drawings never end up in the next
 screenshot.
 
@@ -116,7 +118,11 @@ fine — they all drive the same screen.
 
 ## 3. Use it
 
-Just ask, in whatever agent you connected:
+First, share the window you want help with: **click into it and press `Ctrl+Shift+F8`**. Press it
+again in that window to stop. Or just ask, and the agent asks you to share one (see
+[Privacy](#privacy)).
+
+Then ask, in whatever agent you connected:
 
 - *"Look at my screen and circle what's wrong."*
 - *"Walk me through exporting this as a PNG — highlight each button before I click it."*
@@ -137,6 +143,7 @@ You can also type a reply in the panel while a step is waiting; it goes straight
 
 | Shortcut | Action |
 |---|---|
+| `Ctrl+Shift+F8` | Share the window you are in with the AI, or stop sharing it |
 | `Ctrl+Shift+O` | Show / hide the chat panel |
 | `Ctrl+Shift+X` | Clear everything drawn on screen and stop the current step |
 | `Ctrl+Shift+F9` | Done (only while the agent is waiting for you to do a step) |
@@ -145,7 +152,8 @@ You can also type a reply in the panel while a step is waiting; it goes straight
 
 The step keys are registered only while a step is waiting, so they never take those keys from your other
 apps, and can be changed or turned off (`""` or `null`) in
-`%APPDATA%\screen-mcp-overlay\settings.json` (`stepKeys`). The panel's card also has **Show me**, which
+`%APPDATA%\screen-mcp-overlay\settings.json` (`stepKeys`). The share key is held while the app runs;
+change or turn it off there too (`shareKey`). The panel's card also has **Show me**, which
 points at the target again. The tray menu has **Read steps aloud** and **Sound cues**.
 
 There's also a **built-in chat panel** (bottom-right, draggable) if you'd rather not switch to a
@@ -160,7 +168,7 @@ works the same either way.
 
 | Tool | What it does |
 |---|---|
-| `list_windows` | Windows and monitors: refs, titles, rects |
+| `list_windows` | The windows you shared, and monitors: refs, titles, rects. `ask` asks you to share one |
 | `describe_window` | A window's controls as a text tree. ~3.6x cheaper than a screenshot |
 | `find_ui_elements` | Search a window's tree by name, role or AutomationId |
 | `read_text` | OCR a window or region, with per-line rectangles |
@@ -174,8 +182,9 @@ works the same either way.
 | `scroll_window` | Scroll a window, or bring a named control into view |
 | `show_message` | Tell the user something, say it out loud, or ask a multiple-choice question |
 
-Any `window` argument takes a ref, a **title substring** (`"Notepad"`) or `"foreground"`, so an agent
-rarely needs `list_windows` first. Drawings can be **anchored** to a window or a control
+Any `window` argument takes a ref, a **title substring** (`"Notepad"`) or `"foreground"` (the
+frontmost shared window), matched against the windows you shared only, so an agent rarely needs
+`list_windows` first. Drawings can be **anchored** to a window or a control
 (`anchor: {window: "Notepad", name: "Save"}`), so they follow their target when it moves.
 
 ## Documentation
@@ -187,20 +196,56 @@ rarely needs `list_windows` first. Drawings can be **anchored** to a window or a
 
 ## Privacy
 
-Everything stays on your machine.
+**Nothing on your screen is visible to an agent until you share it.** A window you have not shared
+does not exist as far as any connected agent can tell: no title, no app name, no pixels, no text, no
+controls, not even whether it is open. Asking for one gets exactly the answer a window that is not
+open gets. Someone getting help in a spreadsheet while a video plays on the side does not have the
+video reach the AI.
 
-- Screenshots are written to a temporary folder and deleted when the app exits. They are never
-  uploaded anywhere.
+**How to share:**
+
+- **The share key.** Click into a window and press `Ctrl+Shift+F8`. Press it again there to stop.
+- **The agent asks.** When it needs a window you have not shared, the overlay (not the agent) asks you
+  to click into it and press Done, then to confirm. The agent never names the window, so it cannot
+  find out what is open by asking.
+- **The tray menu.** *Shared with the AI* lists everything shared. Click an item to stop sharing it, or
+  *Stop sharing everything*.
+
+A shared window brings the windows it owns: its menus, its dialogs and the file picker it opens. It does
+not bring the app's other windows. For most apps the overlay can share **all of the app's windows**
+at once, and remembers that across restarts; it never offers that for browsers, Explorer and other
+programs whose windows are unrelated things, so a second browser window stays private.
+
+What to know:
+
+- **Screenshots are masked.** Anything that is not a shared window on top (other windows, the
+  desktop, the taskbar, a notification) is painted over in one flat colour before the image or the
+  text read from it reaches an agent.
+- **A shared browser window shows its tab strip**, so the titles of its other tabs are visible, and
+  switching that window to another tab shows that tab. Sharing is per window, not per tab: put what
+  you want private in a separate browser window.
+- **Stopping a share is not retroactive.** What an agent already saw stays in its conversation (and
+  in its saved transcript). The overlay deletes its screenshots when you stop sharing something, and
+  the panel's **New** button starts its own conversation afresh.
+- **Sharing governs this overlay only.** An agent with its own shell or file access (Claude Code's
+  Bash, Codex) can still read your screen or list your windows outside this server. The built-in panel
+  has no shell and may read only the screenshots this server took.
+- Every request for a window you have not shared shows a line in the overlay panel, so it is never
+  silent. Agents never see those lines.
+
+Everything stays on your machine:
+
+- Screenshots are written to a temporary folder, deleted when you stop sharing something and when the
+  app exits. They are never uploaded by the overlay.
 - There is **no telemetry**, no analytics and no crash reporting.
 - The MCP server listens on loopback only (`127.0.0.1`) and requires an access token. It sends no CORS
   headers, refuses any request carrying an `Origin`, and enables DNS-rebinding protection — so a web
   page you happen to be visiting cannot reach it and read your screen.
-- Every capture posts a line into the overlay panel. A screen read is never silent.
-- The overlay does not control your mouse or keyboard. It can bring a window to the front and scroll
-  one, and that is the extent of it.
+- The overlay does not control your mouse or keyboard. It can bring a shared window to the front and
+  scroll one, and that is the extent of it.
 
-The agent you connect, of course, sends what it captures to whatever service that agent uses. That
-part is between you and your agent.
+The agent you connect, of course, sends what it sees of your shared windows to whatever service that
+agent uses. That part is between you and your agent.
 
 ## License
 

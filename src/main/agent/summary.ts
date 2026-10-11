@@ -19,14 +19,16 @@ export function summarise(name: string, input: unknown): string {
 
     switch (short) {
         case 'list_windows':
-            return 'listing your windows';
+            // With ask, the call puts a sharing request on screen; the line
+            // says so, so it is not mistaken for the agent looking around.
+            return args.ask ? 'asking you to share a window' : 'listing the windows you shared';
         case 'describe_window':
         case 'find_ui_elements':
-            return `reading ${args.window ? String(args.window) : 'the screen'}`;
+            return `reading ${args.window ? String(args.window) : 'what you shared'}`;
         case 'read_text':
             return 'reading text off the screen';
         case 'capture_screen':
-            return `looking at ${args.window ? String(args.window) : args.display ? `display ${String(args.display)}` : 'the screen'}`;
+            return `looking at ${args.window ? String(args.window) : args.display ? `display ${String(args.display)}` : 'what you shared'}`;
         case 'annotate': {
             const shapes = Array.isArray(args.shapes) ? args.shapes : [];
             const kinds = shapes.map(s => String((s as { type?: unknown }).type ?? '?'));

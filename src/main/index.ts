@@ -1,4 +1,5 @@
-import { app, clipboard, globalShortcut, ipcMain, Menu, nativeImage, Tray } from 'electron';
+import { app, clipboard, globalShortcut, ipcMain, Menu, nativeImage, Tray, type MenuItemConstructorOptions } from 'electron';
+import { readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { cleanupCaptureDir, initCaptureDir } from './capture.js';
 import { initClicks } from './clicks.js';
@@ -37,11 +38,28 @@ import { startAnchorTracking, stopAnchorTracking } from './anchors.js';
 import { stopUia } from './uia.js';
 import { currentProviderLabel, initAgentHost, isBusy } from './agent/host.js';
 import { applyOpenAtLogin, settings, startedHidden, updateSettings } from './settings.js';
+import {
+    appLabel,
+    onSharingChanged,
+    onSharingNotice,
+    onSharingRevoked,
+    setShareKeyInUse,
+    sharingSummary,
+    stopSharingApp,
+    stopSharingEverything,
+    stopSharingWindow,
+    syncHelper,
+    toggleFrontWindow,
+    windowsWithSharing
+} from './sharing.js';
 
 const DEFAULT_PORT = Number(process.env.SCREEN_OVERLAY_PORT || 7777);
 
 let tray: Tray | null = null;
 let mcp: McpServerHandle | null = null;
+let captureDir = '';
+/** The share key as the user presses it, once it registered; '' when there is none. */
+let shareKeyLabel = '';
 
 // A second instance would fight the first for global shortcuts and bind the
 // same port, so hand focus back to the running one instead.
@@ -65,13 +83,14 @@ async function main(): Promise<void> {
     setContentProtection(!prefs.showInCapture);
     applyOpenAtLogin(prefs.openAtLogin);
 
-    initCaptureDir();
+    captureDir = initCaptureDir();
     initOverlay();
     initClicks();
     initAgentHost();
     createHud(isContentProtected(), startedHidden());
     registerIpc();
     registerShortcuts();
+    initSharing();
 
     try {
         mcp = await startMcpServer(DEFAULT_PORT);
@@ -88,6 +107,7 @@ async function main(): Promise<void> {
     } catch (err) {
         pushMessage('error', `Could not start the MCP server on port ${DEFAULT_PORT}: ${(err as Error).message}`);
     }
+    pushMessage('system', sharingAtStartup());
 
     // Keeps anchored annotations glued to the windows and controls they point at.
     startAnchorTracking();
@@ -144,6 +164,115 @@ function registerShortcuts(): void {
     bindStepKeys(globalShortcut, () => settings().stepKeys);
     // The tray lists the keys that answer the current step.
     store.on('step', refreshTrayMenu);
+    registerShareKey();
+}
+
+/** Two accelerators for the same keys, however they are spelt ("Control+Shift+X", "shift+ctrl+x"). */
+function sameChord(a: string, b: string): boolean {
+    const norm = (c: string): string =>
+        keyLabel(c)
+            .toLowerCase()
+            .split('+')
+            .sort()
+            .join('+');
+    return norm(a) === norm(b);
+}
+
+/**
+ * The share key shares the window in front, or stops sharing it. Held for
+ * the whole session, unlike the step keys: sharing is something the user
+ * does before an agent asks. Never one of our own chords, which it would
+ * silently take over (a step key equal to it would then never register).
+ */
+function registerShareKey(): void {
+    const prefs = settings();
+    const accel = prefs.shareKey;
+    if (!accel.trim()) return;
+    const ours = ['Control+Shift+O', 'Control+Shift+X', 'Escape', prefs.stepKeys.done, prefs.stepKeys.stuck];
+    if (ours.some(c => c && sameChord(c, accel))) {
+        pushMessage(
+            'error',
+            `The share key ${keyLabel(accel)} is one of the overlay's own keys, so it is off. ` +
+                'Set shareKey in settings.json to another chord.'
+        );
+        return;
+    }
+    let taken = false;
+    try {
+        taken = !globalShortcut.isRegistered(accel) && globalShortcut.register(accel, onShareKey);
+    } catch {
+        // Not a valid accelerator: the setting is hand-edited.
+    }
+    if (!taken) {
+        pushMessage(
+            'error',
+            `Could not register the share key ${keyLabel(accel)}; another app may be using it, or it is not a valid key. ` +
+                'An agent can still ask you to share a window. Set shareKey in settings.json to another chord.'
+        );
+        return;
+    }
+    shareKeyLabel = keyLabel(accel);
+    setShareKeyInUse(shareKeyLabel);
+}
+
+let toggling = false;
+
+function onShareKey(): void {
+    // A held key repeats; one press is one toggle.
+    if (toggling) return;
+    toggling = true;
+    toggleFrontWindow(shareKeyLabel)
+        .then(
+            text => pushMessage('system', text),
+            err => pushMessage('error', `Could not share the window in front: ${(err as Error).message}`)
+        )
+        .finally(() => {
+            toggling = false;
+        });
+}
+
+function initSharing(): void {
+    // User-only lines: what was shared or stopped, and what an agent asked
+    // for that is not shared. The panel's log never reaches an agent.
+    onSharingNotice(text => pushMessage('system', text));
+    onSharingChanged(refreshTrayMenu);
+    onSharingRevoked(purgeCaptures);
+    // Whole-app shares are kept in settings; the helper enforces them too.
+    syncHelper();
+}
+
+/** The first thing the panel says about sharing, so nobody wonders why the agent sees nothing. */
+function sharingAtStartup(): string {
+    const how = shareKeyLabel
+        ? `To share a window, click into it and press ${shareKeyLabel}, or let the agent ask you.`
+        : 'To share a window, let the agent ask you; it asks you to click into the window and confirm.';
+    const { apps } = sharingSummary();
+    const kept = apps.length
+        ? ` Still shared from before: every ${apps.map(appLabel).join(', every ')} window; the tray menu stops that.`
+        : '';
+    return `Nothing on your screen is shared with the AI until you share it. ${how}${kept}`;
+}
+
+/**
+ * Captures already on disk show what was shared when they were taken. Once
+ * the user stops sharing something, an agent that kept a path must not be
+ * able to read it back, so every capture goes: the next one is a call away.
+ */
+function purgeCaptures(): void {
+    if (!captureDir) return;
+    let names: string[];
+    try {
+        names = readdirSync(captureDir);
+    } catch {
+        return;
+    }
+    for (const name of names) {
+        try {
+            rmSync(join(captureDir, name), { force: true, recursive: true });
+        } catch {
+            // Locked by a reader right now; the exit cleanup removes it.
+        }
+    }
 }
 
 function buildTray(): void {
@@ -151,8 +280,65 @@ function buildTray(): void {
     const icon = nativeImage.createFromPath(join(__dirname, '..', 'tray.png'));
     tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
     tray.on('click', () => toggleHud());
+    // The menu lists what is shared; a shared window that closed since must
+    // not linger in it. Hovering the icon comes before opening its menu, and
+    // a change found rebuilds the menu through onSharingChanged.
+    tray.on('mouse-move', sweepShares);
+    tray.on('right-click', sweepShares);
     onVoicesKnown(refreshTrayMenu);
     refreshTrayMenu();
+}
+
+let lastSweep = 0;
+
+function sweepShares(): void {
+    const now = Date.now();
+    if (now - lastSweep < 2000) return;
+    lastSweep = now;
+    windowsWithSharing().catch(() => undefined);
+}
+
+/** A window title as a menu label: Windows reads & as a mnemonic and a tab as the key column. */
+function menuText(text: string): string {
+    const flat = text.replace(/\s+/g, ' ').trim() || 'Untitled window';
+    const short = flat.length > 60 ? `${flat.slice(0, 59)}…` : flat;
+    return process.platform === 'win32' ? short.replace(/&/g, '&&') : short;
+}
+
+/** What is shared with the AI, each item a click away from not being. */
+function sharingMenu(): MenuItemConstructorOptions {
+    const { windows, apps } = sharingSummary();
+    const items: MenuItemConstructorOptions[] = [
+        ...windows.map(
+            (g): MenuItemConstructorOptions => ({
+                label: menuText(g.title),
+                type: 'checkbox',
+                checked: true,
+                click: () => stopSharingWindow(g.ref, { byUser: true })
+            })
+        ),
+        ...apps.map(
+            (exe): MenuItemConstructorOptions => ({
+                label: menuText(`All ${appLabel(exe)} windows`),
+                type: 'checkbox',
+                checked: true,
+                click: () => stopSharingApp(exe, { byUser: true })
+            })
+        )
+    ];
+    const count = items.length;
+    if (!count) items.push({ label: 'Nothing is shared', enabled: false });
+    items.push(
+        { type: 'separator' },
+        { label: 'Stop sharing everything', enabled: count > 0, click: () => stopSharingEverything({ byUser: true }) },
+        {
+            label: shareKeyLabel
+                ? `To share a window, click into it and press ${shareKeyLabel}`
+                : 'To share a window, let the agent ask you',
+            enabled: false
+        }
+    );
+    return { label: count ? `Shared with the AI (${count})` : 'Shared with the AI: nothing', submenu: items };
 }
 
 /** A menu label with its key shown at the right, when there is one. */
@@ -178,6 +364,8 @@ function refreshTrayMenu(): void {
     tray.setContextMenu(
         Menu.buildFromTemplate([
             { label: mcpUrl() || 'MCP server not running', enabled: false },
+            { type: 'separator' },
+            sharingMenu(),
             { type: 'separator' },
             { label: 'Show / hide panel\tCtrl+Shift+O', click: () => toggleHud() },
             {
