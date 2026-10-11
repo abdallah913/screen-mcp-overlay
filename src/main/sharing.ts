@@ -226,6 +226,29 @@ function announce(): void {
     }
 }
 
+const refusedListeners = new Set<(what: string) => void>();
+
+/**
+ * An agent asked for a window that is not shared (or not open: the agent is
+ * told the same either way). The user hears about it in the panel, so a
+ * request for an app they did not share is never silent. Never echoed back
+ * to any agent.
+ */
+export function noteRefused(what: string): void {
+    for (const fn of refusedListeners) {
+        try {
+            fn(what);
+        } catch {
+            // The panel being unavailable must not change what the agent is told.
+        }
+    }
+}
+
+export function onRefused(fn: (what: string) => void): () => void {
+    refusedListeners.add(fn);
+    return () => refusedListeners.delete(fn);
+}
+
 /** For tests: nothing shared, and nothing written to settings. */
 export function resetSharing(): void {
     grants.clear();
