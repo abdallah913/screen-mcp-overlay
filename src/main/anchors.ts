@@ -1,16 +1,20 @@
 import { screen } from 'electron';
 import type { AnchorSelector, AnchorSpec, Annotation, Point, Rect } from '../shared/types.js';
-import { rankMatches, recoveredMatch } from '../shared/uitree.js';
+import { clean, rankMatches, recoveredMatch } from '../shared/uitree.js';
 import { coverVerdict } from '../shared/windows.js';
+import { onSharingChanged, sharedOf, sharedWindows } from './sharing.js';
 import { store } from './store.js';
 import {
     coverage,
     findElements,
     knownControl,
+    listAllWindows,
     resolveRefs,
     selectorForRef,
+    type Coverage,
     type ElementInfo,
-    type ResolvedRef
+    type ResolvedRef,
+    type WindowInfo
 } from './uia.js';
 
 /**
@@ -154,6 +158,73 @@ export async function findRanked(selector: AnchorSelector, within?: Rect): Promi
 function homeWindow(spec: AnchorSpec): string | undefined {
     return spec.kind === 'window' ? spec.ref : (spec.selector?.window ?? knownControl(spec.ref)?.selector.window);
 }
+
+/** The top-level window an anchored drawing belongs to, when known: what sharing is judged on. */
+export function anchoredWindow(a: Annotation): string | undefined {
+    return a.anchor ? homeWindow(a.anchor) : undefined;
+}
+
+// ------------------------------------------------------------------ sharing
+
+/** How the helper names the chat panel when it is what covers a target. */
+export const PANEL_COVER = "the overlay's chat panel";
+
+/** What a covering window that is not shared is called: it says nothing about it. */
+export const ANOTHER_WINDOW = 'another window';
+
+/**
+ * Covering windows as the agent may hear of them: a shared window by its
+ * title, the chat panel as the panel, anything else as "another window",
+ * said once however many there are. An untitled cover stays empty, which
+ * callers read as an open menu or tooltip rather than a cover. Coverage is
+ * measured over every window, since anything can sit on top of a shared
+ * one; only its wording is limited to what the user shared.
+ */
+export function safeCoverNames(by: readonly string[], shared: readonly Pick<WindowInfo, 'title'>[]): string[] {
+    const titles = new Set(shared.map(w => clean(w.title)).filter(Boolean));
+    const out: string[] = [];
+    for (const t of by) {
+        const name = clean(t);
+        const safe = !name ? '' : name === PANEL_COVER || titles.has(name) ? name : ANOTHER_WINDOW;
+        if (!safe || !out.includes(safe)) out.push(safe);
+    }
+    return out;
+}
+
+/** coverVerdict, with the covering windows named as safeCoverNames allows. */
+export function agentCoverVerdict(c: Coverage, shared: readonly Pick<WindowInfo, 'title'>[]): string | null {
+    return coverVerdict({ ...c, by: safeCoverNames(c.by, shared) });
+}
+
+/**
+ * The user stopped sharing something. Drawings on a window that is still open
+ * but no longer shared go, as does what was read from it (tree snapshots,
+ * captures): the agent must not keep following, describing or diffing a
+ * window it can no longer see. A window that closed keeps its drawings: the
+ * tracker hides them, and says the window closed, as it always has.
+ */
+async function forgetUnshared(): Promise<void> {
+    let open: WindowInfo[];
+    try {
+        // Not windowsWithSharing: a listener only judges, and must not prune
+        // shares itself (that announces again, from inside an announcement).
+        open = await listAllWindows();
+    } catch {
+        // The helper is down, so nothing is drawn or read anyway; the
+        // next change, or the helper's own refusal, catches up.
+        return;
+    }
+    const visible = new Set(sharedOf(open).map(w => w.ref));
+    const hidden = new Set(open.map(w => w.ref).filter(ref => !visible.has(ref)));
+    const gone = store.anchored().filter(a => {
+        const home = anchoredWindow(a);
+        return home !== undefined && hidden.has(home);
+    });
+    if (gone.length > 0) store.clear(gone.map(a => a.id));
+    store.forgetWindows(hidden);
+}
+
+onSharingChanged(() => void forgetUnshared());
 
 /** The top-level window a target lives in, when known: what coverage is measured against. */
 function targetWindow(spec: AnchorSpec): string | undefined {
@@ -343,6 +414,11 @@ async function refreshCoverage(
 
     const out = new Map<string, string | null>();
     const byTarget = new Map<string, Promise<string | null | undefined>>();
+    // Annotation.covered is drawn on screen, where a capture can read it, so
+    // it names only what the agent may see. Read only when something covers.
+    let sharedNow: Promise<WindowInfo[]> | undefined;
+    const named = async (c: Coverage): Promise<string | null> =>
+        coverVerdict(c) === null ? null : agentCoverVerdict(c, await (sharedNow ??= sharedWindows().catch(() => [])));
     for (const a of anchored) {
         const spec = a.anchor!;
         const live = byRef.get(spec.ref);
@@ -359,7 +435,7 @@ async function refreshCoverage(
                 spec.kind === 'window' ? undefined : live.rect,
                 spec.kind === 'window' ? undefined : (knownControl(spec.ref)?.selector.role ?? spec.selector?.role)
             )
-                .then(coverVerdict)
+                .then(named)
                 .catch(() => undefined);
             byTarget.set(key, verdict);
         }

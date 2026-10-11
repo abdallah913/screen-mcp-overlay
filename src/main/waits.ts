@@ -1,10 +1,10 @@
 import type { SnapshotNode } from '../shared/types.js';
 import { toSnapshotNodes, type TreeRow } from '../shared/uitree.js';
+import { isShared, onSharingChanged, sharedOf, windowsWithSharing } from './sharing.js';
 import {
     describeWindow,
     findElements,
     listAllWindows,
-    listWindows,
     type DescribedNode,
     type ElementInfo,
     type WindowInfo
@@ -25,6 +25,12 @@ import {
  * from this side keeps the helper free between checks. It costs CPU, not tokens
  * — the event-driven version (UIA AddAutomationEventHandler) would remove even
  * that, but it changes nothing about the token cost this exists to solve.
+ *
+ * Only shared windows are watched (see sharing.ts). A window the user did not
+ * share opening, closing or carrying a matching control never meets a wait,
+ * never ends one and is never reported, so a wait cannot tell the agent what
+ * else is open. The full window list is still read, to tell a window opening
+ * from one being shared, and closing from being unshared.
  */
 
 export type WaitCondition = 'appears' | 'disappears' | 'enabled' | 'changes';
@@ -143,20 +149,39 @@ const asElement = (w: WindowInfo): ElementInfo => ({
 
 type Selected = Pick<WaitRequest, 'condition' | 'window' | 'name' | 'role' | 'automationId' | 'value'>;
 
-function controlMatches(req: Selected): Promise<ElementInfo[]> {
+async function controlMatches(req: Selected): Promise<ElementInfo[]> {
     // "Any control of this role appeared" can short-circuit on the first match,
     // which turns a whole-tree walk into an early exit. "enabled" cannot: the
     // first match may be a disabled one while an enabled one exists, and nor
     // can a value filter, which is applied here rather than in the helper.
     const firstWillDo = req.condition === 'appears' && !req.name && !req.automationId && !req.value;
-    return findElements({
-        window: req.window,
-        name: req.name,
-        role: req.role,
-        automationId: req.automationId,
-        limit: firstWillDo ? 1 : 10
-    });
+    const limit = firstWillDo ? 1 : 10;
+    const selector = { name: req.name, role: req.role, automationId: req.automationId };
+    if (req.window) return findElements({ window: req.window, ...selector, limit });
+
+    // No window: each shared window the user can see, front first, never the
+    // desktop as a whole, which would read every app's controls.
+    const { shared } = await windowsWithSharing();
+    const found: ElementInfo[] = [];
+    let failed: unknown;
+    let answered = false;
+    for (const w of shared.filter(onScreen)) {
+        try {
+            found.push(...(await findElements({ window: w.ref, ...selector, limit: limit - found.length })));
+            answered = true;
+        } catch (err) {
+            // One window closing or hanging between the listing and its
+            // search is not the whole check failing.
+            failed = err;
+        }
+        if (found.length >= limit) break;
+    }
+    if (!answered && failed !== undefined) throw failed;
+    return found;
 }
+
+/** A window the user can see: minimised and other-desktop ones are not searched or counted. */
+const onScreen = (w: WindowInfo): boolean => !w.minimized && !w.cloaked;
 
 /**
  * State words without "focused". Focus moves the moment the user clicks into
@@ -235,26 +260,53 @@ interface Probe {
  */
 type Check = ((final: false | 'done' | 'timeout') => Promise<Probe>) & { slow?: boolean };
 
-const refList = (refs: Iterable<string>): string => [...refs].sort().join(',');
-
-/** The first window in `windows` that is not in the comma-joined `before`. */
-function opened(windows: WindowInfo[], before: string): Probe {
-    const known = new Set(before.split(','));
-    const fresh = windows.find(w => !known.has(w.ref));
-    return { hit: fresh ? asElement(fresh) : null };
+/**
+ * Watches a set of shared windows for one opening or closing. `pick` chooses
+ * the windows that count from the shared ones (those with a title, those of
+ * the step's app). The user sharing a window that was already open is not a
+ * window opening, and unsharing one is not a window closing: either would
+ * end a wait on something the agent cannot see, at a moment that says what
+ * the user did elsewhere. Without a baseline the first look is the start.
+ */
+function windowWatch(
+    pick: (shared: WindowInfo[], all: WindowInfo[]) => WindowInfo[],
+    baseline: WindowInfo[] | undefined
+): (all: WindowInfo[], shared: WindowInfo[]) => Probe {
+    let counted: Set<string> | undefined;
+    let hidden: Set<string> | undefined;
+    const begin = (all: WindowInfo[], shared: WindowInfo[]): void => {
+        const visible = new Set(shared.map(w => w.ref));
+        counted = new Set(pick(shared, all).map(w => w.ref));
+        hidden = new Set(all.filter(w => !visible.has(w.ref)).map(w => w.ref));
+    };
+    if (baseline) begin(baseline, sharedOf(baseline));
+    return (all, shared) => {
+        if (!counted || !hidden) begin(all, shared);
+        const now = pick(shared, all);
+        const fresh = now.find(w => !counted!.has(w.ref) && !hidden!.has(w.ref));
+        if (fresh) return { hit: asElement(fresh) };
+        const open = new Set(all.map(w => w.ref));
+        const visible = new Set(shared.map(w => w.ref));
+        const still = new Set(now.map(w => w.ref));
+        // Gone because it closed (or its title no longer matches), not
+        // because the user stopped sharing it.
+        const gone = [...counted!].some(ref => !still.has(ref) && !(open.has(ref) && !visible.has(ref)));
+        return { hit: gone ? null : false };
+    };
 }
 
 /**
  * A window another process opened for the step's app, if one came up: a
  * packaged app's file picker or "Open with" is not the app's own process, but
  * the app's window owns it. A window the user opens from the taskbar has no
- * such owner, so it is not the step done.
+ * such owner, so it is not the step done. Only shared windows are given, and
+ * an owned window of a shared one is shared with it.
  */
-function openedFor(windows: WindowInfo[], before: Set<string>, home: string): WindowInfo | undefined {
-    const pid = windows.find(w => w.ref === home)?.pid;
+function openedFor(shared: WindowInfo[], before: Set<string>, home: string): WindowInfo | undefined {
+    const pid = shared.find(w => w.ref === home)?.pid;
     if (pid === undefined) return undefined;
-    const app = new Set(windows.filter(w => w.pid === pid).map(w => w.ref));
-    return windows.find(w => w.pid !== pid && w.owner !== undefined && app.has(w.owner) && !before.has(w.ref));
+    const app = new Set(shared.filter(w => w.pid === pid).map(w => w.ref));
+    return shared.find(w => w.pid !== pid && w.owner !== undefined && app.has(w.owner) && !before.has(w.ref));
 }
 
 /** A window's tree, as a whole-window "changes" compares it. */
@@ -302,13 +354,16 @@ function makeCheck(req: WaitRequest): Check {
     if (req.condition !== 'changes') {
         if (isTopLevelWait(req)) {
             const counted = req.condition === 'appears' || req.condition === 'enabled';
+            // Every window open at the start, shared or not: one the user
+            // shares during the step was already open, so it has not appeared.
             const known = new Set(req.baseline?.map(w => w.ref));
             return async () => {
+                const { shared } = await windowsWithSharing();
                 // A minimised window has not appeared, and has not gone either:
                 // the user can bring it back with one click.
                 const named = counted
-                    ? titled(await listWindows(), needle)
-                    : titled(await listAllWindows(), needle).filter(w => !w.cloaked);
+                    ? titled(shared.filter(onScreen), needle)
+                    : titled(shared, needle).filter(w => !w.cloaked);
                 // A window that was hidden when the step began is not in the
                 // baseline, so it still counts as new when it is shown.
                 const fresh = counted ? named.filter(w => !known.has(w.ref)) : named;
@@ -327,12 +382,10 @@ function makeCheck(req: WaitRequest): Check {
     }
 
     if (isTopLevelWait(req) || (!req.window && !hasSelector(req))) {
-        let before = req.baseline ? refList(titled(req.baseline, needle).map(w => w.ref)) : undefined;
+        const watch = windowWatch(shared => titled(shared, needle), req.baseline);
         return async () => {
-            const windows = titled(await listAllWindows(), needle);
-            const now = refList(windows.map(w => w.ref));
-            before ??= now;
-            return now === before ? { hit: false } : opened(windows, before);
+            const { all, shared } = await windowsWithSharing();
+            return watch(all, shared);
         };
     }
 
@@ -347,31 +400,31 @@ function makeCheck(req: WaitRequest): Check {
     }
 
     // A whole window, unselected: a debounced diff of its tree, plus its
-    // app's windows so a dialog it opens counts. Other apps' windows are left
-    // out: a reminder popping up elsewhere is not the user doing the step. The
-    // debounce wants the same changed tree twice in a row, so a redraw in
-    // progress does not count.
+    // app's shared windows so a dialog it opens counts. Other apps' windows
+    // are left out: a reminder popping up elsewhere is not the user doing the
+    // step. So is another window of the same app that the user did not share
+    // (a second browser window): it is not theirs to report. The debounce
+    // wants the same changed tree twice in a row, so a redraw in progress
+    // does not count.
     let sameApp: ((w: WindowInfo) => boolean) | undefined;
-    const appWindows = (list: WindowInfo[]): WindowInfo[] => {
+    const appWindows = (shared: WindowInfo[], all: WindowInfo[]): WindowInfo[] => {
         if (!sameApp) {
-            const pid = list.find(w => w.ref === req.window)?.pid;
+            const pid = all.find(w => w.ref === req.window)?.pid;
             sameApp = pid === undefined ? () => true : w => w.pid === pid;
         }
-        return list.filter(sameApp);
+        return shared.filter(sameApp);
     };
     let tree = req.since;
     let pending: string | undefined;
-    let windows = req.baseline ? refList(appWindows(req.baseline).map(w => w.ref)) : undefined;
+    const watch = windowWatch(appWindows, req.baseline);
     let everyWindow = req.baseline ? new Set(req.baseline.map(w => w.ref)) : undefined;
     const signature = (): Promise<string> => treeChangesSignature(req.window!);
     const check: Check = async final => {
-        const all = await listAllWindows();
+        const { all, shared } = await windowsWithSharing();
         everyWindow ??= new Set(all.map(w => w.ref));
-        const listed = appWindows(all);
-        const now = refList(listed.map(w => w.ref));
-        windows ??= now;
-        if (now !== windows) return opened(listed, windows);
-        const fronted = openedFor(all, everyWindow, req.window!);
+        const opened = watch(all, shared);
+        if (opened.hit !== false) return opened;
+        const fronted = openedFor(shared, everyWindow, req.window!);
         if (fronted) return { hit: asElement(fronted) };
         const sig = await signature();
         tree ??= sig;
@@ -430,7 +483,51 @@ function unlessAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promi
     return Promise.race([p, aborted]).finally(() => signal.removeEventListener('abort', onAbort));
 }
 
+/** Why a wait on a window ends when the user stops sharing it. */
+export const NO_LONGER_SHARED = 'the user stopped sharing the window it was watching';
+
+/**
+ * Whether the user stopped sharing a window that is still open: a closed
+ * window is not that, and the waits and steps answer it the way they always
+ * have. False when the window list cannot be read: that is no news either way.
+ */
+export async function unsharedNow(ref: string): Promise<boolean> {
+    try {
+        // Not windowsWithSharing: this runs from sharing listeners, which
+        // judge what changed and must not prune shares themselves.
+        const all = await listAllWindows();
+        const w = all.find(x => x.ref === ref);
+        return w !== undefined && !isShared(w, all);
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Keep an eye on a waited-on window's share: once the user stops sharing it,
+ * nothing more is read from it or reported about it, however the polls go.
+ */
+function watchShare(window: string | undefined): { revoked: () => boolean; stop: () => void } {
+    if (!window) return { revoked: () => false, stop: () => undefined };
+    let revoked = false;
+    const stop = onSharingChanged(() => {
+        void unsharedNow(window).then(gone => {
+            revoked ||= gone;
+        });
+    });
+    return { revoked: () => revoked, stop: () => void stop() };
+}
+
 export async function waitForElement(req: WaitRequest): Promise<WaitOutcome> {
+    const share = watchShare(req.window);
+    try {
+        return await waitLoop(req, share.revoked);
+    } finally {
+        share.stop();
+    }
+}
+
+async function waitLoop(req: WaitRequest, revoked: () => boolean): Promise<WaitOutcome> {
     const started = Date.now();
     const check = makeCheck(req);
     const pollMs = check.slow ? Math.max(req.pollMs, CHANGES_MIN_POLL_MS) : req.pollMs;
@@ -456,6 +553,7 @@ export async function waitForElement(req: WaitRequest): Promise<WaitOutcome> {
             failures = 0;
             succeeded += 1;
         } catch (err) {
+            if (revoked()) return { met: false, waitedMs: elapsed(), polls, ended: 'gave-up', reason: NO_LONGER_SHARED };
             // Never judge a condition on a failed check: an empty result from
             // a helper timeout used to read as "disappears: met".
             if (req.window && isWindowGone(err)) {
@@ -481,6 +579,8 @@ export async function waitForElement(req: WaitRequest): Promise<WaitOutcome> {
             continue;
         }
 
+        // A check that ran as the user stopped sharing the window says nothing.
+        if (revoked()) return { met: false, waitedMs: elapsed(), polls, ended: 'gave-up', reason: NO_LONGER_SHARED };
         if (hit !== false) return { met: true, waitedMs: elapsed(), element: hit ?? undefined, polls };
         if (last) return { met: false, waitedMs: elapsed(), polls, ended: 'last-check', seen };
         if (elapsed() >= req.timeoutMs) return { met: false, waitedMs: elapsed(), polls, seen };

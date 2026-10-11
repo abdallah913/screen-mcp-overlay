@@ -74,8 +74,10 @@ test('a window that opens during the step meets a window-only until', async () =
             list_windows: () => {
                 lists += 1;
                 // Two lists happen before drawing (resolving the window, the baseline).
+                // The dialog is owned by Notepad, which is what shares it with
+                // Notepad; the windows the steps open below are owned the same way.
                 return lists > 3
-                    ? [{ ...desktop.windows[0], foreground: false }, { ...desktop.windows[1], ref: '500', title: 'Export As', foreground: true }, ...desktop.windows.slice(1)]
+                    ? [{ ...desktop.windows[0], foreground: false }, { ...desktop.windows[1], ref: '500', title: 'Export As', foreground: true, owner: '100' }, ...desktop.windows.slice(1)]
                     : desktop.windows;
             }
         },
@@ -166,10 +168,19 @@ test('a met step swaps its circle for a brief check mark', async () => {
 test('a covered target is drawn with a warning; an untitled popup on top is not a cover', async () => {
     fakeHelper({
         find_elements: finder(() => [saved]),
-        covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] })
+        covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Calculator'] })
     });
     let r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
-    assert.match(r.text, /WARNING: "Save" \[button\] el_1 is 85% behind "Google Chrome"; focus_window \{window:"Untitled - Notepad"\}/);
+    assert.match(r.text, /WARNING: "Save" \[button\] el_1 is 85% behind "Calculator"; focus_window \{window:"Untitled - Notepad"\}/);
+
+    // A cover the user did not share is not named, nor measured to the percent.
+    fakeHelper({
+        find_elements: finder(() => [saved]),
+        covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] })
+    });
+    r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
+    assert.match(r.text, /WARNING: "Save" \[button\] el_1 is mostly behind another window; focus_window \{window:"Untitled - Notepad"\}/);
+    assert.equal(/Chrome|85%/.test(r.text), false, r.text);
 
     fakeHelper({
         find_elements: finder(() => [saved]),
@@ -332,7 +343,7 @@ test('NOT met names a window that opened instead, and leaves the circle up', asy
             // The dialog pops up once the step is under way.
             find_elements: finder(() => (asked++, [])),
             list_windows: () =>
-                asked > 1 ? [...desktop.windows, { ...desktop.windows[1], ref: '500', title: 'Save changes?', foreground: true }] : desktop.windows
+                asked > 1 ? [...desktop.windows, { ...desktop.windows[1], ref: '500', title: 'Save changes?', foreground: true, owner: '100' }] : desktop.windows
         },
         desktop
     );
@@ -410,7 +421,7 @@ test('until "changes" without a selector fires on a dialog opening', async () =>
         {
             find_elements: finder(() => []),
             // Notepad's own dialog: the step window's app.
-            list_windows: () => (++lists > 3 ? [...desktop.windows, { ...desktop.windows[0], ref: '600', title: 'Font', foreground: false }] : desktop.windows)
+            list_windows: () => (++lists > 3 ? [...desktop.windows, { ...desktop.windows[0], ref: '600', title: 'Font', foreground: false, owner: '100' }] : desktop.windows)
         },
         desktop
     );
@@ -499,7 +510,10 @@ test('a click where the target is, but covered, is not a hit', async () => {
     fakeHelper({ covered: p => (p.rect ? { fraction: 0.6, centre_covered: true, by: ['Google Chrome'] } : { fraction: 0, centre_covered: false, by: [] }) });
     const { result } = await pending('highlight_and_wait', pointed);
     addClick(click(160, 160));
-    assert.match((await result).text, /^The user clicked where the target is \(160,160 on display 1\), but it was covered by "Google Chrome"/);
+    const { text } = await result;
+    // Google Chrome is not shared, so it is "another window".
+    assert.match(text, /^The user clicked where the target is \(160,160 on display 1\), but it was covered by another window, so/);
+    assert.equal(/Chrome/.test(text), false, text);
 });
 
 test('Escape in click mode is an answer, not an error', async () => {
@@ -790,22 +804,21 @@ test('a last check that fails once and then succeeds is judged on the retry', as
 
 test('an unselected "changes" ignores a window minimised, and windows of other apps', async () => {
     const desktop = fakeDesktop();
+    const reminder = { ...desktop.windows[1], ref: '700', pid: 99, title: 'Reminder', exe: 'reminders.exe' };
     let lists = 0;
     fakeHelper(
         {
             find_elements: finder(() => []),
             list_windows: () =>
                 ++lists > 3
-                    ? [
-                          desktop.windows[0],
-                          { ...desktop.windows[1], minimized: true },
-                          ...desktop.windows.slice(2),
-                          { ...desktop.windows[1], ref: '700', pid: 99, title: 'Reminder' }
-                      ]
+                    ? [desktop.windows[0], { ...desktop.windows[1], minimized: true }, ...desktop.windows.slice(2), reminder]
                     : desktop.windows
         },
         desktop
     );
+    // Shared too, as an app the user shares whole, so it is reported; one
+    // that is not shared is not even that (privacy-guide.test.mjs).
+    harness.shareApp('reminders.exe');
     const { text } = await call('highlight_and_wait', { ...watched, until: { condition: 'changes' }, timeoutMs: 2500 });
     assert.match(text, /^NOT met: "changes" did not happen/);
     assert.match(text, /\+ window 700 "Reminder"/);
@@ -951,8 +964,8 @@ test('restoring a minimised window does not meet a window until', async () => {
 test('"changes" on a named window waits for that window, not any', async () => {
     const desktop = fakeDesktop();
     let lists = 0;
-    const font = { ...desktop.windows[1], ref: '600', title: 'Font' };
-    const saveAs = { ...desktop.windows[1], ref: '601', title: 'Save As' };
+    const font = { ...desktop.windows[1], ref: '600', title: 'Font', owner: '100' };
+    const saveAs = { ...desktop.windows[1], ref: '601', title: 'Save As', owner: '100' };
     fakeHelper(
         {
             list_windows: () => (++lists > 4 ? [...desktop.windows, font, saveAs] : lists > 2 ? [...desktop.windows, font] : desktop.windows)
@@ -979,7 +992,7 @@ test('a step whose target is missing is not "already done" just because a disapp
 
 test('a step in a dialog that is still filling in waits for its target before the precheck', async () => {
     const desktop = fakeDesktop();
-    const exportDialog = { ...desktop.windows[0], ref: '500', title: 'Export', foreground: true };
+    const exportDialog = { ...desktop.windows[0], ref: '500', title: 'Export', foreground: true, owner: '100' };
     const ok = { ref: 'el_40', name: 'OK', role: 'button', rect: rect(400, 400, 60, 24), enabled: true };
     let open = false;
     let okFinds = 0;
@@ -1017,7 +1030,7 @@ test('a step in a dialog that is still filling in waits for its target before th
 
 test('after a dialog closes, the plan carries on in its app\'s other window', async () => {
     const desktop = fakeDesktop();
-    const dialog = { ...desktop.windows[0], ref: '500', title: 'Options', foreground: true };
+    const dialog = { ...desktop.windows[0], ref: '500', title: 'Options', foreground: true, owner: '100' };
     const ok = { ref: 'el_40', name: 'OK', role: 'button', rect: rect(400, 400, 60, 24), enabled: true };
     let closed = false;
     let okFinds = 0;
@@ -1055,7 +1068,7 @@ test('after a dialog closes, the plan carries on in its app\'s other window', as
 
 test('"already done" hands the next step the window its until named', async () => {
     const desktop = fakeDesktop();
-    const saveAs = { ...desktop.windows[0], ref: '500', title: 'Save As', foreground: false };
+    const saveAs = { ...desktop.windows[0], ref: '500', title: 'Save As', foreground: false, owner: '100' };
     const fileName = { ref: 'el_41', name: 'File name', role: 'edit', rect: rect(400, 400, 60, 24), enabled: true };
     let savedFinds = 0;
     const { calls } = fakeHelper(

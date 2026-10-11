@@ -11,14 +11,15 @@ import { store } from '../../store.js';
 import { beginStep } from '../../steps.js';
 import { postToHud } from '../../hud.js';
 import { listDisplays } from '../../displays.js';
+import { ANOTHER_WINDOW, PANEL_COVER, safeCoverNames } from '../../anchors.js';
+import { isShared, onSharingChanged, sharedOf, sharedWindows, windowsWithSharing } from '../../sharing.js';
 import {
     coverage,
     describeWindow,
     elementAtPoint,
     knownControl,
-    listAllWindows,
     resolveRefs,
-    resolveWindow,
+    windowStack,
     type Coverage,
     type PointHit,
     type WindowInfo
@@ -26,6 +27,7 @@ import {
 import {
     changesBaseline,
     isTopLevelWait,
+    unsharedNow,
     waitForElement,
     type WaitCondition,
     type WaitOutcome,
@@ -33,7 +35,14 @@ import {
 } from '../../waits.js';
 import { answerText } from './answers.js';
 import { CONDITIONS, DEFAULT_COLORS, WINDOW, guarded, isWindowRole, selectorFields, text } from './common.js';
-import { anchorNotes, placeAnchored, resolveAnchor, type ResolvedAnchor } from './anchoring.js';
+import {
+    anchorNotes,
+    placeAnchored,
+    resolveAnchor,
+    sharedWindowFor,
+    type ResolvedAnchor,
+    type SharedTarget
+} from './anchoring.js';
 
 /**
  * Waiting on the user and the UI: highlight_and_wait, wait_for_element,
@@ -44,6 +53,12 @@ import { anchorNotes, placeAnchored, resolveAnchor, type ResolvedAnchor } from '
  * silence, or the client going away. Errors are kept for what the agent got
  * wrong (a malformed until, a control that is not there) and for a helper that
  * failed, because those are the cases where retrying differently helps.
+ *
+ * Only shared windows are ever named (see sharing.ts). The full window list is
+ * read to judge what opened, closed or covers a target, but a window the user
+ * did not share is left out of every report without a trace: not its title,
+ * not that it opened, not that it is in front, not a count. A step cannot
+ * move into one, and a click on one is reported as a point and nothing more.
  */
 
 // ------------------------------------------------------------------ shapes
@@ -76,7 +91,27 @@ interface StepOptions {
     findRetryMs: number;
     /** "Step 2/3: ", leading every line of a plan's step. */
     label: string;
+    /** The window was carried over from the previous step, not named by the agent. */
+    carried?: boolean;
 }
+
+/**
+ * The window list at the start of a step: all of it, to judge what changed,
+ * and which of it was shared then, so that a shared window that closes is
+ * still reported once its share has gone with it.
+ */
+interface Before {
+    all: WindowInfo[];
+    shared: ReadonlySet<string>;
+}
+
+const beforeOf = (all: WindowInfo[], shared: readonly WindowInfo[]): Before => ({
+    all,
+    shared: new Set(shared.map(w => w.ref))
+});
+
+/** The shared windows now, for naming covers; none when the list cannot be read, so every cover is generic. */
+const sharedNow = (): Promise<WindowInfo[]> => sharedWindows().catch(() => []);
 
 interface StepResult {
     /** The step is done, so a plan may go on. */
@@ -141,8 +176,8 @@ function waitSummary(req: WaitRequest, o: WaitOutcome, how = ''): string {
 }
 
 const UNSCOPED_NOTE =
-    '\nNote: not scoped to a window, so every check walked the whole desktop (seconds each, and the ' +
-    'timeout can overshoot). Pass window to make it near-instant.';
+    '\nNote: not scoped to a window, so every check searched each shared window in turn (seconds each, and ' +
+    'the timeout can overshoot). Pass window to make it near-instant.';
 
 // ------------------------------------------------------------- where things are
 
@@ -162,10 +197,11 @@ function offsetFrom(r: Rect, p: { x: number; y: number }, scale: number): string
  * What was circled and where, for the response and the panel's step card. The
  * resolver already says where the target sits when it could tell
  * (resolveAnchor's label is "what, where"); only fill the gap when it could not.
+ * `shared` is the shared windows: no other window is named.
  */
-function targetLabel(target: ResolvedAnchor, windowRef: string, windows: WindowInfo[]): string {
+function targetLabel(target: ResolvedAnchor, windowRef: string, shared: readonly WindowInfo[]): string {
     if (target.where) return target.label;
-    const win = windows.find(w => w.ref === windowRef);
+    const win = shared.find(w => w.ref === windowRef);
     const spot = win ? whereIn(target.rect, win.rect) : null;
     return `${target.label}, ${spot && win ? `${spot} of ${quote(win.title)}` : `in window ${windowRef}`}`;
 }
@@ -196,9 +232,11 @@ const MIN_ON_SCREEN = 0.5;
  * mostly past the edge of every display, or on another display than the
  * window in front of them (usually the agent's own terminal). Null when it is
  * in plain view. The overlay points the way on screen; this lets the agent
- * say it in words too.
+ * say it in words too. `shared` is the shared windows: when the window in
+ * front is not one of them, where it is is none of the agent's business, and
+ * nothing is said.
  */
-function displayNote(rect: Rect, windows: WindowInfo[]): string | null {
+function displayNote(rect: Rect, shared: readonly WindowInfo[]): string | null {
     const displays = screen.getAllDisplays();
     const dip = toDip(rect);
     const inside = displays.reduce((sum, d) => sum + overlapArea(dip, d.bounds), 0);
@@ -207,7 +245,7 @@ function displayNote(rect: Rect, windows: WindowInfo[]): string | null {
         const how = share === 0 ? 'off-screen' : `partly off-screen (${Math.round(share * 100)}% visible)`;
         return `Note: the target is ${how}; ask the user to move its window into view.`;
     }
-    const front = windows.find(w => w.foreground && onScreen(w));
+    const front = shared.find(w => w.foreground && onScreen(w));
     if (displays.length < 2 || !front) return null;
     const home = screen.getDisplayMatching(dip);
     const theirs = screen.getDisplayMatching(toDip(front.rect));
@@ -241,20 +279,30 @@ function goneWhy(reason: Annotation['hiddenReason'], windowTitle: string): strin
  * Untitled windows on top are left out: an open menu or dropdown is an
  * untitled top-level popup of the app itself, and counting it would warn on
  * every menu step. A tooltip is untitled too, and passes in a moment.
+ *
+ * Covers are named only when shared (or the panel), as `shared` allows; any
+ * other is "another window", and how much it hides is said in words, not a
+ * percentage that would trace its outline as the user moves it.
  */
-function coveredNote(c: Coverage, what: string, windowTitle: string): string | null {
-    const by = c.by.filter(t => clean(t) !== '');
+function coveredNote(c: Coverage, what: string, windowTitle: string, shared: readonly WindowInfo[]): string | null {
+    const by = safeCoverNames(c.by, shared).filter(Boolean);
     if (by.length === 0 || !(c.centre_covered || c.fraction >= 0.5)) return null;
     // Raising the app would not help when our own panel is what is on top,
     // and the agent cannot move it: only the user can.
-    const fix = by.every(t => t === PANEL)
+    const fix = by.every(t => t === PANEL_COVER)
         ? 'ask the user to drag the chat panel aside or hide it with Ctrl+Shift+O.'
         : `focus_window {window:${JSON.stringify(windowTitle)}} brings it forward.`;
-    return `WARNING: ${what} is ${Math.round(c.fraction * 100)}% behind ${by.slice(0, 2).map(quote).join(', ')}; ${fix}`;
+    const how = by.includes(ANOTHER_WINDOW) ? roughly(c.fraction) : `${Math.round(c.fraction * 100)}%`;
+    return `WARNING: ${what} is ${how} behind ${by.slice(0, 2).map(nameOrPhrase).join(', ')}; ${fix}`;
 }
 
-/** How the helper names the chat panel when it is what covers a target. */
-const PANEL = "the overlay's chat panel";
+/** A cover's name for a sentence: a title quoted, the generic phrase as it is. */
+const nameOrPhrase = (name: string): string => (name === ANOTHER_WINDOW ? name : quote(name));
+
+/** How much of a target an unshared window hides, coarse enough to say nothing of its shape. */
+function roughly(fraction: number): string {
+    return fraction >= 0.9 ? 'almost entirely' : fraction >= 0.5 ? 'mostly' : 'partly';
+}
 
 /**
  * Coverage of a control, measured against the top-level window it actually
@@ -296,11 +344,9 @@ async function targetStatus(circleId: string | undefined, windowRef: string, win
     }
     if (!rect) return 'The circled control is not on screen now.';
     const c = await coverageOf(windowRef, rect, circle.anchor.ref);
-    const covered = c && coveredNote(c, 'the circled control', windowTitle);
+    const covered = c && c.by.length > 0 ? coveredNote(c, 'the circled control', windowTitle, await sharedNow()) : null;
     if (covered) return covered;
-    if (c && c.fraction > 0.2) {
-        return `The circled control is ${Math.round(c.fraction * 100)}% covered by another window.`;
-    }
+    if (c && c.fraction > 0.2) return `The circled control is ${roughly(c.fraction)} covered by another window.`;
     return 'The circled control is visible and uncovered: ask what they see, or describe it differently.';
 }
 
@@ -309,11 +355,33 @@ async function targetStatus(circleId: string | undefined, windowRef: string, win
 /** Roles too coarse to name: a click on a canvas or page says only which window. */
 const COARSE_ROLES = new Set(['pane', 'window', 'document']);
 
-function hitText(hit: PointHit): string | null {
+/**
+ * What a click on anything but a shared window is called: a window the user
+ * kept private and the bare desktop read the same, with no name, no control
+ * and no ref to anchor to. A click is not the user sharing what they clicked.
+ */
+const OUTSIDE = 'outside the shared windows';
+
+function hitText(hit: PointHit & { window: NonNullable<PointHit['window']> }): string {
     const e = hit.element;
-    const inWindow = hit.window ? ` in ${quote(hit.window.title)}` : '';
+    const inWindow = ` in ${quote(hit.window.title)}`;
     if (e && clean(e.name) && !COARSE_ROLES.has(e.role)) return `${quote(e.name)} [${e.role}] ${e.ref}${inWindow}`;
-    return hit.window ? `the window ${quote(hit.window.title)}` : null;
+    return `the window ${quote(hit.window.title)}`;
+}
+
+/**
+ * Whether the top-level window under a click is shared. An open menu or
+ * dropdown is an untitled popup the window list leaves out; the full stack
+ * says which window owns it, and a shared window's own popups are shared.
+ */
+async function hitShared(ref: string): Promise<boolean> {
+    const { all } = await windowsWithSharing();
+    const listed = all.find(w => w.ref === ref);
+    if (listed) return isShared(listed, all);
+    // Unreadable reads as not shared: a click is named only when that is known.
+    const stack = await windowStack().catch(() => []);
+    const popup = stack.find(w => w.ref === ref);
+    return popup !== undefined && isShared(popup, [...all, ...stack]);
 }
 
 /**
@@ -321,18 +389,24 @@ function hitText(hit: PointHit): string | null {
  * the helper reads virtual-screen physical pixels; with monitors at different
  * scales the two layouts are not a uniform scaling of each other, so the
  * conversion goes through Electron rather than arithmetic. Best effort: a
- * failed read leaves the click unnamed, never loses it.
+ * failed read leaves the click unnamed, never loses it. OUTSIDE when the
+ * point is on no shared window.
  */
 async function nameClick(c: ClickResult): Promise<string | null> {
     try {
         const d = screen.getAllDisplays().find(x => String(x.id) === c.displayId);
         if (!d) return null;
         const p = screen.dipToScreenPoint({ x: d.bounds.x + c.dip.x, y: d.bounds.y + c.dip.y });
-        return hitText(await elementAtPoint(p.x, p.y));
+        const hit = await elementAtPoint(p.x, p.y);
+        if (!hit.window || !(await hitShared(hit.window.ref))) return OUTSIDE;
+        return hitText({ ...hit, window: hit.window });
     } catch {
         return null;
     }
 }
+
+/** ", on <what>" for a named click, ", outside the shared windows" otherwise, or ''. */
+const onWhat = (named: string | null): string => (!named ? '' : named === OUTSIDE ? `, ${OUTSIDE}` : `, on ${named}`);
 
 /**
  * Display-local DIPs to global DIPs. A drawing belongs to one display but is
@@ -428,14 +502,21 @@ interface WindowDelta {
     minimized: WindowInfo[];
 }
 
-/** Windows that opened, closed or were minimised since `before`; both lists include minimised windows. */
-function windowDelta(before: WindowInfo[], now: WindowInfo[]): WindowDelta {
-    const was = new Map(before.map(w => [w.ref, w]));
+/**
+ * Shared windows that opened, closed or were minimised since `before`; both
+ * lists include minimised windows. Judged on every window, so restoring or
+ * sharing a window is not it opening, then cut down to the shared ones: an
+ * unshared window's comings and goings are left out without a count.
+ */
+function windowDelta(before: Before, now: WindowInfo[]): WindowDelta {
+    const was = new Map(before.all.map(w => [w.ref, w]));
     const is = new Set(now.map(w => w.ref));
+    const shared = new Set(sharedOf(now).map(w => w.ref));
     return {
-        opened: now.filter(w => !was.has(w.ref)),
-        closed: before.filter(w => !is.has(w.ref)),
-        minimized: now.filter(w => w.minimized && was.get(w.ref)?.minimized === false)
+        opened: now.filter(w => !was.has(w.ref) && shared.has(w.ref)),
+        // Shared when the step began: a window's own share goes when it closes.
+        closed: before.all.filter(w => !is.has(w.ref) && before.shared.has(w.ref)),
+        minimized: now.filter(w => w.minimized && was.get(w.ref)?.minimized === false && shared.has(w.ref))
     };
 }
 
@@ -465,19 +546,20 @@ function cappedDiff(lines: string[], cap: number, sinceId: string): string[] {
  * one here, never one per poll.
  */
 async function afterBlock(
-    before: WindowInfo[],
+    before: Before,
     windowRef: string | undefined,
     start: { id: string; nodes: SnapshotNode[] } | undefined
 ): Promise<string> {
     let now: WindowInfo[];
     try {
-        now = await listAllWindows();
+        now = (await windowsWithSharing()).all;
     } catch {
         return '';
     }
     const delta = windowDelta(before, now);
     const lines = windowLines(delta);
 
+    // Only a shared window is described: the delta holds no other.
     const shown = delta.opened.filter(onScreen);
     const fresh = shown.find(w => w.foreground) ?? shown[0];
     if (fresh) {
@@ -500,7 +582,7 @@ async function afterBlock(
  */
 async function failureDigest(ctx: {
     req: WaitRequest;
-    before: WindowInfo[];
+    before: Before;
     windowRef: string;
     windowTitle: string;
     start?: { id: string; nodes: SnapshotNode[] };
@@ -510,8 +592,9 @@ async function failureDigest(ctx: {
 }): Promise<string> {
     const out: string[] = [];
     let now: WindowInfo[] | undefined;
+    let shared: WindowInfo[] = [];
     try {
-        now = await listAllWindows();
+        ({ all: now, shared } = await windowsWithSharing());
     } catch {
         // Leave the window part out rather than fail the report: against an
         // empty list, every window would read as closed.
@@ -521,8 +604,10 @@ async function failureDigest(ctx: {
     const opened = delta.opened.filter(onScreen);
     const listed = windowLines(delta);
     if (listed.length) out.push(`Since the step began:\n${listed.join('\n')}`);
+    // Where the user went is said only when it is somewhere shared. Saying
+    // "another window" would tell the agent they are in something private.
     const front = now?.find(w => w.foreground);
-    if (front) out.push(`Foreground: ${quote(front.title)}.`);
+    if (front && shared.some(w => w.ref === front.ref)) out.push(`Foreground: ${quote(front.title)}.`);
 
     const status = await targetStatus(ctx.circleId, ctx.windowRef, ctx.windowTitle);
     if (status && !(ctx.warnedCovered && status.startsWith('WARNING:'))) out.push(status);
@@ -594,7 +679,7 @@ async function waitPlan(u: Until, windowRef: string, before: WindowInfo[]): Prom
     const topLevel = isWindowRole(u.role) && !u.window && !u.automationId;
     return {
         condition: u.condition,
-        window: u.window ? await resolveWindow(u.window) : topLevel ? undefined : windowRef,
+        window: u.window ? (await sharedWindowFor(u.window)).ref : topLevel ? undefined : windowRef,
         name: u.name,
         role: topLevel ? 'window' : u.role,
         automationId: u.automationId,
@@ -632,19 +717,23 @@ function settledIn(o: WaitOutcome, plan: WaitPlan, windowRef: string): string {
  * The window a plan's next step runs in. Usually where this step's until
  * settled, but a step that closes a dialog ("Click OK") settles in a window
  * that no longer exists, and the user is back in the app's other window: the
- * one in front, else any. Failing that, whatever is in front now.
+ * one in front, else any. Failing that, whatever is in front now. Only a
+ * shared window is ever chosen: a plan never wanders into one the user kept
+ * private, even of the same app. A window that is still open stays the
+ * answer, shared or not, and the next step refuses it if it is not.
  */
-async function nextWindow(ref: string, before: WindowInfo[]): Promise<string> {
-    let now: WindowInfo[];
+async function nextWindow(ref: string, before: Before): Promise<string> {
+    let all: WindowInfo[];
+    let shared: WindowInfo[];
     try {
-        now = await listAllWindows();
+        ({ all, shared } = await windowsWithSharing());
     } catch {
         // The next step resolves the window itself and reports what it finds.
         return ref;
     }
-    if (now.some(w => w.ref === ref)) return ref;
-    const pid = before.find(w => w.ref === ref)?.pid;
-    const shown = now.filter(onScreen);
+    if (all.some(w => w.ref === ref)) return ref;
+    const pid = before.all.find(w => w.ref === ref)?.pid;
+    const shown = shared.filter(onScreen);
     const sameApp = shown.filter(w => w.pid === pid);
     return (sameApp.find(w => w.foreground) ?? sameApp[0] ?? shown.find(w => w.foreground))?.ref ?? ref;
 }
@@ -796,6 +885,38 @@ function hiddenNote(stretch: HiddenStretch | undefined, windowTitle: string): st
         : `Note: the circled control was off screen for ${secs}s during the step${why ? ` (${why})` : ''}.`;
 }
 
+/** A plan's next window is not shared, or has gone: it says which of the two no more than a refusal does. */
+const NEXT_NOT_SHARED =
+    'the window it would run in is not shared (or has closed); list_windows with ask:"<why you need it>" asks the ' +
+    'user to share it';
+
+/** A step whose window the user stopped sharing while it was up. */
+const NO_LONGER_SHARED_STEP =
+    'NOT done: the user stopped sharing the window this step was in, so the step ended. Nothing more is read from ' +
+    'it; list_windows with ask:"<why you need it>" asks them to share it again.';
+
+/**
+ * Listen for the user to stop sharing a step's window while it is up. Closing
+ * is not that: a step whose window closes is answered as it always was.
+ * `revoked` asks the window list only when sharing changed during the step.
+ */
+function watchShare(ref: string, onRevoked: () => void): { revoked: () => Promise<boolean>; stop: () => void } {
+    let changed = false;
+    let revoked = false;
+    const off = onSharingChanged(() => {
+        changed = true;
+        void unsharedNow(ref).then(gone => {
+            if (!gone || revoked) return;
+            revoked = true;
+            onRevoked();
+        });
+    });
+    return {
+        revoked: async () => revoked || (changed && (await unsharedNow(ref))),
+        stop: () => void off()
+    };
+}
+
 function prefixed(label: string, body: string): string {
     return label ? `${label}${body}` : body;
 }
@@ -809,10 +930,21 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
     if (u && u.condition !== 'changes' && !(u.name || u.role || u.automationId)) {
         throw new Error('until needs name, automationId or role (or condition "changes")');
     }
-    const windowRef = await resolveWindow(spec.window);
-    const before = await listAllWindows();
-    const windowTitle = clean(before.find(w => w.ref === windowRef)?.title ?? windowRef);
-    const plan = u ? await waitPlan(u, windowRef, before) : undefined;
+    let home: SharedTarget;
+    try {
+        home = await sharedWindowFor(spec.window, opts.carried);
+    } catch (err) {
+        // A plan's next window was worked out here, not named by the agent:
+        // the refusal would echo a ref it never saw.
+        if (opts.carried) throw new Error(NEXT_NOT_SHARED);
+        throw err;
+    }
+    const windowRef = home.ref;
+    // Every window, for what changes; only the shared ones are ever named.
+    const before = beforeOf(home.all, home.shared);
+    const shared = home.shared;
+    const windowTitle = clean(home.window.title);
+    const plan = u ? await waitPlan(u, windowRef, before.all) : undefined;
     const result = (ok: boolean, body: string, line = body.split('\n')[0]!, next = windowRef): StepResult => ({
         ok,
         text: prefixed(opts.label, body),
@@ -872,7 +1004,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
             );
         }
         const c = await coverageOf(target.top ?? windowRef, target.rect, target.ref);
-        const covered = c && coveredNote(c, target.what, windowTitle);
+        const covered = c && coveredNote(c, target.what, windowTitle, shared);
         if (covered) {
             warnings.push(covered);
             warnedCovered = true;
@@ -881,7 +1013,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         // another desktop), less the two this step has just reported its own way.
         const notes = anchorNotes({ ...target, offscreen: undefined, covered: undefined }).trim();
         if (notes) warnings.push(notes);
-        const elsewhere = displayNote(target.rect, before);
+        const elsewhere = displayNote(target.rect, shared);
         if (elsewhere) warnings.push(elsewhere);
     }
 
@@ -904,7 +1036,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         postToHud(spec.prompt, 'info');
     }
     const circleId = drawn[0]?.id;
-    const label = target ? targetLabel(target, windowRef, before) : undefined;
+    const label = target ? targetLabel(target, windowRef, shared) : undefined;
     const circled = label ? `Circled ${label}.` : '';
     const notes: string[] = [];
     const tail = (body: string): string => [body, circled, ...warnings, ...notes].filter(Boolean).join('\n');
@@ -928,6 +1060,11 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         progress: progress ? { n: progress.n, of: progress.of } : undefined,
         target: label
     });
+    // The user may stop sharing the step's window while it is up: the step
+    // ends then, and nothing more is read from the window or said about it.
+    // Listening ends with the step; what it heard is kept for the report.
+    const share = watchShare(windowRef, () => step.end());
+    void step.answer.finally(share.stop);
     const startedAt = Date.now();
     const gone = giveUpWhenGone(circleId, windowTitle);
 
@@ -952,6 +1089,10 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         const a = await step.answer;
         store.off('annotations', removed);
         const stretch = stopWatching();
+        if (await share.revoked()) {
+            clearCircle();
+            return result(false, NO_LONGER_SHARED_STEP);
+        }
         const waited = Date.now() - startedAt;
         const verdict =
             a.kind === 'ended' && goneFor
@@ -1012,12 +1153,17 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
         if ('err' in first) {
             stopWatching();
             clearCircle();
+            if (await share.revoked()) return result(false, NO_LONGER_SHARED_STEP);
             throw first.err;
         }
         outcome = first.o;
     }
     if (outcome?.ended !== 'gave-up') notes.push(hiddenNote(stopWatching(), windowTitle));
     else stopWatching();
+    if (await share.revoked()) {
+        clearCircle();
+        return result(false, NO_LONGER_SHARED_STEP);
+    }
 
     const req: WaitRequest = { ...plan, timeoutMs: opts.timeoutMs, pollMs: 400 };
 
@@ -1081,7 +1227,7 @@ async function clickVerdict(
     const atClick = circleId ? store.list().find(x => x.id === circleId) : undefined;
     const circle = atClick ? { ...atClick } : undefined;
     const named = await nameClick(click);
-    const on = named ? `, on ${named}` : '';
+    const on = onWhat(named);
     if (!circleId) return { ok: true, text: `The user clicked at ${where}${on}.` };
     if (!circle) {
         return {
@@ -1120,13 +1266,14 @@ async function clickVerdict(
     if (circle.anchor) {
         const [live] = await resolveRefs([circle.anchor.ref]).catch(() => []);
         const c = live?.rect ? await coverageOf(windowRef, live.rect, circle.anchor.ref) : null;
-        const by = c?.centre_covered ? c.by.find(t => clean(t) !== '') : undefined;
+        const covering = c?.centre_covered ? c.by.filter(t => clean(t) !== '') : [];
+        const by = covering.length > 0 ? safeCoverNames(covering, await sharedNow())[0] : undefined;
         if (by !== undefined) {
             return {
                 ok: false,
                 text:
-                    `The user clicked where the target is (${where}), but it was covered by ${quote(by)}, so ` +
-                    'they may have meant that window. The app did not receive the click.'
+                    `The user clicked where the target is (${where}), but it was covered by ${nameOrPhrase(by)}, ` +
+                    'so they may have meant that window. The app did not receive the click.'
             };
         }
     }
@@ -1181,7 +1328,15 @@ async function runPlan(
         try {
             r = await runStep(
                 { ...s, window, prompt },
-                { ...opts, timeoutMs: Math.min(opts.timeoutMs, remaining), findRetryMs: i > 0 ? 3000 : 0, label }
+                {
+                    ...opts,
+                    timeoutMs: Math.min(opts.timeoutMs, remaining),
+                    findRetryMs: i > 0 ? 3000 : 0,
+                    label,
+                    // Each step's window is checked again: the one a step
+                    // settled in may not be shared, or may no longer be.
+                    carried: i > 0
+                }
             );
         } catch (err) {
             // The first step failing is the call failing; a later one is a
@@ -1267,7 +1422,7 @@ export function registerGuide(server: McpServer): void {
                     .optional()
                     .describe(
                         'The state that proves the step is done. Searched in the step\'s window unless window ' +
-                            'is given; role "window" alone waits for a new top-level window.'
+                            'is given; role "window" alone waits for a new shared window.'
                     ),
                 then: z
                     .array(
@@ -1324,9 +1479,9 @@ export function registerGuide(server: McpServer): void {
             title: 'Wait for the UI to reach a state',
             description:
                 'Block until a control appears, disappears, becomes enabled or changes (name, value, state; ' +
-                'with no selector, a window opening or closing), in one call instead of polling with ' +
+                'with no selector, a shared window opening or closing), in one call instead of polling with ' +
                 'screenshots. timeoutMs:0 checks once: a cheap assertion. role "window" without window waits ' +
-                'for a top-level window.',
+                'for a new shared window.',
             inputSchema: {
                 condition: z.enum(UNTIL_CONDITIONS),
                 ...selectorFields(),
@@ -1343,7 +1498,7 @@ export function registerGuide(server: McpServer): void {
                 }
                 const req: WaitRequest = {
                     condition: args.condition,
-                    window: args.window ? await resolveWindow(args.window) : undefined,
+                    window: args.window ? (await sharedWindowFor(args.window)).ref : undefined,
                     name: args.name,
                     role: isWindowRole(args.role) ? 'window' : args.role,
                     automationId: args.automationId,
@@ -1353,7 +1508,8 @@ export function registerGuide(server: McpServer): void {
                     signal
                 };
                 // Only a real wait reports what else changed; an assertion stays one line.
-                const before = args.timeoutMs > 0 ? await listAllWindows() : undefined;
+                const lists = args.timeoutMs > 0 ? await windowsWithSharing() : undefined;
+                const before = lists && beforeOf(lists.all, lists.shared);
                 const outcome = await withProgress(extra, `Waiting for "${req.condition}"`, () => waitForElement(req));
                 if (outcome.ended === 'aborted') return text('CANCELLED: the request was cancelled while waiting.');
                 // No user is waiting on this answer, so a helper that failed the

@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { rmSync } from 'node:fs';
 import type { Annotation, CaptureRecord, Point, Rect, StepView, UiSnapshot } from '../shared/types.js';
 
 /**
@@ -195,6 +196,33 @@ class Store extends EventEmitter {
 
     snapshot(id: string): UiSnapshot | undefined {
         return this.snapshots.get(id);
+    }
+
+    /**
+     * Forget what was read from windows the user stopped sharing: their tree
+     * snapshots (a since= diff would replay their controls) and their window
+     * captures, files included, since the capture directory is readable by
+     * the panel agent's own file tools. Returns how many records went.
+     */
+    forgetWindows(refs: ReadonlySet<string>): number {
+        if (refs.size === 0) return 0;
+        let n = 0;
+        for (const [id, s] of this.snapshots) {
+            if (!refs.has(s.windowRef)) continue;
+            this.snapshots.delete(id);
+            n += 1;
+        }
+        for (const [id, c] of this.captures) {
+            if (!c.windowRef || !refs.has(c.windowRef)) continue;
+            this.captures.delete(id);
+            n += 1;
+            try {
+                rmSync(c.path, { force: true });
+            } catch {
+                // A file still open elsewhere goes when the app quits, with the rest.
+            }
+        }
+        return n;
     }
 
     // ---- the pending step ---------------------------------------------------

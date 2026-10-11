@@ -16,8 +16,9 @@ import {
     toPhysicalRect
 } from '../../../shared/geometry.js';
 import { clean, isAmbiguous, recoveredMatch, whereIn } from '../../../shared/uitree.js';
-import { coverVerdict, windowBlocker } from '../../../shared/windows.js';
+import { isWindowRef, pickWindow, windowBlocker } from '../../../shared/windows.js';
 import { listDisplays, resolveDisplay } from '../../displays.js';
+import { noteRefused, windowsWithSharing } from '../../sharing.js';
 import { store } from '../../store.js';
 import {
     StaleRefError,
@@ -26,19 +27,91 @@ import {
     findElements,
     knownControl,
     resolveRefs,
-    resolveWindowInfo,
     suggestNames,
-    windowInfo,
     type ElementInfo,
     type WindowInfo
 } from '../../uia.js';
-import { findRanked, geometryFor, wakeAnchorTracking } from '../../anchors.js';
+import { ANOTHER_WINDOW, agentCoverVerdict, findRanked, geometryFor, wakeAnchorTracking } from '../../anchors.js';
 import { DEFAULT_COLORS, RECT_SHAPES } from './common.js';
 
 /**
  * Turning an agent's shapes into annotations: coordinate spaces, anchors, and
  * the validation both share. Used by annotate and by highlight_and_wait.
  */
+
+// ------------------------------------------------------------- sharing gate
+
+/** A window the agent named that the user shared, with the lists it was judged on. */
+export interface SharedTarget {
+    ref: string;
+    window: WindowInfo;
+    /** Why the user cannot see it right now (minimised, another desktop), when that is so. */
+    note?: string;
+    /** Every window, shared or not: for decisions only, never for wording. */
+    all: WindowInfo[];
+    /** What the agent may see. */
+    shared: WindowInfo[];
+}
+
+/** The most shared windows a refusal lists. */
+const REFUSAL_LIST = 8;
+
+/** Words that mean "whatever the user is looking at", as pickWindow takes them. */
+const FOREGROUND = new Set(['foreground', 'active', 'focused', 'current']);
+
+/**
+ * The one answer for a window the agent may not use: one that is not shared,
+ * one that is not open, and a made-up ref all read the same, so a refusal
+ * never tells the agent that something it guessed is open. It lists only
+ * what is shared, and may echo the agent's own query, which tells it nothing.
+ */
+export function notSharedMessage(query: string, shared: readonly WindowInfo[]): string {
+    const listed = shared
+        .slice(0, REFUSAL_LIST)
+        .map(w => `${w.ref} "${clean(w.title).slice(0, 50)}"`)
+        .join(', ');
+    const more = shared.length > REFUSAL_LIST ? ', …' : '';
+    return (
+        `no shared window matches "${clean(query)}"${listed ? `. Shared: ${listed}${more}` : ''}. ` +
+        'Windows stay private until the user shares them; list_windows with ask:"<why you need it>" asks the user to share one.'
+    );
+}
+
+/**
+ * Resolve a window the agent named (a ref, a title substring or "foreground")
+ * among the shared windows only, before anything is asked of the window
+ * itself: a refusal costs the same one window listing whether the window is
+ * open or not, and nothing about an unshared window is read. "foreground" is
+ * the window in front only when that is shared; otherwise it is refused as
+ * if nothing were in front, rather than quietly standing for another window.
+ * Throws the uniform refusal, and tells the user's panel, unless `internal`:
+ * a window the server carried over itself is no agent's request.
+ */
+export async function sharedWindowFor(query: string, internal = false): Promise<SharedTarget> {
+    const { all, shared } = await windowsWithSharing();
+    const q = query.trim();
+    let found: { window: WindowInfo; note?: string } | undefined;
+    if (isWindowRef(q)) {
+        const w = shared.find(x => x.ref === q);
+        found = w ? { window: w } : undefined;
+    } else if (FOREGROUND.has(q.toLowerCase())) {
+        const w = shared.find(x => x.foreground && !x.minimized && !x.cloaked);
+        found = w ? { window: w } : undefined;
+    } else {
+        const picked = pickWindow(q, shared);
+        found = typeof picked === 'string' ? undefined : picked;
+    }
+    if (!found) {
+        if (!internal) noteRefused(q);
+        throw new Error(notSharedMessage(q, shared));
+    }
+    return { ref: found.window.ref, window: found.window, note: found.note, all, shared };
+}
+
+/** A covered verdict in a sentence: a shared title quoted, the generic phrase as it is. */
+export function coveredBy(covered: string): string {
+    return covered === ANOTHER_WINDOW ? ANOTHER_WINDOW : `"${covered}"`;
+}
 
 // ------------------------------------------------------------------ geometry
 
@@ -171,7 +244,10 @@ export interface ResolvedAnchor {
     also?: string[];
     /** Scrolled out of view: drawn as a pointer toward it, not at its rect. */
     offscreen?: boolean;
-    /** Titles of the windows covering it, when it is mostly hidden behind them. */
+    /**
+     * What covers it, when it is mostly hidden: shared windows by title, the
+     * chat panel, or "another window" (see safeCoverNames).
+     */
     covered?: string;
     /** The window it was found in, for the hints a response gives. */
     window?: string;
@@ -212,7 +288,7 @@ export function anchorNotes(t: ResolvedAnchor): string {
             : t.window
               ? `focus_window {"window":"${t.window}"} brings it forward`
               : 'focus its window first';
-        lines.push(`WARNING: ${t.what} is behind "${t.covered}", so the user cannot see it; ${front}.`);
+        lines.push(`WARNING: ${t.what} is behind ${coveredBy(t.covered)}, so the user cannot see it; ${front}.`);
     }
     return lines.length > 0 ? `\n${lines.join('\n')}` : '';
 }
@@ -230,8 +306,8 @@ export async function resolveAnchor(a: AnchorInput): Promise<ResolvedAnchor> {
         if (!a.window || !hasSelector) {
             throw new Error('a control anchor needs window plus name, automationId or role');
         }
-        const resolved = await resolveWindowInfo(a.window);
-        const info = await usableWindow(resolved.ref, resolved.window);
+        const resolved = await sharedWindowFor(a.window);
+        const info = usableWindow(resolved.window);
         const selector: AnchorSelector = {
             window: resolved.ref,
             name: a.name,
@@ -240,26 +316,33 @@ export async function resolveAnchor(a: AnchorInput): Promise<ResolvedAnchor> {
         };
         // Resolving here makes pointing at a control one call rather than
         // find_ui_elements, read the result, then annotate.
-        const ranked = await findRanked(selector, info?.rect);
+        const ranked = await findRanked(selector, info.rect);
         const found = ranked[0];
         if (!found) throw new Error(await missMessage(selector, info));
         const also = isAmbiguous(ranked, selector)
             ? ranked.slice(1, 3).map(m => `"${clean(m.name)}" [${m.role}]`)
             : undefined;
-        return described(found, selector, info, { also, windowNote: resolved.note });
+        return described(found, selector, info, resolved.shared, { also, windowNote: resolved.note });
     }
 
     const raw = a.ref ?? a.window;
     if (!raw) throw new Error('anchor needs a window, a ref, or window plus name');
-    const kind = a.kind === 'window' || a.kind === 'element' ? a.kind : raw.startsWith('el_') ? 'element' : 'window';
-    if (kind === 'window') return windowAnchor(raw);
+    // Anything but an element ref is a window, whatever kind says: a window
+    // handle sent down the element path would reach the helper unchecked.
+    if (a.kind === 'window' || !raw.startsWith('el_')) return windowAnchor(raw);
 
     // A bare ref carries no selector of its own, but the search or describe
     // that produced it recorded one, so it can be re-found when the ref dies.
+    // Refs are numbered in sequence across every client, so one can be
+    // guessed: a control in a window that is not shared (now) is answered
+    // exactly as a ref never handed out is, after the same one window listing.
+    const { shared } = await windowsWithSharing();
     const known = knownControl(raw);
+    const home = known ? shared.find(w => w.ref === known.selector.window) : undefined;
+    if (known && !home) throw new StaleRefError(raw);
     const [live] = await resolveRefs([raw]);
     if (live?.rect) {
-        const info = known ? await windowInfo(known.selector.window).catch(() => undefined) : undefined;
+        const info = home;
         const element = {
             ref: raw,
             name: known?.name ?? '',
@@ -268,15 +351,15 @@ export async function resolveAnchor(a: AnchorInput): Promise<ResolvedAnchor> {
             offscreen: live.offscreen,
             window: known?.top
         };
-        return described(element, known?.selector, info, {});
+        return described(element, known?.selector, info, shared, {});
     }
-    if (known) {
-        const info = await usableWindow(known.selector.window);
-        const ranked = await findRanked(known.selector, info?.rect);
+    if (known && home) {
+        const info = usableWindow(home);
+        const ranked = await findRanked(known.selector, info.rect);
         // Several look-alikes (a "Remove" on every row) leave no way to tell
         // which one the ref was, and guessing circles the wrong row.
         const found = recoveredMatch(ranked, known.selector);
-        if (found) return described(found, known.selector, info, {});
+        if (found) return described(found, known.selector, info, shared, {});
         if (ranked.length > 1) {
             throw new Error(
                 `anchor ${raw} no longer resolves, and ${ranked.length} controls now match ${JSON.stringify(known.name)}: ` +
@@ -292,29 +375,31 @@ export async function resolveAnchor(a: AnchorInput): Promise<ResolvedAnchor> {
 }
 
 /**
- * The window's details, or an error naming why nothing can be drawn on it
+ * A shared window as it is, or an error naming why nothing can be drawn on it
  * (minimised, another desktop, hung) instead of a misleading "no control".
+ * Only ever given a shared window: the reasons describe it.
  */
-async function usableWindow(ref: string, known?: WindowInfo): Promise<WindowInfo | undefined> {
-    const info = known ?? (await windowInfo(ref).catch(() => undefined));
-    const blocker = info && windowBlocker(info, 'draw');
+function usableWindow(info: WindowInfo): WindowInfo {
+    const blocker = windowBlocker(info, 'draw');
     if (blocker) throw new Error(blocker);
     return info;
 }
 
 async function windowAnchor(query: string): Promise<ResolvedAnchor> {
-    const resolved = await resolveWindowInfo(query);
+    const resolved = await sharedWindowFor(query);
     const ref = resolved.ref;
-    const info = await usableWindow(ref, resolved.window);
+    const info = usableWindow(resolved.window);
     const [live] = await resolveRefs([ref]);
     if (!live?.rect) {
         throw new Error(
             `window ${ref} could not be resolved: it may have closed. list_windows shows what is open.`
         );
     }
-    const what = `window ${ref}${info ? ` "${clean(info.title)}"` : ''}`;
-    const title = info ? clean(info.title) || undefined : undefined;
-    const covered = await coverage(ref).then(coverVerdict).catch(() => null);
+    const what = `window ${ref} "${clean(info.title)}"`;
+    const title = clean(info.title) || undefined;
+    const covered = await coverage(ref)
+        .then(c => agentCoverVerdict(c, resolved.shared))
+        .catch(() => null);
     return {
         kind: 'window',
         ref,
@@ -334,6 +419,7 @@ async function described(
     found: Pick<ElementInfo, 'ref' | 'name' | 'role' | 'rect' | 'offscreen' | 'window'>,
     selector: AnchorSelector | undefined,
     info: WindowInfo | undefined,
+    shared: readonly WindowInfo[],
     extra: { also?: string[]; windowNote?: string }
 ): Promise<ResolvedAnchor> {
     const name = clean(found.name);
@@ -350,7 +436,9 @@ async function described(
     const window = selector?.window ?? info?.ref;
     const covered =
         window && !found.offscreen
-            ? await coverage(found.window ?? window, found.rect, found.role).then(coverVerdict).catch(() => null)
+            ? await coverage(found.window ?? window, found.rect, found.role)
+                  .then(c => agentCoverVerdict(c, shared))
+                  .catch(() => null)
             : null;
 
     return {
