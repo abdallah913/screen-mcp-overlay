@@ -38,10 +38,15 @@ export function fakeDesktop() {
 /**
  * Install the fake helper. Returns `calls` (every op and its params, in order)
  * and the desktop it answers from, which a test may mutate between calls.
+ *
+ * Every window of the fake desktop is shared with the AI, as if the user had
+ * shared it, except one marked `private: true`: privacy tests add those.
  */
 export function fakeHelper(overrides = {}, desktop = fakeDesktop()) {
     const calls = [];
     const { windows, controls, tree } = desktop;
+    harness.resetSharing();
+    for (const w of windows) if (!w.private && w.pid !== process.pid) harness.shareWindow(w);
     const contains = (r, x, y) => x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height;
     const handlers = {
         list_windows: () => windows,
@@ -76,6 +81,11 @@ export function fakeHelper(overrides = {}, desktop = fakeDesktop()) {
             return { scrolled: true, element };
         },
         suggest: p => controls.map(c => ({ name: c.name, role: c.role })).slice(0, p.limit ?? 3),
+        zorder: () =>
+            windows
+                .filter(w => !w.minimized && !w.cloaked)
+                .map(w => ({ ref: w.ref, pid: w.pid, rect: w.rect, owner: w.owner, root_owner: w.root_owner, exe: w.exe })),
+        set_shared: () => null,
         ...overrides
     };
     harness.useHelperTransport(async (op, params) => {

@@ -33,6 +33,27 @@ export interface WindowInfo {
     hung: boolean;
     /** The window that owns this one, possibly another process's. */
     owner?: string;
+    /** The end of the owner chain (GA_ROOTOWNER), when it is not the window itself. */
+    root_owner?: string;
+    /**
+     * The process's executable, lowercased file name ("notepad.exe"). For the
+     * user's sharing choices only: it never goes into anything the agent reads.
+     */
+    exe?: string;
+}
+
+/**
+ * One visible top-level window in z-order, front first, with no filtering by
+ * title, size or style: what decides which window a screen pixel belongs to.
+ * Tool windows, the taskbar, toasts and untitled popups are all here.
+ */
+export interface StackWindow {
+    ref: string;
+    pid: number;
+    rect: Rect;
+    owner?: string;
+    root_owner?: string;
+    exe?: string;
 }
 
 export interface ElementInfo {
@@ -394,9 +415,28 @@ export async function listWindows(): Promise<WindowInfo[]> {
 }
 
 /** Every top-level window but our own, minimised and other-desktop ones included. */
+/**
+ * Every top-level window, shared or not. For decisions only (baselines,
+ * coverage, what opened or closed): nothing from it may reach the agent unless
+ * it is one of sharedWindows(). See sharing.ts.
+ */
 export async function listAllWindows(): Promise<WindowInfo[]> {
     const all = await send<WindowInfo[]>('list_windows');
     return all.filter(w => w.pid !== process.pid);
+}
+
+/** Every visible top-level window in z-order, front first; ours included. For masking captures. */
+export function windowStack(): Promise<StackWindow[]> {
+    return send<StackWindow[]>('zorder', {}, 4000);
+}
+
+/**
+ * Tell the helper what is shared, so it refuses everything else on its own:
+ * raw window handles and element refs never reach a window the user did not
+ * share, whatever the TypeScript side checks or misses.
+ */
+export function setHelperShared(windows: string[], apps: string[]): Promise<void> {
+    return send<void>('set_shared', { windows, apps }, 4000);
 }
 
 /** One window's details (title, flags), or undefined if it is gone. */
