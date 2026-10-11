@@ -1,4 +1,4 @@
-import { describeWindow, windowInfo, type Described, type WindowInfo } from './uia.js';
+import { describeWindow, sharedWindowInfo, type Described, type WindowInfo } from './uia.js';
 import { store } from './store.js';
 import { clean, collapseRuns, diagnoseTree, diffLines, elevatedNote, row, toSnapshotNodes } from '../shared/uitree.js';
 /**
@@ -28,9 +28,13 @@ export interface DescribeOptions {
     info?: WindowInfo;
 }
 
-/** The window's flags, fetched only on the paths that need them: the common case pays nothing. */
+/**
+ * The window's flags, fetched only on the paths that need them: the common case
+ * pays nothing. Only a shared window's: its title and state go into the text,
+ * and a window that is not shared has neither as far as the agent can tell.
+ */
 async function lookup(opts: DescribeOptions): Promise<WindowInfo | undefined> {
-    return opts.info ?? (await windowInfo(opts.window).catch(() => undefined));
+    return opts.info ?? (await sharedWindowInfo(opts.window).catch(() => undefined));
 }
 
 /**

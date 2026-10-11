@@ -3,7 +3,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AnchorSelector, Rect } from '../shared/types.js';
-import { isWindowRef, pickWindow } from '../shared/windows.js';
+import { isWindowRef, notShared, pickWindow } from '../shared/windows.js';
+import { clean } from '../shared/uitree.js';
+import { isShared, noteRefused, onSharingChanged, sharedOf, syncHelper, windowsWithSharing } from './sharing.js';
 
 /**
  * Client for the Rust UI Automation helper.
@@ -15,6 +17,12 @@ import { isWindowRef, pickWindow } from '../shared/windows.js';
  * Everything it returns is in **physical pixels** in Windows' virtual-screen
  * space, whose origin can be negative when a second monitor sits left of or
  * above the primary one.
+ *
+ * It sees every window on the desktop. What the agent may see is narrower
+ * (sharing.ts), and this module is where the two meet: every window an agent
+ * names is checked against the shared set before anything is asked of the
+ * helper about it, element refs are only issued for shared windows, and names
+ * of covering windows come out as "another window" unless they are shared.
  */
 
 export interface WindowInfo {
@@ -116,14 +124,14 @@ export interface Coverage {
     /** Fraction of the area whose topmost window is not the target, 0..1. */
     fraction: number;
     centre_covered: boolean;
-    /** Titles of the covering windows, nearest first. */
+    /** Covering windows, nearest first, as the agent may hear them (see agentSafeNames). */
     by: string[];
 }
 
 export interface Occlusion {
     /** Rough fraction of the window hidden behind windows above it, 0..1. */
     covered: number;
-    /** Titles of the windows on top, nearest first. */
+    /** The windows on top, nearest first, as the agent may hear them (see agentSafeNames). */
     by: string[];
 }
 
@@ -167,6 +175,14 @@ const KILL_INTERVAL_MS = 10_000;
  * refs the current helper issued lets callers give a real answer instead.
  */
 const liveElementRefs = new Set<string>();
+
+/**
+ * The shared top-level window each live ref was found in. A ref is only issued
+ * for a shared window, and stops working the moment that window stops being
+ * shared, so a ref an agent kept (or guessed: they are sequential) never
+ * reaches a window the user has since taken back.
+ */
+const refWindow = new Map<string, string>();
 
 /**
  * Each helper numbers its refs from el_1, so after a restart an old el_5 and a
@@ -215,11 +231,73 @@ export function isElementRefLive(ref: string): boolean {
     return !ref.startsWith('el_') || liveElementRefs.has(ref);
 }
 
+/**
+ * The last full window list read, for deciding synchronously whether a window
+ * is shared (issuing refs, forgetting them, naming covers, redacting). Every
+ * agent request lists the windows before it touches one, so this is current
+ * where it matters; a window missing from it counts as not shared.
+ */
+let lastSeen: WindowInfo[] = [];
+
+/** The last full window list, shared or not. For internal decisions and redaction only. */
+export function lastWindowList(): readonly WindowInfo[] {
+    return lastSeen;
+}
+
+/** Whether a top-level window is shared, judged from the last window list. */
+function sharedNow(ref: string): boolean {
+    const w = lastSeen.find(x => x.ref === ref);
+    return w !== undefined && isShared(w, lastSeen);
+}
+
+/**
+ * Count a ref as live, for the shared window it came from; refs of anything
+ * else are never issued. `shared` is passed when the caller already knows,
+ * for a popup that is not in the window list.
+ */
+function issue(ref: string, window: string, shared = sharedNow(window)): boolean {
+    watchSharing();
+    if (!shared) return false;
+    liveElementRefs.add(ref);
+    refWindow.set(ref, window);
+    return true;
+}
+
+let watching = false;
+
+/**
+ * Forget every ref and selector of a window that is no longer shared, as soon
+ * as the user stops sharing it. Registered on first use: sharing.ts imports
+ * this module, so registering while modules load could run before it exists.
+ */
+function watchSharing(): void {
+    if (watching) return;
+    watching = true;
+    onSharingChanged(() => {
+        forgetUnshared();
+        // The cached list may predate a window closing or a share by app;
+        // judge again against a fresh one.
+        listAllWindows().then(forgetUnshared, () => undefined);
+    });
+}
+
+function forgetUnshared(): void {
+    for (const [ref, window] of refWindow) {
+        if (sharedNow(window)) continue;
+        refWindow.delete(ref);
+        liveElementRefs.delete(ref);
+    }
+    for (const [ref, known] of refSelectors) {
+        if (!sharedNow(known.selector.window)) refSelectors.delete(ref);
+    }
+}
+
 function remember(
     e: { ref: string; name: string; role: string; automation_id?: string; window?: string },
-    window: string
+    window: string,
+    shared?: boolean
 ): void {
-    liveElementRefs.add(e.ref);
+    if (!issue(e.ref, window, shared)) return;
     const name = e.name.trim();
     if (!e.automation_id && !name) return;
     refSelectors.delete(e.ref);
@@ -315,6 +393,7 @@ function teardown(proc: ChildProcessWithoutNullStreams, reason: string): void {
     // Every el_* ref died with it. Forget them so callers get a clear
     // "re-run find_ui_elements" rather than a silent empty result.
     liveElementRefs.clear();
+    refWindow.clear();
     child = null;
     carry = '';
 }
@@ -356,6 +435,10 @@ function start(): boolean {
         unavailable = `UI Automation helper error: ${err.message}`;
     });
     unavailable = null;
+    // A new helper knows nothing of what is shared, and must refuse everything
+    // else on its own from its very first request: this goes out ahead of the
+    // request that started it.
+    syncHelper();
     return true;
 }
 
@@ -414,15 +497,16 @@ export async function listWindows(): Promise<WindowInfo[]> {
     return (await listAllWindows()).filter(w => !w.minimized && !w.cloaked);
 }
 
-/** Every top-level window but our own, minimised and other-desktop ones included. */
 /**
- * Every top-level window, shared or not. For decisions only (baselines,
- * coverage, what opened or closed): nothing from it may reach the agent unless
- * it is one of sharedWindows(). See sharing.ts.
+ * Every top-level window but our own, shared or not, minimised and
+ * other-desktop ones included. For decisions only (baselines, coverage, what
+ * opened or closed): nothing from it may reach the agent unless it is one of
+ * sharedWindows(). See sharing.ts.
  */
 export async function listAllWindows(): Promise<WindowInfo[]> {
-    const all = await send<WindowInfo[]>('list_windows');
-    return all.filter(w => w.pid !== process.pid);
+    const all = (await send<WindowInfo[]>('list_windows')).filter(w => w.pid !== process.pid);
+    lastSeen = all;
+    return all;
 }
 
 /** Every visible top-level window in z-order, front first; ours included. For masking captures. */
@@ -439,25 +523,54 @@ export function setHelperShared(windows: string[], apps: string[]): Promise<void
     return send<void>('set_shared', { windows, apps }, 4000);
 }
 
-/** One window's details (title, flags), or undefined if it is gone. */
+/** One window's details (title, flags), or undefined if it is gone. Internal: shared or not. */
 export async function windowInfo(ref: string): Promise<WindowInfo | undefined> {
     return (await listAllWindows()).find(w => w.ref === ref);
 }
 
+/** One window's details when it is shared, for anything that ends up in agent-facing text. */
+export async function sharedWindowInfo(ref: string): Promise<WindowInfo | undefined> {
+    const { shared } = await windowsWithSharing();
+    return shared.find(w => w.ref === ref);
+}
+
 /**
- * Turn whatever an agent passed as a window into a ref: a ref as-is (no helper
- * round trip), otherwise a title substring or "foreground", resolved against
- * the live window list. When no visible window matches, a minimised one and
- * then one on another virtual desktop still count, and `note` says so, so the
- * agent hears "minimized" rather than "not open". Throws with the open windows
- * listed when nothing matches, so the agent can correct itself without a
- * separate list_windows.
+ * The refusal for a window the agent may not see. Its message is the one a
+ * window that is not open gets, word for word (see notShared), so catching it
+ * tells nobody which it was.
  */
-export async function resolveWindowInfo(query: string): Promise<{ ref: string; window?: WindowInfo; note?: string }> {
-    if (isWindowRef(query)) return { ref: query.trim() };
-    const found = pickWindow(query, await listAllWindows());
-    if (typeof found === 'string') throw new Error(found);
-    return { ref: found.window.ref, window: found.window, note: found.note };
+export class NotSharedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'NotSharedError';
+    }
+}
+
+/**
+ * Turn whatever an agent passed as a window into a ref of a SHARED window: a
+ * ref, a title substring or "foreground", resolved against the shared windows
+ * only. When no visible one matches, a minimised one and then one on another
+ * virtual desktop still count, and `note` says so, so the agent hears
+ * "minimized" rather than "not open".
+ *
+ * Anything else (an unshared window, a closed one, a made-up ref) is refused
+ * with one message that lists the shared windows, after the same single window
+ * list whatever was asked, so neither the words nor the time taken say whether
+ * the window exists. Nothing is asked of the helper about the window before
+ * this passes.
+ */
+export async function resolveWindowInfo(query: string): Promise<{ ref: string; window: WindowInfo; note?: string }> {
+    const { shared } = await windowsWithSharing();
+    const q = query.trim();
+    if (isWindowRef(q)) {
+        const w = shared.find(x => x.ref === q);
+        if (w) return { ref: w.ref, window: w };
+    } else {
+        const found = pickWindow(q, shared);
+        if (typeof found !== 'string') return { ref: found.window.ref, window: found.window, note: found.note };
+    }
+    noteRefused(q);
+    throw new NotSharedError(notShared(q, shared));
 }
 
 /** resolveWindowInfo for callers that only need the ref. */
@@ -465,7 +578,7 @@ export async function resolveWindow(query: string): Promise<string> {
     return (await resolveWindowInfo(query)).ref;
 }
 
-export async function findElements(opts: {
+type FindOptions = {
     window?: string;
     name?: string;
     role?: string;
@@ -473,20 +586,42 @@ export async function findElements(opts: {
     limit?: number;
     /** Also return matches with no usable rect, marked with why and their container. */
     includeHidden?: boolean;
-}): Promise<ElementInfo[]> {
+};
+
+/**
+ * Search a window's controls. Without a window, every shared window is
+ * searched in turn (front first, up to `limit` in all), never the desktop: a
+ * search from the desktop root reaches every app the user has open.
+ */
+export async function findElements(opts: FindOptions): Promise<ElementInfo[]> {
+    if (opts.window) return findIn(opts.window, opts);
+    const { shared } = await windowsWithSharing();
+    // A hung window would wedge the helper for the whole timeout, and minimised
+    // or other-desktop ones have nothing the user could be pointed at.
+    const searchable = shared.filter(w => !w.hung && !w.minimized && !w.cloaked);
+    const found: ElementInfo[] = [];
+    for (const w of searchable) {
+        const left = opts.limit === undefined ? undefined : opts.limit - found.length;
+        if (left !== undefined && left <= 0) break;
+        // One window closing mid-search must not lose what the others matched.
+        found.push(...(await findIn(w.ref, { ...opts, limit: left }).catch(() => [])));
+    }
+    return found;
+}
+
+async function findIn(window: string, opts: FindOptions): Promise<ElementInfo[]> {
     // A full-tree search can take ~100ms on a large app; allow generous headroom.
     const { automationId, includeHidden, ...rest } = opts;
     const found = await send<ElementInfo[]>(
         'find_elements',
-        { ...rest, automation_id: automationId, include_hidden: includeHidden ?? false },
+        { ...rest, window, automation_id: automationId, include_hidden: includeHidden ?? false },
         15000
     );
     for (const e of found) {
-        if (opts.window) remember(e, opts.window);
-        else liveElementRefs.add(e.ref);
+        remember(e, window);
         // A hidden match names the container to open first; the agent may
         // anchor to it, so its ref must count as live too.
-        if (e.container) liveElementRefs.add(e.container.ref);
+        if (e.container) issue(e.container.ref, window);
     }
     return found;
 }
@@ -516,7 +651,7 @@ export async function describeWindow(opts: {
     for (const n of described.nodes) {
         if (n.depth <= 1) popupTop = n.popup ? n.window : undefined;
         if (n.depth > 0) remember({ ...n, window: n.window ?? popupTop }, opts.window);
-        else liveElementRefs.add(n.ref);
+        else issue(n.ref, opts.window);
     }
     return described;
 }
@@ -532,8 +667,9 @@ export function focusWindow(ref: string): Promise<{ focused: boolean }> {
  * Our own pid is excluded: the overlay windows span the whole screen, so
  * counting them would report every window as fully covered.
  */
-export function occlusionOf(ref: string): Promise<Occlusion> {
-    return send<Occlusion>('occlusion', { window: ref, ignore_pid: process.pid }, 6000);
+export async function occlusionOf(ref: string): Promise<Occlusion> {
+    const occ = await send<Occlusion>('occlusion', { window: ref, ignore_pid: process.pid }, 6000);
+    return { ...occ, by: agentSafeNames(occ.by) };
 }
 
 /**
@@ -546,14 +682,34 @@ export function printWindow(ref: string, path: string): Promise<{ rect: Rect; fa
     return send<{ rect: Rect; fallback: boolean }>('print_window', { window: ref, path }, 20000);
 }
 
-/** The control under a virtual-screen physical point, and its top-level window. Never the overlay. */
+/**
+ * The control under a virtual-screen physical point, and its top-level window.
+ * Never the overlay, and nothing at all over a window that is not shared: a
+ * click there (a mis-click, or the user simply using another app) says no
+ * more than a click on the bare desktop, and issues no ref.
+ */
 export async function elementAtPoint(x: number, y: number): Promise<PointHit> {
     const hit = await send<PointHit>('element_at_point', { x: Math.round(x), y: Math.round(y), ignore_pid: process.pid }, 4000);
-    if (hit.element) {
-        if (hit.window) remember(hit.element, hit.window.ref);
-        else liveElementRefs.add(hit.element.ref);
-    }
+    const top = hit.window?.ref;
+    if (!top || !(await refIsShared(top))) return { element: null, window: null };
+    if (hit.element) remember(hit.element, top, true);
     return hit;
+}
+
+/**
+ * Whether a top-level window is shared, read fresh. A menu or dropdown is not
+ * in the window list, so the full stack, which carries its owner, decides for
+ * it.
+ */
+async function refIsShared(ref: string): Promise<boolean> {
+    const all = await listAllWindows();
+    const listed = all.find(w => w.ref === ref);
+    if (listed) return isShared(listed, all);
+    const stack = await windowStack().catch((): StackWindow[] => []);
+    const stacked = stack.find(w => w.ref === ref);
+    if (!stacked) return false;
+    const listedRefs = new Set(all.map(w => w.ref));
+    return isShared(stacked, [...all, ...stack.filter(w => !listedRefs.has(w.ref))]);
 }
 
 /**
@@ -567,6 +723,39 @@ export function setHudWindowRef(ref: string | undefined): void {
     hudRef = ref;
 }
 
+/** The chat panel's window ref, for masking it out of captures. */
+export function hudWindowRef(): string | undefined {
+    return hudRef;
+}
+
+/** How the helper names the chat panel when it covers something. */
+export const PANEL_NAME = "the overlay's chat panel";
+
+/**
+ * Covering windows as the agent may hear of them: a shared window by its
+ * title, the chat panel as the panel, and everything else as "another window",
+ * however the helper named it (a title, "a popup of <owner>", or a class name,
+ * which identifies an app as well as a title does). Judged against the last
+ * window list, so a window not in it is "another window" too.
+ */
+export function agentSafeNames(by: readonly string[]): string[] {
+    const shared = sharedOf(lastSeen);
+    const titles = new Set(shared.map(w => clean(w.title)).filter(Boolean));
+    const out: string[] = [];
+    for (const raw of by) {
+        const name = clean(raw);
+        const popupOf = /^a popup of (.+)$/.exec(name)?.[1];
+        const byRef = isWindowRef(name) ? shared.find(w => w.ref === name) : undefined;
+        let safe = 'another window';
+        if (name === PANEL_NAME) safe = PANEL_NAME;
+        else if (byRef?.title) safe = clean(byRef.title);
+        // A popup of a shared window is shared with it (it is owned by it).
+        else if (titles.has(name) || (popupOf !== undefined && titles.has(popupOf))) safe = name;
+        if (!out.includes(safe)) out.push(safe);
+    }
+    return out;
+}
+
 /** Rows a dropdown or menu draws in its own popup, whichever tree the app reports them in. */
 const ROW_ROLES = new Set(['listitem', 'menuitem', 'treeitem', 'dataitem']);
 
@@ -575,10 +764,11 @@ const ROW_ROLES = new Set(['listitem', 'menuitem', 'treeitem', 'dataitem']);
  * behind other top-level windows, the chat panel included. A row's `role` lets
  * an open dropdown around it count as where it is drawn, not as covering it.
  */
-export function coverage(window: string, rect?: Rect, role?: string): Promise<Coverage> {
+export async function coverage(window: string, rect?: Rect, role?: string): Promise<Coverage> {
     // An agent's own spelling ("list item") counts as the helper's ("listitem").
     const row = role !== undefined && ROW_ROLES.has(role.toLowerCase().replace(/[\s_-]/g, ''));
-    return send<Coverage>('covered', { window, rect, ignore_pid: process.pid, hud: hudRef, row }, 4000);
+    const c = await send<Coverage>('covered', { window, rect, ignore_pid: process.pid, hud: hudRef, row }, 4000);
+    return { ...c, by: agentSafeNames(c.by) };
 }
 
 /** Collapsed expandable controls in a window: where a control that matched nothing may be. */

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isWindowRef, matchWindow, windowLine } from '../dist-test/windows.js';
+import { isWindowRef, matchWindow, notShared, windowLine } from '../dist-test/windows.js';
 
 const R = { x: 0, y: 0, width: 800, height: 600 };
 const w = (ref, title, foreground = false) => ({ ref, title, rect: R, foreground });
@@ -44,15 +44,19 @@ test('a substring match prefers the foreground window', () => {
     assert.equal(matchWindow('chrome', list).ref, '2');
 });
 
-test('no match explains itself and lists what is open', () => {
+test('no match explains itself and lists the (shared) windows it was given', () => {
     const err = matchWindow('Photoshop', desktop);
     assert.equal(typeof err, 'string');
-    assert.match(err, /no window title contains "Photoshop"/);
-    assert.match(err, /200 "Inbox - Outlook"/);
+    assert.match(err, /^no shared window matches "Photoshop"\. Shared: 100 "Untitled - Notepad", 200 "Inbox - Outlook"/);
+    assert.match(err, /list_windows with ask:"<why you need it>" asks the user to share one\.$/);
 });
 
-test('an empty desktop says so', () => {
-    assert.equal(matchWindow('x', []), 'no visible windows');
+test('with nothing shared, a miss lists nothing and counts nothing', () => {
+    assert.equal(
+        matchWindow('x', []),
+        'no shared window matches "x". Windows stay private until the user shares them; list_windows with ' +
+            'ask:"<why you need it>" asks the user to share one.'
+    );
 });
 
 test('window lines are one compact line each', () => {
@@ -97,9 +101,17 @@ test('"foreground" never falls back to a window the user cannot see', () => {
     assert.equal(typeof pickWindow('foreground', [flagged('1', 'A', { minimized: true })]), 'string');
 });
 
-test('no match anywhere lists the visible windows', () => {
+test('no match anywhere lists every window it was given, minimised ones included', () => {
     const r = pickWindow('Photoshop', [w('1', 'Calculator'), flagged('2', 'Notepad', { minimized: true })]);
-    assert.match(r, /no window title contains "Photoshop". Open windows: 1 "Calculator"/);
+    assert.match(r, /^no shared window matches "Photoshop"\. Shared: 1 "Calculator", 2 "Notepad"\. /);
+});
+
+test('the refusal reads the same for any query, and echoes only the query', () => {
+    const shared = [w('1', 'Calculator')];
+    const a = notShared('500', shared);
+    const b = notShared('999999', shared);
+    assert.equal(a.replace('"500"', '"Q"'), b.replace('"999999"', '"Q"'));
+    assert.equal(matchWindow('500', shared), a);
 });
 
 test('window blockers name the next step', () => {

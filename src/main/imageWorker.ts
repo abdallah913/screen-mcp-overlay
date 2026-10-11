@@ -38,6 +38,10 @@ export function disposeImageWorker(): void {
  * off the screenshot instead of estimating them. Returns the original buffer
  * unchanged if compositing fails for any reason — a missing grid is a much
  * smaller problem than a failed capture.
+ *
+ * Only ever given an image already masked to the shared windows (capture.ts):
+ * the grid is drawn last, over the blanked areas too, and nothing here may
+ * read or keep the pixels for anything else.
  */
 export async function compositeGrid(png: Buffer, step: number): Promise<Buffer> {
     try {

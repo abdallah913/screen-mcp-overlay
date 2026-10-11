@@ -68,12 +68,16 @@ test('a scoped find that misses gives the same hints', async () => {
 
 // --- what the user can actually see -------------------------------------------
 
-test('a covered target is drawn, marked and warned about', async () => {
+test('a covered target is drawn, marked and warned about, naming the cover only if it is shared', async () => {
     fakeHelper({ covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] }) });
     const { text, isError } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
     assert.equal(isError, false);
-    assert.match(text, /WARNING: "Save" \[button\] el_1 is behind "Google Chrome".*focus_window \{"window":"100"\}/);
-    assert.equal(store.list()[0].covered, 'Google Chrome');
+    assert.match(text, /WARNING: "Save" \[button\] el_1 is behind "another window".*focus_window \{"window":"100"\}/);
+    assert.equal(store.list()[0].covered, 'another window');
+
+    fakeHelper({ covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Calculator'] }) });
+    const shared = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
+    assert.match(shared.text, /is behind "Calculator"/);
 });
 
 test('a scrolled-out target is marked offscreen and the response says how to bring it in', async () => {
@@ -113,14 +117,14 @@ test('scroll_window says when a control cannot be scrolled into view', async () 
 
 // --- window-level blockers ----------------------------------------------------
 
-test('list_windows marks admin and hung windows and lists the ones the user cannot see', async () => {
+test('list_windows marks admin and hung windows and lists the shared ones the user cannot see', async () => {
     const desktop = fakeDesktop();
     desktop.windows[1].elevated = true;
     desktop.windows.push({ ...desktop.windows[0], ref: '500', title: 'Settings', cloaked: true, foreground: false });
     fakeHelper({}, desktop);
     const { text } = await call('list_windows');
     assert.match(text, /^200 320x500@1000,100 Calculator \[admin\]$/m);
-    assert.match(text, /^not visible \(focus_window shows one\): 300 "Minimised thing" \[minimized\], 500 "Settings" \[other desktop\]$/m);
+    assert.match(text, /^shared, not visible \(focus_window shows one\): 300 "Minimised thing" \[minimized\], 500 "Settings" \[other desktop\]$/m);
 });
 
 test('a minimised window is found by title and named as minimised', async () => {
