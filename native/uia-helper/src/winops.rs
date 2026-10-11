@@ -11,7 +11,10 @@
 //! call that blocks until it recovers.
 
 use serde::Serialize;
-use windows::Win32::Foundation::{GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT, WIN32_ERROR, WPARAM};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{
+    GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT, TRUE, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     MonitorFromPoint, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
@@ -23,15 +26,17 @@ use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetAncestor, GetClientRect, GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindow,
-    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SendMessageTimeoutW,
-    SetForegroundWindow, ShowWindow, WindowFromPoint, GA_ROOT, GA_ROOTOWNER, GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV,
-    SMTO_ABORTIFHUNG, SW_RESTORE, WM_MOUSEWHEEL, WM_NULL, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    BringWindowToTop, EnumWindows, GetAncestor, GetClientRect, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
+    GetWindow, GetWindowDisplayAffinity, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, SendMessageTimeoutW, SetForegroundWindow, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
+    GW_HWNDNEXT, GW_HWNDPREV, SMTO_ABORTIFHUNG, SW_RESTORE, WM_MOUSEWHEEL, WM_NULL, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT,
 };
 
 use crate::model::{Coverage, PrintResult, Rect};
 use crate::search::popups::{is_popup, popups_of};
-use crate::windows::{class_of, is_cloaked, is_elevated, is_hung, rect_of, title_of};
+use crate::sharing::{allowed, ANOTHER_WINDOW};
+use crate::windows::{class_of, is_cloaked, is_elevated, is_hung, ours, rect_of, root_owner_of, title_of};
 
 /// PW_RENDERFULLCONTENT: renders DirectComposition surfaces too, which is what
 /// makes this work for Chromium and other GPU-composited apps.
@@ -44,14 +49,22 @@ const MESSAGE_TIMEOUT_MS: u32 = 1000;
 
 const NOT_RESPONDING: &str = "that window is not responding, so Windows cannot reach it until the app recovers. \
      Wait for it, or ask the user whether it has frozen";
-const CLOSED: &str = "that window has closed";
+pub const CLOSED: &str = "that window has closed";
 
 #[derive(Serialize)]
 pub struct Occlusion {
     /// Rough fraction of the window covered by windows above it, 0.0 to 1.0.
     pub covered: f32,
-    /// Titles of the windows sitting on top, nearest first.
+    /// Names of the windows sitting on top, nearest first, each once (see
+    /// cover_name).
     pub by: Vec<String>,
+}
+
+/// Whether the caller may act on this window: it exists and is shared. Every
+/// op that takes a window refuses one that is not with the very words it
+/// gives a window that has closed, so the two cannot be told apart.
+fn reachable(hwnd: HWND) -> bool {
+    exists(hwnd) && allowed(hwnd)
 }
 
 fn intersect(a: &Rect, b: &Rect) -> i64 {
@@ -79,8 +92,12 @@ fn exists(hwnd: HWND) -> bool {
 /// Approximate on purpose: overlapping occluders are summed rather than unioned,
 /// so the figure can overshoot. It is a "do not trust this capture" signal, not
 /// a measurement.
+///
+/// A window that is not shared gets what a closed one gets: nothing covered,
+/// by nothing.
 pub fn occlusion_of(hwnd: HWND, ignore_pid: u32) -> Occlusion {
-    let Some(target) = rect_of(hwnd) else {
+    let target = if allowed(hwnd) { rect_of(hwnd) } else { None };
+    let Some(target) = target else {
         return Occlusion { covered: 0.0, by: Vec::new() };
     };
     let area = (target.width as i64 * target.height as i64).max(1);
@@ -102,7 +119,10 @@ pub fn occlusion_of(hwnd: HWND, ignore_pid: u32) -> Occlusion {
                 let overlap = intersect(&target, &r);
                 if overlap > area / 100 {
                     covered += overlap;
-                    by.push(title_of(above));
+                    let name = cover_name(above, None);
+                    if !by.contains(&name) {
+                        by.push(name);
+                    }
                 }
             }
         }
@@ -168,7 +188,7 @@ pub fn responds(hwnd: HWND) -> bool {
 /// foreground thread's input queue first is the documented way round it, and is
 /// what every window-manager utility does.
 pub fn focus(hwnd: HWND) -> Result<(), String> {
-    if !exists(hwnd) {
+    if !reachable(hwnd) {
         return Err(CLOSED.into());
     }
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
@@ -362,10 +382,14 @@ fn client_region(hwnd: HWND, raw: &RECT) -> (usize, usize, usize, usize) {
 /// PrintWindow asks the window to render itself into a bitmap, so the result is
 /// the window's content rather than whatever happens to be on screen at those
 /// coordinates. When it cannot (the window refuses, is hung, or hands back a
-/// blank GPU surface) the screen is copied instead and `fallback` says so,
-/// because then anything covering the window is in the image.
-pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
-    if !exists(hwnd) {
+/// blank GPU surface) the screen is copied instead and `fallback` says so.
+/// The copy is masked before it is written: only the parts where the window,
+/// or a shared window above it, is on top keep their pixels, so a video
+/// playing over the window never reaches the file. `ignore_pid` is the
+/// overlay app's, whose own windows are left out of that (0: the parent
+/// process's).
+pub fn print_window_png(hwnd: HWND, path: &str, ignore_pid: u32) -> Result<PrintResult, String> {
+    if !reachable(hwnd) {
         return Err(CLOSED.into());
     }
     if unsafe { IsIconic(hwnd) }.as_bool() {
@@ -397,6 +421,12 @@ pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
         }
         canvas.copy_screen((raw.left, raw.top));
         buf = canvas.pixels()?;
+        let origin = (raw.left, raw.top);
+        let keep: Vec<Rect> = shown_parts(&stack_down_to(hwnd, ours(ignore_pid)), EDGE_PX)
+            .into_iter()
+            .map(|r| Rect { x: r.x - origin.0, y: r.y - origin.1, ..r })
+            .collect();
+        mask_outside(&mut buf, width as usize, height as usize, &keep);
     }
     drop(canvas);
 
@@ -420,6 +450,143 @@ pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
     // the DWM extended bounds trims, so image coordinates are relative to
     // this rectangle rather than to the one list_windows reports.
     Ok(PrintResult { rect: Rect { x: raw.left, y: raw.top, width, height }, fallback: !printed })
+}
+
+// ---------------------------------------------------------------- masking
+
+/// The colour a screen copy is painted wherever no shared window is on top,
+/// BGRA: the client's own mask colour (MASK_BGRA in src/shared/visible.ts),
+/// so a hole looks the same whichever side made it.
+const MASK_BGRA: [u8; 4] = [32, 32, 32, 255];
+
+/// How far a shared window's area is pulled in at its edges, and every other
+/// window's pushed out (EDGE_PX in src/shared/visible.ts): Windows 11 rounds
+/// window corners, and drop shadows spill onto the windows below.
+const EDGE_PX: i32 = 2;
+
+/// WDA_EXCLUDEFROMCAPTURE: a window Windows leaves out of every screen copy.
+const EXCLUDED_FROM_CAPTURE: u32 = 0x11;
+
+fn grow(r: &Rect, by: i32) -> Rect {
+    Rect { x: r.x - by, y: r.y - by, width: (r.width + 2 * by).max(0), height: (r.height + 2 * by).max(0) }
+}
+
+fn clip(a: &Rect, b: &Rect) -> Option<Rect> {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let w = (a.x + a.width).min(b.x + b.width) - x;
+    let h = (a.y + a.height).min(b.y + b.height) - y;
+    (w > 0 && h > 0).then_some(Rect { x, y, width: w, height: h })
+}
+
+/// `a` with `b` cut out of it: up to four rects.
+fn cut(a: &Rect, b: &Rect) -> Vec<Rect> {
+    let Some(i) = clip(a, b) else { return vec![*a] };
+    let mut out = Vec::new();
+    if i.y > a.y {
+        out.push(Rect { x: a.x, y: a.y, width: a.width, height: i.y - a.y });
+    }
+    if i.y + i.height < a.y + a.height {
+        out.push(Rect { x: a.x, y: i.y + i.height, width: a.width, height: a.y + a.height - (i.y + i.height) });
+    }
+    if i.x > a.x {
+        out.push(Rect { x: a.x, y: i.y, width: i.x - a.x, height: i.height });
+    }
+    if i.x + i.width < a.x + a.width {
+        out.push(Rect { x: i.x + i.width, y: i.y, width: a.x + a.width - (i.x + i.width), height: i.height });
+    }
+    out
+}
+
+/// The parts of shared windows that are on top, for a stack of (rect,
+/// shared) front first; everything else is to be masked. The same rule as
+/// visibleRegions in src/shared/visible.ts.
+fn shown_parts(stack: &[(Rect, bool)], edge: i32) -> Vec<Rect> {
+    let mut covering: Vec<Rect> = Vec::new();
+    let mut shown: Vec<Rect> = Vec::new();
+    for (rect, shared) in stack {
+        if rect.width <= 0 || rect.height <= 0 {
+            continue;
+        }
+        if *shared {
+            let inner = grow(rect, -edge);
+            let mut parts: Vec<Rect> = if inner.width > 0 && inner.height > 0 { vec![inner] } else { Vec::new() };
+            for c in &covering {
+                parts = parts.iter().flat_map(|p| cut(p, c)).collect();
+            }
+            shown.extend(parts);
+        }
+        covering.push(if *shared { *rect } else { grow(rect, edge) });
+    }
+    shown
+}
+
+/// Paint every pixel of a top-down BGRA image outside `keep` (image pixels)
+/// the mask colour.
+fn mask_outside(bgra: &mut [u8], width: usize, height: usize, keep: &[Rect]) {
+    if bgra.len() < width * height * 4 {
+        bgra.iter_mut().for_each(|b| *b = 0);
+        return;
+    }
+    let mut kept = vec![false; width * height];
+    let frame = Rect { x: 0, y: 0, width: width as i32, height: height as i32 };
+    for r in keep {
+        let Some(k) = clip(r, &frame) else { continue };
+        for y in k.y as usize..(k.y + k.height) as usize {
+            kept[y * width + k.x as usize..y * width + (k.x + k.width) as usize].fill(true);
+        }
+    }
+    for (px, keep) in bgra.chunks_exact_mut(4).zip(kept) {
+        if !keep {
+            px.copy_from_slice(&MASK_BGRA);
+        }
+    }
+}
+
+/// Whether a window can put pixels into a screen copy: shown, on this
+/// desktop, and not left out of captures by its app.
+fn in_screen_copy(hwnd: HWND) -> bool {
+    let shown = unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() } && !is_cloaked(hwnd);
+    let mut affinity = 0u32;
+    let excluded = unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) }.is_ok() && affinity == EXCLUDED_FROM_CAPTURE;
+    shown && !excluded
+}
+
+struct StackWalk {
+    target: HWND,
+    ours: u32,
+    layers: Vec<(Rect, bool)>,
+}
+
+unsafe extern "system" fn stack_visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let walk = &mut *(lparam.0 as *mut StackWalk);
+    if hwnd == walk.target {
+        if let Some(r) = rect_of(hwnd) {
+            walk.layers.push((r, true));
+        }
+        return BOOL(0);
+    }
+    // The overlay app's windows are drawn for the user and not shared; the
+    // overlay spans the screen, so counting it would mask everything.
+    if (walk.ours != 0 && pid_of(hwnd) == walk.ours) || !in_screen_copy(hwnd) {
+        return TRUE;
+    }
+    if let Some(r) = rect_of(hwnd) {
+        walk.layers.push((r, allowed(hwnd)));
+    }
+    TRUE
+}
+
+/// Every window from the front of the z-order down to `hwnd`'s top-level
+/// window, which ends it, each as (rect, shared).
+fn stack_down_to(hwnd: HWND, ours: u32) -> Vec<(Rect, bool)> {
+    let target = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let target = if target.is_invalid() { hwnd } else { target };
+    let mut walk = StackWalk { target, ours, layers: Vec::new() };
+    // EnumWindows reports an error when the callback stops it, which is how
+    // the walk ends at the target.
+    let _ = unsafe { EnumWindows(Some(stack_visit), LPARAM(&mut walk as *mut StackWalk as isize)) };
+    walk.layers
 }
 
 // ---------------------------------------------------------------- scroll
@@ -450,7 +617,7 @@ pub fn not_scrolled() -> String {
 /// control rather than a view change. The send is bounded, so a hung window
 /// costs at most a second instead of wedging the helper.
 pub fn scroll(hwnd: HWND, notches: i32) -> Result<(), String> {
-    if !exists(hwnd) {
+    if !reachable(hwnd) {
         return Err(CLOSED.into());
     }
     if is_hung(hwnd) {
@@ -619,25 +786,28 @@ fn root_at(x: i32, y: i32, ours: Ours) -> Option<HWND> {
 /// the app's name, which would read as some other program.
 const HUD_NAME: &str = "the overlay's chat panel";
 
-/// A name the user would recognise for a covering window. Menus and dropdowns
-/// have no title of their own, so they take their owner's ("a popup of Paint"
-/// reads better than a class name).
-fn covering_name(hwnd: HWND, hud: Option<HWND>) -> String {
+/// A name for a covering window. A shared one goes by its title; menus and
+/// dropdowns have none, so they take the shared window they belong to ("a
+/// popup of Paint"). Every window that is not shared is "another window",
+/// never its title, its owner's or its class: those name the app the user
+/// kept to themselves.
+fn cover_name(hwnd: HWND, hud: Option<HWND>) -> String {
     if Some(hwnd) == hud {
         return HUD_NAME.to_string();
     }
-    let title = title_of(hwnd);
-    if !title.trim().is_empty() {
-        return title;
-    }
-    let owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
-    if !owner.is_invalid() && owner != hwnd {
-        let owner_title = title_of(owner);
-        if !owner_title.trim().is_empty() {
-            return format!("a popup of {owner_title}");
+    if allowed(hwnd) {
+        let title = title_of(hwnd);
+        if !title.trim().is_empty() {
+            return title;
+        }
+        if let Some(owner) = root_owner_of(hwnd).filter(|o| allowed(*o)) {
+            let owner_title = title_of(owner);
+            if !owner_title.trim().is_empty() {
+                return format!("a popup of {owner_title}");
+            }
         }
     }
-    class_of(hwnd)
+    ANOTHER_WINDOW.to_string()
 }
 
 /// How much of `rect` (virtual-screen physical; the whole window when None) is
@@ -652,8 +822,12 @@ fn covering_name(hwnd: HWND, hud: Option<HWND>) -> String {
 /// forward, which closes the menu. A main window's own dropdown is not: an
 /// autocomplete list hanging over the circled Submit button hides it from the
 /// user like any other window, and the user would aim at the list entry.
+///
+/// The sampling sees every window, shared or not, since what the user sees is
+/// what counts; only the names are held back (cover_name). A target that is
+/// not shared is refused as if it had closed.
 pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND>, row: bool) -> Result<Coverage, String> {
-    if !exists(hwnd) {
+    if !reachable(hwnd) {
         return Err(CLOSED.into());
     }
     let target = unsafe { GetAncestor(hwnd, GA_ROOT) };
@@ -697,7 +871,7 @@ pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND
     let (fraction, centre_covered, by) = tally(&samples);
     let mut names: Vec<String> = Vec::new();
     for h in by {
-        let name = covering_name(HWND(h as *mut std::ffi::c_void), hud);
+        let name = cover_name(HWND(h as *mut std::ffi::c_void), hud);
         if !names.contains(&name) {
             names.push(name);
         }
@@ -829,6 +1003,60 @@ mod tests {
         assert_eq!(sample_of(4, 1, &[], || true), Sample::Nowhere);
         // The target is never mistaken for the desktop, nor asked about it.
         assert_eq!(sample_of(1, 1, &[], || panic!("asked")), Sample::Target);
+    }
+
+    fn r(x: i32, y: i32, width: i32, height: i32) -> Rect {
+        Rect { x, y, width, height }
+    }
+
+    #[test]
+    fn only_a_shared_window_on_top_is_shown() {
+        // A video (unshared) over the right half of the target window.
+        let target = r(0, 0, 100, 100);
+        let video = r(50, 0, 100, 100);
+        let shown = shown_parts(&[(video, false), (target, true)], 0);
+        assert_eq!(shown, vec![r(0, 0, 50, 100)]);
+        // Edges pull the shared window in and push the cover out.
+        let shown = shown_parts(&[(video, false), (target, true)], 2);
+        assert_eq!(shown, vec![r(2, 2, 46, 96)]);
+        // A shared menu over the target shows, and hides nothing it should.
+        let menu = r(10, 10, 20, 20);
+        let shown = shown_parts(&[(menu, true), (target, true)], 0);
+        assert!(shown.contains(&menu));
+        let area: i32 = shown.iter().map(|s| s.width * s.height).sum();
+        assert_eq!(area, 100 * 100);
+        // Nothing shared: nothing shown.
+        assert!(shown_parts(&[(video, false)], 2).is_empty());
+    }
+
+    #[test]
+    fn cutting_leaves_the_rest() {
+        let parts = cut(&r(0, 0, 10, 10), &r(3, 3, 4, 4));
+        let area: i32 = parts.iter().map(|p| p.width * p.height).sum();
+        assert_eq!(area, 100 - 16);
+        assert!(parts.iter().all(|p| clip(p, &r(3, 3, 4, 4)).is_none()));
+        assert_eq!(cut(&r(0, 0, 10, 10), &r(20, 20, 5, 5)), vec![r(0, 0, 10, 10)]);
+        assert!(cut(&r(2, 2, 2, 2), &r(0, 0, 10, 10)).is_empty());
+    }
+
+    #[test]
+    fn masking_paints_everything_not_kept() {
+        let mut buf = image(4, 3, [200, 100, 50, 255]);
+        mask_outside(&mut buf, 4, 3, &[r(1, 1, 2, 1), r(-5, -5, 2, 2)]);
+        for y in 0..3 {
+            for x in 0..4 {
+                let px = &buf[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+                if y == 1 && (x == 1 || x == 2) {
+                    assert_eq!(px, [200, 100, 50, 255]);
+                } else {
+                    assert_eq!(px, MASK_BGRA, "{x},{y}");
+                }
+            }
+        }
+        // Nothing kept: all masked.
+        let mut buf = image(2, 2, [9, 9, 9, 9]);
+        mask_outside(&mut buf, 2, 2, &[]);
+        assert!(buf.chunks_exact(4).all(|px| px == MASK_BGRA));
     }
 
     #[test]

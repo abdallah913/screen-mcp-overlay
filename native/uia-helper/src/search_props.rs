@@ -242,8 +242,8 @@ impl Focus {
         Focus { at: None, ancestors: Vec::new() }
     }
 
-    /// Focus as it bears on controls in `tops` (top-level window handles; 0
-    /// means anywhere on the desktop).
+    /// Focus as it bears on controls in `tops` (top-level window handles,
+    /// all shared ones: focus in any other app is never read).
     ///
     /// Reading focus is a call into whatever app has it, which is often not
     /// the one being searched, and a hung foreground app would make every
@@ -268,7 +268,7 @@ impl Focus {
         }
         let root = unsafe { GetAncestor(foreground, GA_ROOT) };
         let root = if root.is_invalid() { foreground } else { root };
-        if !tops.iter().any(|&t| t == 0 || t == root.0 as isize) || crate::windows::is_hung(root) {
+        if !tops.iter().any(|&t| t != 0 && t == root.0 as isize) || crate::windows::is_hung(root) {
             return Focus::none();
         }
         // Not the value: the focused control is often a document, whose value

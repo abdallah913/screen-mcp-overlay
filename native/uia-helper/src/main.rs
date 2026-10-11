@@ -11,10 +11,16 @@
 //! holds because of the DPI-awareness call in `main`; without it Windows hands
 //! back DPI-virtualised coordinates and every rect is silently wrong on a scaled
 //! display.
+//!
+//! Nothing here reads or acts on a window the user has not shared (see
+//! sharing.rs): every op that names a window refuses one that is not shared
+//! with the answer a closed window gets. Only list_windows and zorder list
+//! every window, for the client's own decisions.
 
 mod model;
 mod ocr;
 mod search;
+mod sharing;
 mod windows;
 mod winops;
 
@@ -85,6 +91,12 @@ struct Request {
     /// its main window's tree.
     #[serde(default)]
     row: bool,
+    /// set_shared: the shared windows, as handles (or {ref, pid}).
+    #[serde(default)]
+    windows: Option<Vec<sharing::ShareRef>>,
+    /// set_shared: executables shared whole, by file name.
+    #[serde(default)]
+    apps: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -165,6 +177,12 @@ fn main() {
 
         match req.op.as_str() {
             "list_windows" => reply(req.id, Ok(windows::list_windows())),
+            "zorder" => reply(req.id, Ok(windows::zorder())),
+            "set_shared" => {
+                sharing::set_shared(req.windows.as_deref().unwrap_or_default(), req.apps.as_deref().unwrap_or_default());
+                session.forget_unshared();
+                reply(req.id, Ok(serde_json::Value::Null));
+            }
             "find_elements" => {
                 let r = session.find_elements(
                     req.window.as_deref(),
@@ -206,10 +224,7 @@ fn main() {
             "print_window" => {
                 let target = parse_hwnd(req.window.as_deref());
                 match (target, req.path.as_deref()) {
-                    (Ok(h), Some(p)) => reply(
-                        req.id,
-                        winops::print_window_png(h, p),
-                    ),
+                    (Ok(h), Some(p)) => reply(req.id, winops::print_window_png(h, p, ignore_pid(&req))),
                     (Err(e), _) => reply::<()>(req.id, Err(e)),
                     (_, None) => reply::<()>(req.id, Err("print_window needs a path".into())),
                 }

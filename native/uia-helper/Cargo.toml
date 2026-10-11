@@ -32,6 +32,9 @@ features = [
     "Win32_System_Threading",
     # Elevation checks (OpenProcessToken, GetTokenInformation).
     "Win32_Security",
+    # The parent process (the overlay app), whose windows a masked screen copy
+    # leaves alone.
+    "Win32_System_Diagnostics_ToolHelp",
     # IUIAutomation2 connection and transaction timeouts, so a hung app fails
     # one UIA call instead of wedging the helper. uiautomation enables it too;
     # it is declared here because the helper calls it directly.

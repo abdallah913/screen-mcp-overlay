@@ -3,8 +3,14 @@
 //! These are often separate top-level windows, which UI Automation lists under
 //! the desktop rather than under the app window, so a search rooted at the
 //! window can never reach the menu item the user was just told to open. They
-//! are found here by process instead, with plain Win32 calls (no COM), and
-//! searched before the window itself.
+//! are found here with plain Win32 calls (no COM), and searched before the
+//! window itself.
+//!
+//! Only popups tied to the window itself count: ones it owns, and menus and
+//! popups serving it. Sharing the same process, or sitting over the window,
+//! does not: one browser process runs the window the user shared and the one
+//! playing a video, and the video's Picture-in-Picture window must never be
+//! described as part of the shared one.
 
 use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{HWND, LPARAM, TRUE};
@@ -15,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::model::Rect;
-use crate::windows::{class_of, is_cloaked, rect_of, title_of};
+use crate::windows::{class_of, is_cloaked, rect_of, root_owner_of, title_of, MENU_CLASS};
 
 use super::rank::{popup_like, popup_of, popup_window, touches, PopupLink};
 
@@ -39,19 +45,17 @@ const NEVER_POPUPS: &[&str] = &[
     "TaskListThumbnailWnd",
 ];
 
-/// The class of a Win32 menu window.
-const MENU_CLASS: &str = "#32768";
-
 /// Owner links followed when asking whether the target owns a window.
 const OWNER_HOPS: usize = 8;
 
 struct Search {
     target: HWND,
+    /// The target's process, and its hosted UWP content's: a cheap first
+    /// filter, never a link on its own.
     pids: Vec<u32>,
-    /// The target's thread, and its hosted UWP content's: a Win32 menu is
-    /// created by the thread whose window opened it.
-    threads: Vec<u32>,
-    target_rect: Option<Rect>,
+    /// While the target is itself a popup, the window it belongs to: its
+    /// sibling popups (a submenu beside its parent menu) belong there too.
+    home: Option<HWND>,
     screen: Option<Rect>,
     found: Vec<(HWND, Rect)>,
 }
@@ -60,10 +64,6 @@ pub fn pid_of(hwnd: HWND) -> u32 {
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     pid
-}
-
-fn thread_of(hwnd: HWND) -> u32 {
-    unsafe { GetWindowThreadProcessId(hwnd, None) }
 }
 
 /// Whether `target` owns `hwnd`, directly or up the owner chain.
@@ -130,7 +130,7 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if hwnd == search.target || !IsWindowVisible(hwnd).as_bool() || !search.pids.contains(&pid_of(hwnd)) {
         return TRUE;
     }
-    let Some((class, owned)) = popup_looks(hwnd) else { return TRUE };
+    let Some((_, owned)) = popup_looks(hwnd) else { return TRUE };
     let Some(rect) = rect_of(hwnd) else { return TRUE };
     if rect.width <= 0 || rect.height <= 0 {
         return TRUE;
@@ -140,11 +140,12 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
             return TRUE;
         }
     }
+    let belongs = root_owner_of(hwnd);
     let link = PopupLink {
-        menu_of_its_thread: class == MENU_CLASS && search.threads.contains(&thread_of(hwnd)),
+        serves: belongs == Some(search.target) || (search.home.is_some() && belongs == search.home),
         owned: owned && owned_by(hwnd, search.target),
     };
-    if !popup_of(link, &rect, search.target_rect.as_ref(), search.screen.as_ref()) {
+    if !popup_of(link, &rect, search.screen.as_ref()) {
         return TRUE;
     }
     search.found.push((hwnd, rect));
@@ -155,16 +156,14 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
 /// from the top, and a submenu opens above its parent menu).
 ///
 /// A UWP app's frame belongs to ApplicationFrameHost while its popups belong to
-/// the app itself, so the hosted CoreWindow's process counts too.
+/// the app itself, so the hosted CoreWindow's process is looked through too.
 pub fn popups_of(window: HWND) -> Vec<(HWND, Rect)> {
     let mut pids = vec![pid_of(window)];
-    let mut threads = vec![thread_of(window)];
     if let Ok(core) = unsafe { FindWindowExW(Some(window), None, w!("Windows.UI.Core.CoreWindow"), None) } {
         let hosted = pid_of(core);
         if hosted != 0 && !pids.contains(&hosted) {
             pids.push(hosted);
         }
-        threads.push(thread_of(core));
     }
     if pids[0] == 0 {
         return Vec::new();
@@ -172,8 +171,7 @@ pub fn popups_of(window: HWND) -> Vec<(HWND, Rect)> {
     let mut search = Search {
         target: window,
         pids,
-        threads,
-        target_rect: rect_of(window),
+        home: if is_popup(window) { root_owner_of(window) } else { None },
         screen: screen_of(window),
         found: Vec::new(),
     };
