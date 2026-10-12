@@ -1,6 +1,6 @@
 import type { SnapshotNode } from '../shared/types.js';
 import { toSnapshotNodes, type TreeRow } from '../shared/uitree.js';
-import { isShared, onSharingChanged, sharedOf, wasRevoked, windowsWithSharing } from './sharing.js';
+import { isShared, onSharingChanged, revocationCount, sharedOf, wasRevoked, windowsWithSharing } from './sharing.js';
 import {
     describeWindow,
     findElements,
@@ -70,6 +70,12 @@ export interface WaitRequest {
      * the first poll sets the baseline, which may already hold the change.
      */
     since?: string;
+    /**
+     * revocationCount() when the caller began reading for this call: the
+     * user stopping any share after that ends the wait (see watchShare).
+     * Defaults to the count when the wait starts.
+     */
+    revocations?: number;
 }
 
 export interface WaitOutcome {
@@ -100,11 +106,15 @@ export interface WaitOutcome {
  * Whether a control carries the wanted value. A state word must match a whole
  * word, or "checked" would match "unchecked"; a value matches as a
  * case-insensitive substring, which is how typing steps are confirmed.
+ *
+ * "focused" is never a state that matches (see withoutFocus): a shared
+ * control has focus only while the user is in its window, so a wait on it
+ * would be met or not by whether they were in a window they did not share.
  */
 export function valueMatches(e: Pick<ElementInfo, 'value' | 'state'>, want: string | undefined): boolean {
     const w = want?.trim().toLowerCase();
     if (!w) return true;
-    if (e.state?.split(',').some(s => s.trim().toLowerCase() === w)) return true;
+    if (withoutFocus(e.state)?.split(',').some(s => s.toLowerCase() === w)) return true;
     return (e.value ?? '').toLowerCase().includes(w);
 }
 
@@ -189,13 +199,21 @@ const onScreen = (w: WindowInfo): boolean => !w.minimized && !w.cloaked;
  * State words without "focused". Focus moves the moment the user clicks into
  * the app, before they have done anything the step asked for, so a "changes"
  * wait that saw it would confirm a typing step on the click into the field.
+ * Nor is it ever reported: a shared window holds focus only while the user is
+ * in it, so the word, or its absence from every shared window, would say
+ * whether they were in one they did not share.
  */
 export function withoutFocus(state: string | undefined): string | undefined {
     const kept = (state ?? '')
         .split(',')
         .map(w => w.trim())
-        .filter(w => w && w !== 'focused');
+        .filter(w => w && w.toLowerCase() !== 'focused');
     return kept.length > 0 ? kept.join(',') : undefined;
+}
+
+/** A control as a wait reports it: without focus (see withoutFocus). */
+function unfocused<E extends ElementInfo | null | undefined | false>(e: E): E {
+    return e ? ({ ...e, state: withoutFocus(e.state) } as E) : e;
 }
 
 type Looks = Pick<ElementInfo, 'name' | 'value' | 'enabled' | 'state'>;
@@ -498,7 +516,11 @@ function unlessAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promi
     return Promise.race([p, aborted]).finally(() => signal.removeEventListener('abort', onAbort));
 }
 
-/** Why a wait on a window ends when the user stops sharing it. */
+/**
+ * Why a wait ends when the user stops sharing something. Its callers are
+ * answered in fixed words instead (common.ts guarded); this stays as the
+ * internal reason, so the wait stops reading at once.
+ */
 export const NO_LONGER_SHARED = 'the user stopped sharing the window it was watching';
 
 /**
@@ -522,11 +544,17 @@ export async function unsharedNow(ref: string): Promise<boolean> {
 }
 
 /**
- * Keep an eye on a waited-on window's share: once the user stops sharing it,
- * nothing more is read from it or reported about it, however the polls go.
+ * Keep an eye on the shares while a wait runs. Once the user stops sharing
+ * the waited-on window, nothing more is read from it or reported about it,
+ * however the polls go. Stopping any other share ends the wait as well, and
+ * an unscoped one most of all: its every check searches each shared window,
+ * so a check that was in flight may hold what the user just took back. The
+ * tool answers such a call in fixed words (common.ts guarded) whatever the
+ * wait found, so there is nothing left to wait for.
  */
-function watchShare(window: string | undefined): { revoked: () => boolean; stop: () => void } {
-    if (!window) return { revoked: () => false, stop: () => undefined };
+function watchShare(window: string | undefined, start: number): { revoked: () => boolean; stop: () => void } {
+    const any = (): boolean => revocationCount() !== start;
+    if (!window) return { revoked: any, stop: () => undefined };
     let revoked = false;
     const stop = onSharingChanged(() => {
         void unsharedNow(window).then(gone => {
@@ -536,11 +564,11 @@ function watchShare(window: string | undefined): { revoked: () => boolean; stop:
     // Asked directly as well: a check that failed because the window closed
     // right after the user stopped sharing it must not read as it closing
     // while the listing above is still in flight.
-    return { revoked: () => revoked || wasRevoked(window), stop: () => void stop() };
+    return { revoked: () => revoked || wasRevoked(window) || any(), stop: () => void stop() };
 }
 
 export async function waitForElement(req: WaitRequest): Promise<WaitOutcome> {
-    const share = watchShare(req.window);
+    const share = watchShare(req.window, req.revocations ?? revocationCount());
     try {
         return await waitLoop(req, share.revoked);
     } finally {
@@ -560,6 +588,7 @@ async function waitLoop(req: WaitRequest, revoked: () => boolean): Promise<WaitO
 
     for (;;) {
         if (req.signal?.aborted) return { met: false, waitedMs: elapsed(), polls, ended: 'aborted' };
+        if (revoked()) return { met: false, waitedMs: elapsed(), polls, ended: 'gave-up', reason: NO_LONGER_SHARED };
         const last = Boolean(req.lastCheck?.aborted);
         const final = last || elapsed() >= req.timeoutMs;
         polls += 1;
@@ -569,8 +598,8 @@ async function waitLoop(req: WaitRequest, revoked: () => boolean): Promise<WaitO
             const why = !final ? false : last && req.lastCheck?.reason === 'done' ? 'done' : 'timeout';
             const probe = await unlessAborted(check(why), req.signal);
             if (probe === undefined) return { met: false, waitedMs: elapsed(), polls, ended: 'aborted' };
-            hit = probe.hit;
-            seen = probe.seen;
+            hit = unfocused(probe.hit);
+            seen = unfocused(probe.seen);
             failures = 0;
             succeeded += 1;
         } catch (err) {

@@ -96,10 +96,13 @@ export function registerDraw(server: McpServer): void {
             description: 'Remove drawings: the given ids, or all.',
             inputSchema: { ids: z.array(z.string()).optional() }
         },
-        async args => {
-            const n = store.clear(args.ids);
-            return text(`Cleared ${n}; ${store.list().length} remain.${await hiddenNote()}`);
-        }
+        // Guarded like every tool that reads the window list: its note on
+        // hidden drawings can land just as the user stops a share.
+        args =>
+            guarded('clear_annotations', async () => {
+                const n = store.clear(args.ids);
+                return text(`Cleared ${n}; ${store.list().length} remain.${await hiddenNote()}`);
+            })
     );
 }
 

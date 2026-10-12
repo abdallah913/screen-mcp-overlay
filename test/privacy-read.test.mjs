@@ -240,21 +240,31 @@ test('an unscoped search keeps to its limit across windows', async () => {
 
 // --- covering windows, clicks and refs ------------------------------------------------
 
-test('a private window covering a shared target is "another window", however the helper names it', async () => {
-    for (const by of [[VIDEO], ['Chrome_WidgetWin_1'], [`a popup of ${VIDEO}`], ['500']]) {
+test('a private window covering a shared target is not mentioned to the agent, however the helper names it', async () => {
+    fakeHelper({}, desktopWith(true));
+    const uncovered = normal((await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] })).text);
+    for (const by of [[VIDEO], ['Chrome_WidgetWin_1'], [`a popup of ${VIDEO}`], ['500'], ['another window']]) {
         fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by }) }, desktopWith(true));
         const { text } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
         assertNoLeak(text, JSON.stringify(by));
-        assert.match(text, /is behind another window/);
-        assertNoLeak(String(store.list()[0].covered), 'the stored cover');
+        // Even a fixed phrase came and went with the private window, so the
+        // answer is the one with nothing on top.
+        assert.equal(normal(text), uncovered, JSON.stringify(by));
+        // The overlay still tells the user, naming nothing they did not share.
+        assert.equal(store.list()[0].covered, 'another window');
     }
 });
 
-test('the chat panel and shared windows keep their names as covers', async () => {
-    fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by: ["the overlay's chat panel", VIDEO, 'Calculator'] }) }, desktopWith(true));
+test('the chat panel and shared windows keep their names as covers, unless a private window is among them', async () => {
+    fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by: ["the overlay's chat panel", 'Calculator'] }) }, desktopWith(true));
     const { text } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
     assertNoLeak(text);
-    assert.match(text, /behind "the overlay's chat panel, another window"/);
+    assert.match(text, /behind "the overlay's chat panel, Calculator"/);
+
+    fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by: ["the overlay's chat panel", VIDEO, 'Calculator'] }) }, desktopWith(true));
+    const mixed = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
+    assertNoLeak(mixed.text);
+    assert.doesNotMatch(mixed.text, /WARNING|behind|covered|another window/);
 });
 
 test('a click on the private window names nothing and issues no ref', async () => {

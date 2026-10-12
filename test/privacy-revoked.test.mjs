@@ -7,9 +7,11 @@ import { call, fakeDesktop, fakeHelper, harness, rect } from './support/fake-hel
  * (sharing.ts wasRevoked): no wait, step report, plan or note may say later
  * that it closed, was minimised or is still there. Otherwise a wait started
  * while it was shared, or a step that runs for minutes, tells the agent
- * whether and when a window it was denied closed. The guidance tools also
- * answer "foreground" and refuse a window exactly as the reading tools do,
- * and say how much of a target a private window hides in one fixed phrase.
+ * whether and when a window it was denied closed. A call during which the
+ * user stops sharing anything answers in one fixed sentence (common.ts
+ * guarded). The guidance tools also answer "foreground" and refuse a window
+ * exactly as the reading tools do, and say nothing of a private window over
+ * a target.
  */
 
 const { store, answerStep, cancelStep, currentStep, stopSharingWindow, wasRevoked } = harness;
@@ -41,6 +43,10 @@ const video = {
 };
 const save = { ref: 'el_1', name: 'Save', role: 'button', automation_id: 'SaveBtn', rect: rect(150, 150, 80, 24), enabled: true };
 const shapes = [{ type: 'circle' }];
+
+/** What any call hears when the user stopped sharing something while it ran (common.ts). */
+const STOPPED =
+    'The user stopped sharing a window while this ran, so nothing from it is returned. list_windows shows what is shared now.';
 
 /** Check counts, times and ids depend on scheduling and on earlier tests, not on what the user did. */
 const steady = t =>
@@ -100,7 +106,7 @@ test('a window "changes" wait is not met by a window closing after the user stop
         if (closes) close();
         return (await waiting).text;
     });
-    assert.match(text, /^NOT met: "changes" did not happen/);
+    assert.equal(text, `wait_for_element: ${STOPPED}`);
 });
 
 test('an unselected "changes" wait is not met by a window closing after the user stopped sharing it', async () => {
@@ -112,7 +118,7 @@ test('an unselected "changes" wait is not met by a window closing after the user
         if (closes) close();
         return (await waiting).text;
     });
-    assert.match(text, /^NOT met: "changes" did not happen/);
+    assert.equal(text, `wait_for_element: ${STOPPED}`);
 });
 
 test('unsharing and closing between two checks is not a window closing either', async () => {
@@ -124,7 +130,7 @@ test('unsharing and closing between two checks is not a window closing either', 
         stopSharingWindow('100', { byUser: true });
         return (await waiting).text;
     });
-    assert.match(text, /^NOT met/);
+    assert.equal(text, `wait_for_element: ${STOPPED}`);
 });
 
 test('a wait on a window the user unshares and closes at once ends as unshared, not as closed', async () => {
@@ -143,7 +149,7 @@ test('a wait on a window the user unshares and closes at once ends as unshared, 
         });
         out.push(steady((await call('wait_for_element', { condition: 'disappears', name: 'Save', window: 'Notepad', timeoutMs: 5000 })).text));
     }
-    assert.match(out[0], /^NOT met yet: the user stopped sharing the window it was watching\./);
+    assert.equal(out[0], `wait_for_element: ${STOPPED}`);
     assert.equal(out[1], out[0]);
 });
 
@@ -165,9 +171,8 @@ test('a step digest does not list a window that closed after the user stopped sh
         answerStep({ kind: 'done' });
         return (await waiting).text;
     });
-    assert.match(text, /^DONE after/);
-    assert.equal(/Since the step began/.test(text), false, text);
-    assert.match(text, /Nothing changed: the user may still be working/);
+    // Calculator's step ends as Notepad's share does: the whole call is void.
+    assert.equal(text, `highlight_and_wait: ${STOPPED}`);
 });
 
 test('a met "changes" step does not list it in After either', async () => {
@@ -183,7 +188,7 @@ test('a met "changes" step does not list it in After either', async () => {
         answerStep({ kind: 'done' });
         return (await waiting).text;
     });
-    assert.match(text, /^Met: "changes"/);
+    assert.equal(text, `highlight_and_wait: ${STOPPED}`);
 });
 
 test('a step whose window the user unshares and closes at once ends as unshared', async () => {
@@ -196,7 +201,7 @@ test('a step whose window the user unshares and closes at once ends as unshared'
             if (closes) close();
             stopSharingWindow('100', { byUser: true });
             const { text } = await waiting;
-            assert.match(text, /^NOT done: the user stopped sharing the window this step was in/, `${mode}: ${text}`);
+            assert.equal(text, `highlight_and_wait: ${STOPPED}`, mode);
             return text;
         });
     }
@@ -243,8 +248,48 @@ test('a plan stops at a window the user unshared, whether it then closed or not'
         store.off('annotations', onTick);
         out.push(steady(text));
     }
-    assert.match(out[0], /\nStep 2\/2: could not start: the window it would run in is not shared \(or has closed\)/);
+    assert.equal(out[0], `highlight_and_wait: ${STOPPED}`);
     assert.equal(out[1], out[0]);
+});
+
+// --- a share ended before the call -------------------------------------------------
+
+/*
+ * The tests above stop a share during the call, which now voids it whole. A
+ * share the user stopped before the call began is the other half: the call
+ * runs, and the window's closing during it must not show.
+ */
+
+test('a step does not report a window, unshared before it began, closing during it', async () => {
+    const text = await sameOpenOrClosed(async ({ close }, closes) => {
+        stopSharingWindow('100', { byUser: true });
+        const waiting = call('highlight_and_wait', {
+            window: 'Calculator',
+            prompt: 'do it',
+            until: { condition: 'appears', name: 'Nothing here' },
+            timeoutMs: 60000
+        });
+        await eventually(() => currentStep() !== null);
+        await sleep(200);
+        if (closes) close();
+        await sleep(200);
+        answerStep({ kind: 'done' });
+        return (await waiting).text;
+    });
+    assert.match(text, /^DONE after Ts, but the until is NOT met/);
+    assert.equal(/Since the step began/.test(text), false, text);
+    assert.match(text, /Nothing changed: the user may still be working/);
+});
+
+test('a "changes" wait is not met by a window, unshared before it began, closing during it', async () => {
+    const text = await sameOpenOrClosed(async ({ close }, closes) => {
+        stopSharingWindow('100', { byUser: true });
+        const waiting = call('wait_for_element', { condition: 'changes', timeoutMs: 1500 });
+        await sleep(400);
+        if (closes) close();
+        return (await waiting).text;
+    });
+    assert.match(text, /^NOT met: "changes" did not happen within Ts/);
 });
 
 // --- drawings ---------------------------------------------------------------------
@@ -346,22 +391,21 @@ async function coverWords(cover) {
     return `${steady(started.text)}\n---\n${steady((await stuck).text)}`;
 }
 
-test('how much of a target a private window hides is one phrase, whatever the overlap', async () => {
-    // The private window moves over the target: while it covers it, the words stay the same.
-    const covering = [];
-    for (const [fraction, centre] of [[0.55, true], [0.75, true], [0.95, true], [1, true], [0.3, true], [0.6, false]]) {
-        covering.push(await coverWords({ fraction, centre_covered: centre, by: [video.title] }));
+test('a private window over a target reads as nothing on top, wherever it is', async () => {
+    // The private window moves over the target and off it: whether it
+    // covers the centre, most of it or a corner, the words are the ones with
+    // nothing on top. A warning that came and went with it, in whatever
+    // fixed words, mapped where it was.
+    const answers = [];
+    for (const [fraction, centre] of [[0.55, true], [0.75, true], [0.95, true], [1, true], [0.3, true], [0.6, false], [0.1, false], [0.45, false]]) {
+        answers.push(await coverWords({ fraction, centre_covered: centre, by: [video.title] }));
     }
-    for (const t of covering) assert.equal(t, covering[0]);
-    assert.match(covering[0], /WARNING: "Save" \[button\] el_1 is behind another window; focus_window/);
-    assert.equal(/\d+%|partly|mostly|almost|YouTube/.test(covering[0]), false, covering[0]);
-    // While it only grazes it, the answer is the one with nothing on top.
-    const grazing = [];
-    for (const fraction of [0, 0.1, 0.3, 0.45]) {
-        grazing.push(await coverWords({ fraction, centre_covered: false, by: fraction ? [video.title] : [] }));
-    }
-    for (const t of grazing) assert.equal(t, grazing[0]);
-    assert.match(grazing[0], /The circled control is visible and uncovered/);
+    const nothing = await coverWords({ fraction: 0, centre_covered: false, by: [] });
+    for (const t of answers) assert.equal(t, nothing);
+    assert.match(nothing, /The circled control is visible and uncovered/);
+    assert.equal(/WARNING|behind|covered by|another window|YouTube/.test(nothing), false, nothing);
+    // Alongside a shared cover too: its share of the target would include the private one's.
+    assert.equal(await coverWords({ fraction: 0.9, centre_covered: true, by: ['Calculator', video.title] }), nothing);
 });
 
 test('a shared cover is still named and measured', async () => {

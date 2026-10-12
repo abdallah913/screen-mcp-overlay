@@ -42,7 +42,13 @@ export const STOPPED_WHILE_RUNNING =
  * told the agent it was open and what it was called.
  *
  * A share the user withdraws while the handler runs can still be in what it
- * read, so then nothing of the result goes back, whichever window it was.
+ * read, so then nothing of the result goes back, whichever window it was and
+ * whichever tool. Walkthrough steps and waits are no exception: a step's
+ * last reads (what changed, the digest, a click's verdict) and an unscoped
+ * wait's search of every shared window can each land just after the user
+ * took a window back, and a tool cannot tell that from inside every read.
+ * They still stop reading the moment they hear of it (guide.ts, waits.ts),
+ * but what they would have said is replaced by this one fixed answer.
  */
 export async function guarded(tool: string, fn: () => Promise<Result>): Promise<Result> {
     const revocations = revocationCount();
@@ -52,18 +58,9 @@ export async function guarded(tool: string, fn: () => Promise<Result>): Promise<
     } catch (err) {
         result = fail(`${tool}: ${await agentSafe(err as Error)}`);
     }
-    if (revocationCount() === revocations || ANSWERS_STOPS_ITSELF.has(tool)) return result;
+    if (revocationCount() === revocations) return result;
     return fail(`${tool}: ${STOPPED_WHILE_RUNNING}`);
 }
-
-/**
- * Tools that watch for a share ending while they wait, and then stop reading
- * and answer in fixed words of their own (guide.ts, waits.ts). A walkthrough
- * step or a wait can run for many minutes, and the user stopping some other
- * share meanwhile must not throw away what the step found in the windows
- * still shared.
- */
-const ANSWERS_STOPS_ITSELF = new Set(['highlight_and_wait', 'wait_for_element']);
 
 /**
  * Helper errors that say something about one window: that it closed, hangs, is

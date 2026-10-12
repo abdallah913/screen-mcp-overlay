@@ -32,7 +32,7 @@ import {
     type ElementInfo,
     type WindowInfo
 } from '../../uia.js';
-import { ANOTHER_WINDOW, agentCoverVerdict, findRanked, geometryFor, wakeAnchorTracking } from '../../anchors.js';
+import { agentCoverVerdict, findRanked, geometryFor, screenCoverVerdict, wakeAnchorTracking } from '../../anchors.js';
 import { DEFAULT_COLORS, RECT_SHAPES } from './common.js';
 
 /**
@@ -64,10 +64,9 @@ export interface SharedTarget {
  * resolveWindowInfo, step for step, on the one listing the decisions are
  * also made on), so it means the same window here as in describe_window, and
  * a refusal reads the same word for word (privacy-revoked.test.mjs compares
- * them). "foreground" is the frontmost shared window: the shared one in
- * front, else the first visible shared one in z-order, whatever the user is
- * really in. Refusing it when a private window is in front, as this used to,
- * told the agent exactly that.
+ * them). "foreground" is the frontmost visible shared window in z-order,
+ * whatever the user is really in (windows.ts matchWindow). Refusing it when a
+ * private window is in front, as this used to, told the agent exactly that.
  *
  * Tells the user's panel of a refusal, unless `internal`: a window the server
  * carried over itself is no agent's request.
@@ -90,9 +89,29 @@ export async function sharedWindowFor(query: string, internal = false): Promise<
     return { ref: found.window.ref, window: found.window, note: found.note, all, shared };
 }
 
-/** A covered verdict in a sentence: a shared title quoted, the generic phrase as it is. */
+/** A covered verdict in a sentence: shared titles, or the chat panel, quoted. */
 export function coveredBy(covered: string): string {
-    return covered === ANOTHER_WINDOW ? ANOTHER_WINDOW : `"${covered}"`;
+    return `"${covered}"`;
+}
+
+/**
+ * How covered a target is: for the agent, only when every cover is shared
+ * (agentCoverVerdict), and for the overlay, which tells the user about a
+ * private window on top as well (screenCoverVerdict). Null when it could
+ * not be read: a failed read costs the drawing nothing.
+ */
+async function coveredNow(
+    window: string,
+    rect: Rect | undefined,
+    role: string | undefined,
+    shared: readonly WindowInfo[]
+): Promise<{ agent: string | null; screen: string | null }> {
+    try {
+        const c = await coverage(window, rect, role);
+        return { agent: agentCoverVerdict(c, shared), screen: screenCoverVerdict(c, shared) };
+    } catch {
+        return { agent: null, screen: null };
+    }
 }
 
 // ------------------------------------------------------------------ geometry
@@ -227,10 +246,17 @@ export interface ResolvedAnchor {
     /** Scrolled out of view: drawn as a pointer toward it, not at its rect. */
     offscreen?: boolean;
     /**
-     * What covers it, when it is mostly hidden: shared windows by title, the
-     * chat panel, or "another window" (see safeCoverNames).
+     * What covers it, when it is mostly hidden, as the agent may hear it:
+     * shared windows by title, or the chat panel. Unset whenever a window
+     * the user did not share is among the covers (see sharedCovers).
      */
     covered?: string;
+    /**
+     * What covers it, for the overlay's note to the user: a private window
+     * on top is "another window" there (see safeCoverNames). Never reported
+     * to the agent.
+     */
+    coveredOnScreen?: string;
     /** The window it was found in, for the hints a response gives. */
     window?: string;
     /** What the user knows it as: the control's own name, or a window's title. Unset when it has none. */
@@ -379,9 +405,7 @@ async function windowAnchor(query: string): Promise<ResolvedAnchor> {
     }
     const what = `window ${ref} "${clean(info.title)}"`;
     const title = clean(info.title) || undefined;
-    const covered = await coverage(ref)
-        .then(c => agentCoverVerdict(c, resolved.shared))
-        .catch(() => null);
+    const covered = await coveredNow(ref, undefined, undefined, resolved.shared);
     return {
         kind: 'window',
         ref,
@@ -391,7 +415,8 @@ async function windowAnchor(query: string): Promise<ResolvedAnchor> {
         window: ref,
         name: title,
         app: title,
-        covered: covered ?? undefined,
+        covered: covered.agent ?? undefined,
+        coveredOnScreen: covered.screen ?? undefined,
         windowNote: resolved.note
     };
 }
@@ -418,10 +443,8 @@ async function described(
     const window = selector?.window ?? info?.ref;
     const covered =
         window && !found.offscreen
-            ? await coverage(found.window ?? window, found.rect, found.role)
-                  .then(c => agentCoverVerdict(c, shared))
-                  .catch(() => null)
-            : null;
+            ? await coveredNow(found.window ?? window, found.rect, found.role, shared)
+            : { agent: null, screen: null };
 
     return {
         kind: 'element',
@@ -433,7 +456,8 @@ async function described(
         where,
         also: extra.also,
         offscreen: found.offscreen || undefined,
-        covered: covered ?? undefined,
+        covered: covered.agent ?? undefined,
+        coveredOnScreen: covered.screen ?? undefined,
         window,
         name: name || undefined,
         app: info ? clean(info.title) || undefined : undefined,
@@ -569,7 +593,7 @@ export function placeAnchored(
             },
             // Known at draw time, so the first frame already shows the target
             // as covered or scrolled away; the tracker keeps both current.
-            covered: anchor.covered,
+            covered: anchor.coveredOnScreen,
             offscreen: anchor.offscreen
         };
         // Place it immediately so it appears without waiting for a tracker tick.

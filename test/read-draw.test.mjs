@@ -68,11 +68,13 @@ test('a scoped find that misses gives the same hints', async () => {
 
 // --- what the user can actually see -------------------------------------------
 
-test('a covered target is drawn, marked and warned about, naming the cover only if it is shared', async () => {
+test('a covered target is drawn, marked and warned about, only when the cover is shared', async () => {
+    // Google Chrome is not shared: the overlay marks the target for the user,
+    // and the agent hears nothing, as if nothing were on top.
     fakeHelper({ covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] }) });
     const { text, isError } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
     assert.equal(isError, false);
-    assert.match(text, /WARNING: "Save" \[button\] el_1 is behind another window.*focus_window \{"window":"100"\}/);
+    assert.doesNotMatch(text, /WARNING|behind|another window|Chrome/);
     assert.equal(store.list()[0].covered, 'another window');
 
     fakeHelper({ covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Calculator'] }) });

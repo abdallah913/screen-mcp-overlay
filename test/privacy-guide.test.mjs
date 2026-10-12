@@ -56,6 +56,10 @@ async function eventually(cond, ms = 3000) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+/** What any call hears when the user stopped sharing something while it ran (common.ts). */
+const STOPPED =
+    'The user stopped sharing a window while this ran, so nothing from it is returned. list_windows shows what is shared now.';
+
 async function pending(name, args) {
     const result = call(name, args);
     await eventually(() => currentStep() !== null);
@@ -191,24 +195,24 @@ function changingDesktop(start, later, overrides = {}) {
     };
 }
 
-test('the user switching to the private window leaves no Foreground line', async () => {
-    const toVideo = changingDesktop([video], windows => windows.map(w => ({ ...w, foreground: w.ref === video.ref })));
-    const { result } = await pending('highlight_and_wait', watched);
-    toVideo();
-    answerStep({ kind: 'done' });
-    const { text } = await result;
-    noLeak(text);
-    assert.match(text, /^DONE after/);
-    assert.equal(/Foreground/.test(text), false, text);
+test('where the user went during a step is never said, shared window or not', async () => {
+    const after = async front => {
+        const to = changingDesktop([video], windows => windows.map(w => ({ ...w, foreground: w.ref === front })));
+        const { result } = await pending('highlight_and_wait', watched);
+        to();
+        answerStep({ kind: 'done' });
+        return (await result).text.replace(/\d+s\b/g, 'Ts').replace(/ann_\d+/g, 'ann_N');
+    };
+    const toVideo = await after(video.ref);
+    noLeak(toVideo);
+    assert.match(toVideo, /^DONE after/);
+    assert.equal(/Foreground/.test(toVideo), false, toVideo);
     // Nothing shared opened or closed, and that is all that is said.
-    assert.match(text, /Nothing changed: the user may still be working/);
-
-    // The same switch to a shared window is reported.
-    const toCalculator = changingDesktop([video], windows => windows.map(w => ({ ...w, foreground: w.ref === '200' })));
-    const other = await pending('highlight_and_wait', watched);
-    toCalculator();
-    answerStep({ kind: 'done' });
-    assert.match((await other.result).text, /\nForeground: "Calculator"\./);
+    assert.match(toVideo, /Nothing changed: the user may still be working/);
+    // A line naming a shared window in front, missing only while the user
+    // is in the video, would say just as much.
+    assert.equal(await after('200'), toVideo);
+    assert.equal(await after('100'), toVideo);
 });
 
 /** The video opening in front of Notepad. */
@@ -316,10 +320,9 @@ test('a plan whose next window stopped being shared stops there, without naming 
         timeoutMs: 5000
     });
     store.off('annotations', stopOnTick);
-    noLeak(text);
-    assert.match(text, /^Step 1\/2: Met/);
-    assert.match(text, /\nStep 2\/2: could not start: the window it would run in is not shared \(or has closed\); list_windows with ask/);
-    assert.equal(/600|Find"/.test(text.split('\n').slice(1).join('\n')), false, text);
+    // A share ended while the plan ran: nothing of it is returned, not
+    // even step 1's report, which was read up to that moment.
+    assert.equal(text, `highlight_and_wait: ${STOPPED}`);
     const n = calls.findIndex(c => c.op === 'find_elements' && c.params.name === 'Save' && c.params.window === '600');
     assert.equal(n, -1, 'step 2 did not search the unshared dialog');
 });
@@ -371,28 +374,30 @@ test('a click-mode step clicked on the private window names nothing', async () =
 
 // --- covers ----------------------------------------------------------------------
 
-test('a target covered by the private window says "another window", on screen too', async () => {
+test('a target covered by the private window is said to be covered only to the user, on screen', async () => {
     fakeHelper(
         { find_elements: finder(() => [saved]), covered: () => ({ fraction: 0.85, centre_covered: true, by: [video.title] }) },
         withVideo()
     );
     const drawn = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes });
     noLeak(drawn.text);
-    assert.match(drawn.text, /WARNING: "Save" \[button\] el_1 is behind another window, so the user cannot see it/);
-    // The overlay draws this caption, where a screen capture could read it.
+    // The agent hears nothing of it, as if nothing were on top.
+    assert.equal(/WARNING|behind|covered|another window/.test(drawn.text), false, drawn.text);
+    // The overlay tells the user, naming nothing they did not share.
     assert.equal(store.list()[0].covered, 'another window');
 
     const window = await call('annotate', { anchor: { window: 'Notepad' }, shapes: [{ type: 'box' }] });
     noLeak(window.text);
+    assert.equal(/WARNING|behind|covered|another window/.test(window.text), false, window.text);
     assert.equal(store.list()[0].covered, 'another window');
 
     const step = await call('highlight_and_wait', { ...watched, until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
     noLeak(step.text);
-    assert.match(step.text, /is behind another window;/);
-    assert.equal(/\d+%|mostly|partly|almost/.test(step.text), false, step.text);
+    assert.equal(/WARNING|behind|another window|\d+%/.test(step.text), false, step.text);
+    assert.match(step.text, /The circled control is visible and uncovered/);
 });
 
-test('a click where the target is, under the private window, does not name it', async () => {
+test('a click where the target is, under the private window, is an ordinary click on it', async () => {
     fakeHelper(
         { covered: p => (p.rect ? { fraction: 0.6, centre_covered: true, by: [video.title] } : { fraction: 0, centre_covered: false, by: [] }) },
         withVideo()
@@ -401,7 +406,8 @@ test('a click where the target is, under the private window, does not name it', 
     addClick(click(160, 160));
     const { text } = await result;
     noLeak(text);
-    assert.match(text, /but it was covered by another window, so/);
+    assert.match(text, /^The user clicked the target \(160,160 on display 1\)\./);
+    assert.equal(/covered|another window/.test(text), false, text);
 });
 
 // --- the user stops sharing --------------------------------------------------------
@@ -425,21 +431,23 @@ test('a step ends when the user stops sharing its window, saying only that', asy
     const clicked = await pending('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'Click Save', timeoutMs: 60000 });
     stopSharingWindow('100');
     const { text, isError } = await clicked.result;
-    assert.equal(isError, false);
-    assert.match(text, /^NOT done: the user stopped sharing the window this step was in, so the step ended\./);
-    assert.equal(/Notepad|Circled|clicked/.test(text), false, text);
+    assert.equal(isError, true);
+    assert.equal(text, `highlight_and_wait: ${STOPPED}`);
+    assert.equal(currentStep(), null, 'the step is gone from the screen');
 
     fakeHelper({ find_elements: finder(() => []) }, withVideo());
     const watching = await pending('highlight_and_wait', watched);
     stopSharingWindow('100');
-    assert.match((await watching.result).text, /^NOT done: the user stopped sharing the window this step was in/);
+    assert.equal((await watching.result).text, `highlight_and_wait: ${STOPPED}`);
 });
 
 test('a wait on a window ends when the user stops sharing it', async () => {
     let probes = 0;
     fakeHelper({ find_elements: () => (++probes === 2 && stopSharingWindow('100'), []) }, withVideo());
+    const started = Date.now();
     const { text } = await call('wait_for_element', { condition: 'appears', name: 'Saved', window: 'Notepad', timeoutMs: 60000 });
-    assert.match(text, /^NOT met yet: the user stopped sharing the window it was watching\./);
+    assert.equal(text, `wait_for_element: ${STOPPED}`);
+    assert.ok(Date.now() - started < 5000, 'it ended at once, not at its timeout');
 });
 
 test("progress messages carry only the agent's own words", async () => {

@@ -92,7 +92,9 @@ test('a window that opens during the step meets a window-only until', async () =
     });
     assert.match(text, /^Met: "appears" after/);
     assert.match(text, /Export As \[window\]/);
-    assert.match(text, /After:\n\+ window 500 "Export As" \[foreground\]/);
+    // Never marked as in front: the mark said where the user was (see windowLines).
+    assert.match(text, /After:\n\+ window 500 "Export As"\n/);
+    assert.equal(/foreground/.test(text), false, text);
 });
 
 test('an until that already holds does not start the step', async () => {
@@ -173,14 +175,23 @@ test('a covered target is drawn with a warning; an untitled popup on top is not 
     let r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
     assert.match(r.text, /WARNING: "Save" \[button\] el_1 is 85% behind "Calculator"; focus_window \{window:"Untitled - Notepad"\}/);
 
-    // A cover the user did not share is not named, nor measured at all.
+    // A cover the user did not share is not named, nor measured, nor
+    // mentioned at all: the step reads as one with nothing on top.
     fakeHelper({
         find_elements: finder(() => [saved]),
         covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] })
     });
     r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
-    assert.match(r.text, /WARNING: "Save" \[button\] el_1 is behind another window; focus_window \{window:"Untitled - Notepad"\}/);
-    assert.equal(/Chrome|85%|mostly|partly|almost/.test(r.text), false, r.text);
+    assert.equal(/WARNING|behind|covered by|Chrome|85%|mostly|partly|almost/.test(r.text), false, r.text);
+    assert.match(r.text, /The circled control is visible and uncovered/);
+
+    // Nor alongside a shared cover: the fraction would include its overlap.
+    fakeHelper({
+        find_elements: finder(() => [saved]),
+        covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Calculator', 'Google Chrome'] })
+    });
+    r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
+    assert.equal(/WARNING|behind|covered by|Calculator|85%/.test(r.text), false, r.text);
 
     fakeHelper({
         find_elements: finder(() => [saved]),
@@ -350,7 +361,8 @@ test('NOT met names a window that opened instead, and leaves the circle up', asy
     const { text, isError } = await call('highlight_and_wait', { ...watched, timeoutMs: 1000 });
     assert.equal(isError, false);
     assert.match(text, /^NOT met: "appears" did not happen within/);
-    assert.match(text, /\+ window 500 "Save changes\?" \[foreground\]/);
+    assert.match(text, /\+ window 500 "Save changes\?"\n/);
+    assert.equal(/foreground/.test(text), false, text);
     assert.match(text, /A new window "Save changes\?" appeared; if the control is in it, pass until\.window:"Save changes\?"/);
     assert.match(text, /Circle ann_\d+ left up; your next highlight_and_wait replaces it\./);
     assert.equal(store.list().length, 1);
@@ -434,7 +446,9 @@ test('until.value matches a whole state word, or a value substring', async () =>
     fakeHelper({ find_elements: () => box('unchecked,focused') });
     let r = await call('wait_for_element', { condition: 'appears', name: 'Bold', value: 'checked', window: 'Notepad', timeoutMs: 0 });
     assert.match(r.text, /^NOT met/);
-    assert.match(r.text, /Closest: Bold \[checkbox\].*\(unchecked,focused\)/);
+    // Focus is never reported: it says whether the user is in this window.
+    assert.match(r.text, /Closest: Bold \[checkbox\].*\(unchecked\)/);
+    assert.equal(/focused/.test(r.text), false, r.text);
     fakeHelper({ find_elements: () => box('checked') });
     r = await call('wait_for_element', { condition: 'appears', name: 'Bold', value: 'Checked', window: 'Notepad', timeoutMs: 0 });
     assert.match(r.text, /^Met/);
@@ -506,14 +520,23 @@ test('a click off the circle says where it was and that the app did not get it',
     assert.equal(store.list().length, 0);
 });
 
-test('a click where the target is, but covered, is not a hit', async () => {
+test('a click where the target is, but covered by a shared window, is not a hit', async () => {
+    fakeHelper({ covered: p => (p.rect ? { fraction: 0.6, centre_covered: true, by: ['Calculator'] } : { fraction: 0, centre_covered: false, by: [] }) });
+    const { result } = await pending('highlight_and_wait', pointed);
+    addClick(click(160, 160));
+    const { text } = await result;
+    assert.match(text, /^The user clicked where the target is \(160,160 on display 1\), but it was covered by "Calculator", so/);
+});
+
+test('a click where the target is, under a window that is not shared, is an ordinary hit', async () => {
+    // Google Chrome is not shared: saying the target was covered only while
+    // it sat there would tell the agent where it is.
     fakeHelper({ covered: p => (p.rect ? { fraction: 0.6, centre_covered: true, by: ['Google Chrome'] } : { fraction: 0, centre_covered: false, by: [] }) });
     const { result } = await pending('highlight_and_wait', pointed);
     addClick(click(160, 160));
     const { text } = await result;
-    // Google Chrome is not shared, so it is "another window".
-    assert.match(text, /^The user clicked where the target is \(160,160 on display 1\), but it was covered by another window, so/);
-    assert.equal(/Chrome/.test(text), false, text);
+    assert.match(text, /^The user clicked the target \(160,160 on display 1\)\./);
+    assert.equal(/Chrome|covered|another window/.test(text), false, text);
 });
 
 test('Escape in click mode is an answer, not an error', async () => {
