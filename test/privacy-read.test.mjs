@@ -1,8 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { call, connect, fakeDesktop, fakeHelper, harness, rect } from './support/fake-helper.mjs';
-import { captureLayers, keptInFrame } from '../dist-test/windows.js';
-import { MASK_BGRA, SHARED_INSET_PX, maskBitmap } from '../dist-test/visible.js';
+import { call, connect, fakeDesktop, fakeHelper, harness, onTop, rect } from './support/fake-helper.mjs';
+import { captureLayers } from '../dist-test/windows.js';
 
 /*
  * A window the user has not shared must be indistinguishable, through every
@@ -243,8 +242,11 @@ test('an unscoped search keeps to its limit across windows', async () => {
 test('a private window covering a shared target is not mentioned to the agent, however the helper names it', async () => {
     fakeHelper({}, desktopWith(true));
     const uncovered = normal((await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] })).text);
+    // The video over Save, as the z-order has it, and the helper's look at
+    // the screen naming it in each of the ways it can.
+    const videoOverSave = () => onTop(desktopWith(true), { ref: '500', rect: rect(140, 140, 200, 100) });
     for (const by of [[VIDEO], ['Chrome_WidgetWin_1'], [`a popup of ${VIDEO}`], ['500'], ['another window']]) {
-        fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by }) }, desktopWith(true));
+        fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by }) }, videoOverSave());
         const { text } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
         assertNoLeak(text, JSON.stringify(by));
         // Even a fixed phrase came and went with the private window, so the
@@ -255,16 +257,27 @@ test('a private window covering a shared target is not mentioned to the agent, h
     }
 });
 
-test('the chat panel and shared windows keep their names as covers, unless a private window is among them', async () => {
-    fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by: ["the overlay's chat panel", 'Calculator'] }) }, desktopWith(true));
+test('the chat panel and shared windows keep their names as covers, whatever private window is among them', async () => {
+    // The panel over Save's left, Calculator over its right.
+    const covers = desktop => onTop(onTop(desktop, { ref: '200', rect: rect(190, 140, 100, 60) }), { ref: '400', rect: rect(140, 140, 60, 40) });
+    fakeHelper({}, { ...covers(desktopWith(true)), hud: '400' });
     const { text } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
     assertNoLeak(text);
     assert.match(text, /behind "the overlay's chat panel, Calculator"/);
 
-    fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by: ["the overlay's chat panel", VIDEO, 'Calculator'] }) }, desktopWith(true));
-    const mixed = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
-    assertNoLeak(mixed.text);
-    assert.doesNotMatch(mixed.text, /WARNING|behind|covered|another window/);
+    // The video over Save too, in front of both, between them or behind
+    // them: the same words, since it is never measured.
+    const videoOver = { ref: '500', rect: rect(140, 140, 200, 100) };
+    for (const desktop of [
+        onTop(covers(desktopWith(true)), videoOver),
+        covers(onTop(desktopWith(true), videoOver)),
+        onTop(covers(onTop(desktopWith(true), videoOver)), { ref: '400', rect: rect(140, 140, 60, 40) })
+    ]) {
+        fakeHelper({ covered: () => ({ fraction: 1, centre_covered: true, by: ["the overlay's chat panel", VIDEO, 'Calculator'] }) }, { ...desktop, hud: '400' });
+        const mixed = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
+        assertNoLeak(mixed.text);
+        assert.equal(normal(mixed.text), normal(text));
+    }
 });
 
 test('a click on the private window names nothing and issues no ref', async () => {
@@ -526,61 +539,19 @@ test('snapshot ids cannot be guessed, from one another or by counting', async ()
     }
 });
 
-// --- masking captures (pure) ------------------------------------------------------------
+// --- composing captures (pure) ----------------------------------------------------------
 
 const r = (x, y, width, height) => ({ x, y, width, height });
 
-test('capture layers: our overlay hides what is under it when it shows in grabs', () => {
-    const stack = [
-        { ref: 'overlay', pid: 1, rect: r(0, 0, 1920, 1080) },
-        { ref: '100', pid: 11, rect: r(100, 100, 800, 600) }
-    ];
-    const layers = captureLayers(stack, { pid: 1, panel: 'hud', overlayInGrab: true }, w => w.ref === '100');
-    assert.deepEqual(layers.map(l => [l.shared, Boolean(l.ignore)]), [[false, false], [true, false]]);
-    assert.deepEqual(keptInFrame(layers, layers, r(0, 0, 1920, 1080), { width: 1920, height: 1080 }), []);
-});
-
-test('capture layers: our overlay is see-through, the chat panel hides, sharing decides the rest', () => {
+test('capture layers: only shared windows are painted, never ours', () => {
     const stack = [
         { ref: 'hud', pid: 1, rect: r(1500, 600, 400, 400) },
         { ref: 'overlay', pid: 1, rect: r(0, 0, 1920, 1080) },
         { ref: '500', pid: 40, rect: r(600, 120, 900, 600) },
         { ref: '100', pid: 11, rect: r(100, 100, 800, 600) }
     ];
-    const layers = captureLayers(stack, { pid: 1, panel: 'hud' }, w => w.ref === '100');
-    assert.deepEqual(
-        layers.map(l => [l.shared, Boolean(l.ignore)]),
-        [[false, false], [false, true], [false, false], [true, false]]
-    );
-    const kept = keptInFrame(layers, layers, r(0, 0, 1920, 1080), { width: 1920, height: 1080 });
-    const inside = (x, y) => kept.some(k => x >= k.x && x < k.x + k.width && y >= k.y && y < k.y + k.height);
-    assert.equal(inside(300, 300), true, 'Notepad where nothing covers it');
-    assert.equal(inside(700, 300), false, 'the video over Notepad');
-    assert.equal(inside(1200, 300), false, 'the video beside it');
-    assert.equal(inside(50, 50), false, 'the desktop');
-});
-
-test('a capture whose windows could not be read keeps nothing', () => {
-    const layers = [{ rect: r(0, 0, 100, 100), shared: true }];
-    assert.deepEqual(keptInFrame(null, layers, r(0, 0, 100, 100), { width: 100, height: 100 }), []);
-    assert.deepEqual(keptInFrame(layers, null, r(0, 0, 100, 100), { width: 100, height: 100 }), []);
-});
-
-test('only what was shared both before and after the grab is kept, in the frame\'s own pixels', () => {
-    const before = [{ rect: r(1000, 0, 400, 400), shared: true }];
-    // The window moved 100px right while the grab was in flight.
-    const after = [{ rect: r(1100, 0, 400, 400), shared: true }];
-    // A second display whose frame starts at x=1000, captured at half scale.
-    const kept = keptInFrame(before, after, r(1000, 0, 800, 600), { width: 400, height: 300 });
-    assert.equal(kept.length, 1);
-    const [k] = kept;
-    // The later position, pulled in at the edge, at half scale.
-    assert.equal(k.x, Math.floor((100 + SHARED_INSET_PX) / 2), `left edge at the later position: ${k.x}`);
-    assert.ok(k.x + k.width <= 200, 'right edge at the earlier position');
-
-    const frame = new Uint8Array(400 * 300 * 4).fill(200);
-    const out = maskBitmap(frame, 400, 300, kept);
-    assert.deepEqual([...out.subarray(0, 4)], [...MASK_BGRA], 'outside is painted over');
-    const i = (100 * 400 + 100) * 4;
-    assert.deepEqual([...out.subarray(i, i + 4)], [200, 200, 200, 200], 'inside is the frame');
+    // Even if our own windows were somehow counted as shared.
+    const layers = captureLayers(stack, { pid: 1, panel: 'hud' }, w => w.ref === '100' || w.pid === 1);
+    assert.deepEqual(layers.map(l => l.shared), [false, false, false, true]);
+    assert.deepEqual(layers.map(l => l.rect), stack.map(w => w.rect));
 });

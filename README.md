@@ -118,8 +118,8 @@ fine — they all drive the same screen.
 
 ## 3. Use it
 
-First, share the window you want help with: **click into it and press `Ctrl+Shift+F8`**. Press it
-again in that window to stop. Or just ask, and the agent asks you to share one (see
+First, share the window you want help with: **click into it and press `Ctrl+Shift+F8`**, then confirm
+the window it names. Press it again in that window to stop. Or just ask, and the agent asks you to share one (see
 [Privacy](#privacy)).
 
 Then ask, in whatever agent you connected:
@@ -204,7 +204,8 @@ video reach the AI.
 
 **How to share:**
 
-- **The share key.** Click into a window and press `Ctrl+Shift+F8`. Press it again there to stop.
+- **The share key.** Click into a window and press `Ctrl+Shift+F8`. A dialog names the window and its
+  app and asks you to confirm (*Don't share* is the default). Press the key again there to stop.
 - **The agent asks.** When it needs a window you have not shared, the overlay (not the agent) asks you
   to click into it and press Done, then to confirm. The agent never names the window, so it cannot
   find out what is open by asking.
@@ -220,15 +221,17 @@ What to know:
 
 - **Screenshots show shared windows only.** A screenshot is built from each shared window's own
   picture on a blank background, so nothing of any other window (its pixels, its outline, its shadow),
-  the desktop, the taskbar or a notification is ever in it, and no text is read from them. A shared
-  window that cannot draw its own picture (some games and video players) is taken from the screen
-  instead, and left blank whenever anything you have not shared is in front of it.
+  the desktop, the taskbar or a notification is ever in it, and no text is read from them. Nothing is
+  ever copied from the screen: a shared window that cannot draw its own picture (some games and video
+  players) is left blank, and the agent is told so.
 - **Nothing about other windows leaks through the wording either.** An agent is not told which window
   you are working in, whether something you have not shared covers what it pointed at, or that a window
   you stopped sharing has closed. A tool call during which you stop sharing something returns nothing
   it read.
 - **The overlay's own questions carry its badge.** Asking you to share a window is done by the overlay,
-  marked as such; an agent's message that tries to look like one is labelled as the agent's.
+  marked as such; an agent's message that tries to look like one is labelled as the agent's. The
+  overlay never reads its own questions aloud, so anything spoken is the agent's, and the panel marks
+  every line about what the agent is doing with **AI**.
 - **A shared browser window shows its tab strip**, so the titles of its other tabs are visible, and
   switching that window to another tab shows that tab. Sharing is per window, not per tab: put what
   you want private in a separate browser window.

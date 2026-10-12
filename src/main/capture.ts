@@ -1,11 +1,11 @@
-import { app, desktopCapturer, screen, type NativeImage } from 'electron';
+import { app, screen, type NativeImage } from 'electron';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { CaptureRecord, DisplayInfo, Rect } from '../shared/types.js';
 import { clampRectToDisplay, fitScale } from '../shared/geometry.js';
-import { captureLayers, keptInFrame, nearlyUniform } from '../shared/windows.js';
-import { composeLayers, intersect, maskBitmap, unsharedOver, type Bitmap, type Layer, type PaintLayer } from '../shared/visible.js';
+import { captureLayers, nearlyUniform } from '../shared/windows.js';
+import { composeLayers, intersect, maskBitmap, type Bitmap, type Layer, type PaintLayer } from '../shared/visible.js';
 import { store } from './store.js';
 import { compositeGrid } from './imageWorker.js';
 import { hudWindowRef, listAllWindows, printWindow, windowStack } from './uia.js';
@@ -14,7 +14,6 @@ import { toDisplayLocal } from './anchors.js';
 import { nativeImage } from 'electron';
 import { listDisplays } from './displays.js';
 import { pushMessage } from './hud.js';
-import { isContentProtected } from './overlay.js';
 
 /**
  * Screenshots are written here rather than returned as base64. Claude Code
@@ -73,9 +72,7 @@ async function readScreen(): Promise<OnScreen[] | null> {
         // whatever really is there.
         const away = new Set(all.filter(w => w.cloaked || w.minimized).map(w => w.ref));
         const onScreen = stack.filter(w => !away.has(w.ref));
-        // Without content protection, our overlay is in a screen grab like
-        // any other window, so it is masked like one.
-        const own = { pid: process.pid, panel: hudWindowRef(), overlayInGrab: !isContentProtected() };
+        const own = { pid: process.pid, panel: hudWindowRef() };
         const layers = captureLayers(onScreen, own, w => isShared(w, stack));
         return layers.map((layer, i) => ({ ...layer, ref: onScreen[i]!.ref }));
     } catch {
@@ -83,35 +80,10 @@ async function readScreen(): Promise<OnScreen[] | null> {
     }
 }
 
-/**
- * Whether a shared window's screen pixels may be used, within `frame` (the
- * part of the screen they would be painted from): only when it was on screen
- * in both readings with nothing unshared in front of it there, shadows
- * included. Masking around a window on top would leave a hole its shape,
- * which follows it as it moves, so then the window is left blank whole: all
- * that says is that something is over it, never what, where or how big.
- */
-function screenCopyClear(ref: string, frame: Rect, before: OnScreen[] | null, after: OnScreen[] | null): boolean {
-    for (const reading of [before, after]) {
-        const at = reading ? reading.findIndex(w => w.ref === ref) : -1;
-        if (!reading || at < 0) return false;
-        const clip = intersect(reading[at]!.rect, frame);
-        if (!clip || unsharedOver(reading, at, clip)) return false;
-    }
-    return true;
-}
-
-/**
- * `image` with everything outside `keep` (its own pixels) painted one flat
- * colour, at full resolution: before any resize, whose filtering would bleed
- * hidden pixels into the edges of what is kept. A bitmap that is not the shape
- * expected is blanked whole.
- */
-function maskedBitmap(image: NativeImage, keep: Rect[]): Bitmap {
+/** A bitmap the size of `image`, all the mask colour: nothing of `image` is read. */
+function blankLike(image: NativeImage): Bitmap {
     const { width, height } = image.getSize();
-    const bitmap = image.toBitmap();
-    const ok = bitmap.length === width * height * 4;
-    return { data: maskBitmap(ok ? bitmap : new Uint8Array(width * height * 4), width, height, ok ? keep : []), width, height };
+    return { data: maskBitmap(new Uint8Array(width * height * 4), width, height, []), width, height };
 }
 
 function fromBitmap(b: Bitmap): NativeImage {
@@ -168,8 +140,8 @@ export interface WindowCapture {
     rect: Rect;
     /**
      * The window's own render is one flat colour: how PrintWindow sees GPU and
-     * DirectX surfaces. Never set for a screen copy, which can be flat only
-     * because of what covers the window.
+     * DirectX surfaces. Not set when it would not render at all (`fallback`),
+     * which is left blank on purpose.
      */
     blank: boolean;
 }
@@ -184,11 +156,8 @@ export interface WindowCapture {
  * that was asked for.
  *
  * Two ways that can still go wrong are reported rather than hidden: the window
- * refused to render, so the helper copied the screen (`record.fallback`), or
- * it rendered blank. A screen copy is masked like any screen capture: only
- * what a shared window shows on top survives, the strips of desktop around
- * its frame are blanked, and with anything unshared over it the whole copy is
- * (see screenCopyClear).
+ * refused to render (`record.fallback`), so the image is left blank, or it
+ * rendered blank. The screen is never copied in its place.
  */
 export async function captureWindow(opts: {
     windowRef: string;
@@ -198,21 +167,16 @@ export async function captureWindow(opts: {
 }): Promise<WindowCapture> {
     const revocations = revocationCount();
     const id = store.nextId('cap');
-    // Read before the render as well as after: a fallback is only known once
-    // it happened, and windows can move while it does.
-    const before = await readScreen();
     let { rect, fallback, image } = await printToPrivate(opts.windowRef);
     if (image.isEmpty()) throw new Error('the window rendered an empty image');
-    // Judged on the window's own render, before anything is masked: a screen
-    // copy blanked whole because something covers the window would otherwise
-    // read as a GPU surface, and say so.
+    // Judged on the window's own render: what covers it never enters into it.
     const own = image.getSize();
     const blank = !fallback && nearlyUniform(image.toBitmap(), own.width, own.height);
-    if (fallback) {
-        const after = await readScreen();
-        const keep = screenCopyClear(opts.windowRef, rect, before, after) ? keptInFrame(before, after, rect, own) : [];
-        image = fromBitmap(maskedBitmap(image, keep));
-    }
+    // A window that would not render itself is left blank rather than taken
+    // from the screen. A screen copy holds whatever is in front of it, behind
+    // it where it is see-through, and whatever passes over it meanwhile; even
+    // blanked whenever something unshared was near, it said that something was.
+    if (fallback) image = fromBitmap(blankLike(image));
 
     const size = image.getSize();
     const downscale = fitScale(size, opts.maxDimension, opts.maxPixels);
@@ -277,12 +241,10 @@ export interface CaptureOptions {
 }
 
 /**
- * How a shared window goes into a composed capture: its own render; from the
- * screen, when it refused (the helper's screen copy is never looked at) or
- * rendered one flat colour (a GPU surface); or not at all, blank, when the
- * render failed (it closed, or the render could not be written or read).
- * A failure is not a reason to read the screen: that would take its pixels
- * from wherever something else may be on top, for a fault of our own.
+ * How a shared window goes into a composed capture: its own render; or not
+ * at all, blank, when it refused or rendered one flat colour (a GPU surface)
+ * ('screen': it would have needed the screen, which is never read), or when
+ * the render failed (it closed, or the render could not be written or read).
  */
 type Rendered = { image: Bitmap; rect: Rect } | 'screen' | 'none';
 
@@ -303,22 +265,6 @@ async function renderLayer(ref: string): Promise<Rendered> {
     return { image: { data, width, height }, rect };
 }
 
-/** The display as the screen shows it, at full physical resolution, or null. */
-async function grabDisplay(display: DisplayInfo): Promise<NativeImage | null> {
-    // Electron scales the thumbnail to whatever we request, so anything
-    // smaller loses detail irreversibly. Screens only: a 'window' source
-    // would carry window titles as its name.
-    const sources = await desktopCapturer
-        .getSources({
-            types: ['screen'],
-            thumbnailSize: { width: display.physicalSize.width, height: display.physicalSize.height },
-            fetchWindowIcons: false
-        })
-        .catch(() => []);
-    const source = sources.find(s => s.display_id === display.id) ?? (sources.length === 1 ? sources[0] : undefined);
-    return source && !source.thumbnail.isEmpty() ? source.thumbnail : null;
-}
-
 /**
  * Part of a display, composed from the shared windows on it: a blank canvas
  * with each shared window painted on from its own render, back to front, so
@@ -327,17 +273,13 @@ async function grabDisplay(display: DisplayInfo): Promise<NativeImage | null> {
  * not even where it is, so nothing in the image traces it. The taskbar, the
  * desktop, our overlay and the chat panel are not shared and are not there.
  *
- * Only a shared window that will not render itself is taken from the screen:
- * a grab masked to what shared windows show on top both before and after it
- * (windows move while a capture is in flight), painted inside that window
- * only, and only when nothing unshared is in front of it (screenCopyClear);
- * else that window is blank whole. A window whose render failed is blank too.
+ * A shared window that will not render itself, or whose render failed, is
+ * left blank: the screen is never read.
  *
  * `area` and `frame` are virtual-screen physical: the canvas and the whole
  * display; nothing outside the display is painted, whatever a window spans.
- * `fromScreen` is the windows that did not render themselves, painted from
- * the screen or left blank: decided by how they render, never by what is on
- * top of them.
+ * `fromScreen` is the windows that did not render themselves and were left
+ * blank: decided by how they render, never by what is on top of them.
  */
 async function compose(
     display: DisplayInfo,
@@ -355,7 +297,7 @@ async function compose(
         if (at < 0) throw new Error(`window ${upTo} could not be resolved; it may have closed or been minimised`);
         stack = stack.slice(0, at + 1);
     }
-    const shown = stack.filter(w => w.shared && !w.ignore && intersect(w.rect, area)).reverse();
+    const shown = stack.filter(w => w.shared && intersect(w.rect, area)).reverse();
 
     // One at a time: the helper is single-threaded, and a burst of renders
     // would queue the anchor tracker behind them.
@@ -365,25 +307,12 @@ async function compose(
         if (clip) rendered.push({ ref: w.ref, clip, render: await renderLayer(w.ref) });
     }
 
-    // Grabbed whenever a window asks for the screen, covered or not, so not
-    // even the work done says whether something covers it.
-    let screenCopy: Bitmap | null = null;
-    let after: OnScreen[] | null = null;
-    if (rendered.some(r => r.render === 'screen')) {
-        const grab = await grabDisplay(display);
-        after = await readScreen();
-        if (grab) screenCopy = maskedBitmap(grab, keptInFrame(before, after, frame, grab.getSize()));
-    }
+    // A window that will not render itself stays blank: the screen is never
+    // read, so nothing of any other window can come with it (see captureWindow).
     const layers: PaintLayer[] = [];
     for (const { ref, clip, render } of rendered) {
-        if (typeof render === 'object') {
-            layers.push({ image: render.image, rect: render.rect, clip: [clip] });
-            continue;
-        }
-        fromScreen.add(ref);
-        if (render === 'screen' && screenCopy && screenCopyClear(ref, frame, before, after)) {
-            layers.push({ image: screenCopy, rect: frame, clip: [clip] });
-        }
+        if (typeof render === 'object') layers.push({ image: render.image, rect: render.rect, clip: [clip] });
+        else fromScreen.add(ref);
     }
     return { bitmap: { data: composeLayers(size, area, layers), ...size }, fromScreen };
 }

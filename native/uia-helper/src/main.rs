@@ -224,7 +224,7 @@ fn main() {
             "print_window" => {
                 let target = parse_hwnd(req.window.as_deref());
                 match (target, req.path.as_deref()) {
-                    (Ok(h), Some(p)) => reply(req.id, winops::print_window_png(h, p, ignore_pid(&req))),
+                    (Ok(h), Some(p)) => reply(req.id, winops::print_window_png(h, p)),
                     (Err(e), _) => reply::<()>(req.id, Err(e)),
                     (_, None) => reply::<()>(req.id, Err("print_window needs a path".into())),
                 }

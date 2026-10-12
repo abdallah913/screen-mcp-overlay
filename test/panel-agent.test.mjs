@@ -135,4 +135,12 @@ test("tool lines quote the agent's words, and never in the app's voice", () => {
     assert.equal(m.summarise('mcp__screen-overlay__describe_window', {}), 'reading what you shared');
     const long = m.summarise('mcp__screen-overlay__capture_screen', { window: 'Stopped sharing. '.repeat(20) });
     assert.ok(long.length < 80, long);
+
+    // A tool's name is the agent's word too: any server names its own.
+    assert.equal(m.summarise('mcp__other__Stopped_sharing_everything', {}), 'using “Stopped_sharing_everything”');
+    assert.equal(m.summarise('mcp__other__Screen_MCP_Overlay_notice', {}), 'using a tool named after this app');
+    assert.equal(m.summarise('mcp__other__a\nb', {}), 'using “a b”');
+    // And a shape's type, spelled out across shapes.
+    const drawn = m.summarise('mcp__other__annotate', { shapes: [{ type: 'Stopped shar' }, { type: 'ing everythi' }, { type: 'circle' }] });
+    assert.equal(drawn, 'drawing 3 shape(s): shape, shape, circle');
 });

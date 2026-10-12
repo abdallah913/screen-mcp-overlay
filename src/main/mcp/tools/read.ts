@@ -138,20 +138,16 @@ async function sharedCover(ref: string, panel: boolean): Promise<string> {
 
 /**
  * Said with every read of a window that did not render itself, in the same
- * words whether it refused, rendered blank or failed, and whatever covers it:
- * its pixels are the screen's, blank wherever a window that is not shared is
- * over it (then all of it is), so how much is blank must not be explained.
+ * words whether it refused, rendered blank or failed. It is left blank, never
+ * taken from the screen: a screen copy holds whatever is in front of it or
+ * shows through it, which may be a window the user did not share.
  */
-const SCREEN_COPY_NOTE = 'This window cannot render itself, so it comes from the screen and may be partly or wholly blank.';
+const SCREEN_COPY_NOTE =
+    'This window cannot render itself (a GPU or video surface), so it is left blank; nothing is read from ' +
+    'the screen in its place. describe_window may still read its controls.';
 
-/**
- * Say when "the window's pixels" are really the screen's: then whatever is on
- * top of the window is in them, labelled as the window. That is the confident
- * wrong read that rendering the window itself exists to prevent.
- */
-async function screenPixelsWarning(window: string): Promise<string> {
-    const cover = await sharedCover(window, true).catch(() => '');
-    return `\nNote: ${SCREEN_COPY_NOTE}${cover} focus_window brings it to the front.`;
+async function screenPixelsWarning(_window: string): Promise<string> {
+    return `\nNote: ${SCREEN_COPY_NOTE}`;
 }
 
 /** Said with every capture of a window as rendered: what is on top of it, in fixed words. */
@@ -163,7 +159,8 @@ function captureBody(record: CaptureRecord, source: string): string {
     // Worth a few tokens: a downscaled image is the usual reason small text is
     // unreadable, and the fix (a window or region capture) is cheap.
     const scaled = record.imageScale < 0.999 ? `, downscaled ${record.imageScale.toFixed(3)}x` : '';
-    // A window's own render holds only that window; a screen copy is masked.
+    // A window's own render holds only that window; a composed capture, or a
+    // window left blank, has had everything else left out.
     const masked = !record.windowRef || record.fallback ? MASKED_NOTE : '';
     return (
         `${record.id}: ${record.imageSize.width}x${record.imageSize.height} of ${source}${scaled}\n` +
@@ -440,7 +437,8 @@ export function registerRead(server: McpServer): void {
                     if (shot.blank) {
                         warning +=
                             '\nNote: the window rendered as one flat colour, which is how GPU and DirectX ' +
-                            'surfaces render; asRendered:true crops the screen instead.';
+                            'surfaces render; nothing is read from the screen in its place. describe_window may ' +
+                            'still read its controls.';
                     }
                     const note = w.note ? `\nNote: ${w.note}` : '';
                     const body = captureBody(shot.record, `window ${w.ref}`) + warning + note;

@@ -1,6 +1,6 @@
-import type { Point, Rect, Size } from './types.js';
+import type { Point, Rect } from './types.js';
 import { clean, rectText } from './uitree.js';
-import { both, intersect, toImage, visibleRegions, type Layer } from './visible.js';
+import type { Layer } from './visible.js';
 
 /**
  * Naming a window without a round trip.
@@ -228,42 +228,14 @@ export interface StackLike {
 }
 
 /**
- * The stack as layers for masking a capture. The chat panel is opaque,
- * carries the user's conversation, and can sit on top of a shared window, so
- * it hides what is under it and is never shown itself. Our other windows, the
- * overlay, are see-through and left out while content protection keeps them
- * out of the grab. When it does not (`overlayInGrab`), the overlay is in the
- * grab like any window, step strip and all, and the strip can name a window
- * the user is being asked about, so it is cut out like the panel.
+ * The stack as layers for composing a capture: which windows are painted.
+ * Our own windows (the overlay with its step strip, and the chat panel, which
+ * carries the user's conversation) never are, whatever `shared` says.
  */
 export function captureLayers<S extends StackLike>(
     stack: readonly S[],
-    own: { pid: number; panel?: string; overlayInGrab?: boolean },
+    own: { pid: number; panel?: string },
     shared: (w: S) => boolean
 ): Layer[] {
-    return stack.map(w => {
-        if (w.ref === own.panel) return { rect: w.rect, shared: false };
-        if (w.pid === own.pid) return own.overlayInGrab ? { rect: w.rect, shared: false } : { rect: w.rect, shared: false, ignore: true };
-        return { rect: w.rect, shared: shared(w) };
-    });
-}
-
-/**
- * What of a frame to keep, in the frame's own pixels: the parts that showed a
- * shared window on top both before and after the grab (windows move while a
- * capture is in flight), within `frame`, the virtual-screen physical rect the
- * image shows. Either reading missing means nothing is kept: a capture whose
- * windows could not be read is blanked whole rather than written unmasked.
- */
-export function keptInFrame(
-    before: readonly Layer[] | null,
-    after: readonly Layer[] | null,
-    frame: Rect,
-    image: Size
-): Rect[] {
-    if (!before || !after || frame.width <= 0 || frame.height <= 0) return [];
-    const kept = both(visibleRegions(before), visibleRegions(after))
-        .map(r => intersect(r, frame))
-        .filter((r): r is Rect => r !== null);
-    return toImage(kept, frame, image.width / frame.width, image.height / frame.height);
+    return stack.map(w => ({ rect: w.rect, shared: w.ref !== own.panel && w.pid !== own.pid && shared(w) }));
 }

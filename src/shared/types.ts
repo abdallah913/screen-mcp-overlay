@@ -65,8 +65,8 @@ export interface CaptureRecord {
      */
     windowRef?: string;
     /**
-     * The window refused to render itself and the pixels came from the screen
-     * instead, so anything covering it is in the image.
+     * The window refused to render itself, so the image is blank: nothing is
+     * taken from the screen in its place.
      */
     fallback?: boolean;
 }

@@ -11,18 +11,16 @@ import { store } from '../../store.js';
 import { beginStep } from '../../steps.js';
 import { postToHud } from '../../hud.js';
 import { listDisplays } from '../../displays.js';
-import { PANEL_COVER, sharedCovers } from '../../anchors.js';
+import { agentCoverage, PANEL_COVER } from '../../anchors.js';
 import {
     isShared,
     onSharingChanged,
     revocationCount,
     sharedOf,
-    sharedWindows,
     wasRevoked,
     windowsWithSharing
 } from '../../sharing.js';
 import {
-    coverage,
     describeWindow,
     elementAtPoint,
     knownControl,
@@ -120,9 +118,6 @@ const beforeOf = (all: WindowInfo[], shared: readonly WindowInfo[]): Before => (
     all,
     shared: new Set(shared.map(w => w.ref))
 });
-
-/** The shared windows now, for naming covers; none when the list cannot be read, so every cover is generic. */
-const sharedNow = (): Promise<WindowInfo[]> => sharedWindows().catch(() => []);
 
 interface StepResult {
     /** The step is done, so a plan may go on. */
@@ -293,16 +288,16 @@ function goneWhy(reason: Annotation['hiddenReason'], windowTitle: string): strin
  * untitled top-level popup of the app itself, and counting it would warn on
  * every menu step. A tooltip is untitled too, and passes in a moment.
  *
- * Said only when every cover is shared (or the panel), as `shared` allows
- * (sharedCovers): with a window the user did not share among them, nothing
- * is said, exactly as when nothing is on top. Whether a warning appeared
- * at all, in whatever words, followed that window as the user moved it, so
- * the agent could map where it was one control at a time. The user still
- * sees the overlay's own note about it.
+ * `c` is measured over shared windows and the chat panel alone
+ * (sharedCoverage): a window the user did not share is never a cover, and
+ * never hides one, wherever it is. Whether a warning appeared at all
+ * followed such a window as the user moved it, so the agent could map where
+ * it was one control at a time. The user still sees the overlay's own note
+ * about it.
  */
-function coveredNote(c: Coverage, what: string, windowTitle: string, shared: readonly WindowInfo[]): string | null {
-    const by = sharedCovers(c.by, shared);
-    if (!by || by.length === 0 || !(c.centre_covered || c.fraction >= 0.5)) return null;
+function coveredNote(c: Coverage, what: string, windowTitle: string): string | null {
+    const by = c.by;
+    if (by.length === 0 || !(c.centre_covered || c.fraction >= 0.5)) return null;
     // Raising the app would not help when our own panel is what is on top,
     // and the agent cannot move it: only the user can.
     const fix = by.every(t => t === PANEL_COVER)
@@ -312,19 +307,15 @@ function coveredNote(c: Coverage, what: string, windowTitle: string, shared: rea
 }
 
 /**
- * Coverage of a control, measured against the top-level window it actually
- * lives in: a menu item's own open menu, not the app window under it, or
- * every menu step would warn that the item is behind its menu.
+ * Coverage of a control as the agent may hear it (agentCoverage), measured
+ * against the top-level window it actually lives in: a menu item's own open
+ * menu, not the app window under it, or every menu step would warn that the
+ * item is behind its menu. Null when it could not be read: a failed read
+ * must not cost the step.
  */
 async function coverageOf(windowRef: string, rect: Rect, controlRef?: string): Promise<Coverage | null> {
     const known = controlRef ? knownControl(controlRef) : undefined;
-    const top = known?.top || windowRef;
-    try {
-        return await coverage(top, rect, known?.selector.role);
-    } catch {
-        // Best effort: a failed read must not cost the step.
-        return null;
-    }
+    return agentCoverage(known?.top || windowRef, rect);
 }
 
 /**
@@ -350,18 +341,14 @@ async function targetStatus(circleId: string | undefined, windowRef: string, win
         return '';
     }
     if (!rect) return 'The circled control is not on screen now.';
+    // Over shared windows alone: one the user did not share, on top or not,
+    // changes nothing here (see coveredNote).
     const c = await coverageOf(windowRef, rect, circle.anchor.ref);
-    // A window the user did not share anywhere on top, over the centre or
-    // grazing it, reads as nothing on top (see coveredNote). The shared list
-    // is read whatever covers it, so the helper's round trips do not change
-    // when a private window is on top either.
-    const shared = c ? await sharedNow() : [];
-    const by = c ? sharedCovers(c.by, shared) : null;
-    if (c && by && by.length > 0) {
-        const covered = coveredNote(c, 'the circled control', windowTitle, shared);
+    if (c && c.by.length > 0) {
+        const covered = coveredNote(c, 'the circled control', windowTitle);
         if (covered) return covered;
         if (c.fraction > 0.2) {
-            const names = by.slice(0, 2).map(quote).join(', ');
+            const names = c.by.slice(0, 2).map(quote).join(', ');
             return `The circled control is ${Math.round(c.fraction * 100)}% covered by ${names}.`;
         }
     }
@@ -1076,7 +1063,7 @@ async function runStep(spec: StepSpec, opts: StepOptions): Promise<StepResult> {
             );
         }
         const c = await coverageOf(target.top ?? windowRef, target.rect, target.ref);
-        const covered = c && coveredNote(c, target.what, windowTitle, shared);
+        const covered = c && coveredNote(c, target.what, windowTitle);
         if (covered) {
             warnings.push(covered);
             warnedCovered = true;
@@ -1340,15 +1327,14 @@ async function clickVerdict(
 
     // On target, but the target may have been behind another shared window
     // (or the panel), so what the user saw under the circle was that window.
-    // A window the user did not share among the covers and it is an ordinary
-    // click on the target: saying otherwise only when that window sat over
-    // the target told the agent where it was (see coveredNote).
+    // Measured over shared windows alone: a window the user did not share
+    // over the target leaves it an ordinary click on the target, since saying
+    // otherwise only when that window sat there told the agent where it was
+    // (see coveredNote).
     if (circle.anchor) {
         const [live] = await resolveRefs([circle.anchor.ref]).catch(() => []);
         const c = live?.rect ? await coverageOf(windowRef, live.rect, circle.anchor.ref) : null;
-        // Read whatever covers it, as in targetStatus.
-        const shared = c ? await sharedNow() : [];
-        const by = c?.centre_covered && c.by.length > 0 ? sharedCovers(c.by, shared)?.[0] : undefined;
+        const by = c?.centre_covered ? c.by[0] : undefined;
         if (by !== undefined) {
             return {
                 ok: false,

@@ -65,8 +65,13 @@ const UNSEEN = /[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
 const DIRECTION = /\p{Bidi_Control}/gu;
 /** Line breaks and other control characters. */
 const BREAKS = /[\p{Cc}\p{Zl}\p{Zp}]/gu;
-/** Anything that reads as a quotation mark; two single ones side by side pass for a double. */
-const QUOTE_MARKS = /["'`´“”„‟‘’‚‛«»‹›〝〞〟＂＇❛❜❝❞⹂″‶′‵ʹʺʻʼʽ˝ˮ״׳]+/g;
+/**
+ * Anything that reads as a quotation mark; two single ones side by side pass
+ * for a double. Unicode's own list (CJK corner brackets and fullwidth marks
+ * among them) and every opening or closing punctuation mark, plus the primes,
+ * modifier letters and ornaments that look like one.
+ */
+const QUOTE_MARKS = /[\p{Quotation_Mark}\p{Pi}\p{Pf}`´″‶′‵ʹʺʻʼʽ˝ˮ״׳❛❜❝❞❟❠🙶🙷🙸]+/gu;
 
 /**
  * Letters that pass for Latin ones on screen (Cyrillic, Greek, Armenian,

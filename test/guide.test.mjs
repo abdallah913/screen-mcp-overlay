@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { call, connect, fakeDesktop, fakeHelper, harness, rect } from './support/fake-helper.mjs';
+import { call, connect, fakeDesktop, fakeHelper, harness, onTop, rect } from './support/fake-helper.mjs';
 
 /*
  * The guidance tools (src/main/mcp/tools/guide.ts, src/main/waits.ts) end to
@@ -168,36 +168,33 @@ test('a met step swaps its circle for a brief check mark', async () => {
 });
 
 test('a covered target is drawn with a warning; an untitled popup on top is not a cover', async () => {
-    fakeHelper({
-        find_elements: finder(() => [saved]),
-        covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Calculator'] })
-    });
-    let r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
+    const step = { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 };
+    // Calculator over the left 68 of Save's 80 pixels, its centre included.
+    const calcOverSave = { ref: '200', rect: rect(150, 150, 68, 24) };
+    fakeHelper({ find_elements: finder(() => [saved]) }, onTop(fakeDesktop(), calcOverSave));
+    let r = await call('highlight_and_wait', step);
     assert.match(r.text, /WARNING: "Save" \[button\] el_1 is 85% behind "Calculator"; focus_window \{window:"Untitled - Notepad"\}/);
 
     // A cover the user did not share is not named, nor measured, nor
     // mentioned at all: the step reads as one with nothing on top.
-    fakeHelper({
-        find_elements: finder(() => [saved]),
-        covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] })
-    });
-    r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
+    const chrome = { ref: '600', title: 'Google Chrome', private: true, rect: rect(140, 140, 200, 100) };
+    fakeHelper({ find_elements: finder(() => [saved]) }, onTop(fakeDesktop(), chrome));
+    r = await call('highlight_and_wait', step);
     assert.equal(/WARNING|behind|covered by|Chrome|85%|mostly|partly|almost/.test(r.text), false, r.text);
     assert.match(r.text, /The circled control is visible and uncovered/);
 
-    // Nor alongside a shared cover: the fraction would include its overlap.
-    fakeHelper({
-        find_elements: finder(() => [saved]),
-        covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Calculator', 'Google Chrome'] })
-    });
-    r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
-    assert.equal(/WARNING|behind|covered by|Calculator|85%/.test(r.text), false, r.text);
+    // Nor does it change what is said of a shared cover, on top of it or
+    // under it: the same words as with no private window at all.
+    for (const desktop of [onTop(onTop(fakeDesktop(), calcOverSave), chrome), onTop(onTop(fakeDesktop(), chrome), calcOverSave)]) {
+        fakeHelper({ find_elements: finder(() => [saved]) }, desktop);
+        r = await call('highlight_and_wait', step);
+        assert.match(r.text, /WARNING: "Save" \[button\] el_1 is 85% behind "Calculator"; focus_window/);
+        assert.equal(/Chrome|another window|100%/.test(r.text), false, r.text);
+    }
 
-    fakeHelper({
-        find_elements: finder(() => [saved]),
-        covered: () => ({ fraction: 0.9, centre_covered: true, by: [''] })
-    });
-    r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
+    // An untitled popup of the app (a menu) on top is no cover.
+    fakeHelper({ find_elements: finder(() => [saved]) }, onTop(fakeDesktop(), { ref: '700', title: '', pid: 11, owner: '100', rect: rect(140, 140, 200, 100) }));
+    r = await call('highlight_and_wait', step);
     assert.equal(/WARNING/.test(r.text), false);
 });
 
@@ -521,7 +518,7 @@ test('a click off the circle says where it was and that the app did not get it',
 });
 
 test('a click where the target is, but covered by a shared window, is not a hit', async () => {
-    fakeHelper({ covered: p => (p.rect ? { fraction: 0.6, centre_covered: true, by: ['Calculator'] } : { fraction: 0, centre_covered: false, by: [] }) });
+    fakeHelper({}, onTop(fakeDesktop(), { ref: '200', rect: rect(180, 140, 100, 60) }));
     const { result } = await pending('highlight_and_wait', pointed);
     addClick(click(160, 160));
     const { text } = await result;
@@ -531,7 +528,7 @@ test('a click where the target is, but covered by a shared window, is not a hit'
 test('a click where the target is, under a window that is not shared, is an ordinary hit', async () => {
     // Google Chrome is not shared: saying the target was covered only while
     // it sat there would tell the agent where it is.
-    fakeHelper({ covered: p => (p.rect ? { fraction: 0.6, centre_covered: true, by: ['Google Chrome'] } : { fraction: 0, centre_covered: false, by: [] }) });
+    fakeHelper({}, onTop(fakeDesktop(), { ref: '600', title: 'Google Chrome', private: true, rect: rect(180, 140, 100, 60) }));
     const { result } = await pending('highlight_and_wait', pointed);
     addClick(click(160, 160));
     const { text } = await result;
@@ -1234,23 +1231,33 @@ test('a blocked step reports progress to a client that asked for it', async () =
 test('a menu item is measured against its own open menu, not the app window under it', async () => {
     const asked = [];
     const inMenu = { ...save, window: '500' };
-    fakeHelper({
-        find_elements: p => (p.name === 'Save' ? [inMenu] : []),
-        covered: p => {
-            asked.push(p.window);
-            return { fraction: 0, centre_covered: false, by: [] };
-        }
+    // The menu (untitled, Notepad's) in front, over Calculator, over Notepad:
+    // measured against Notepad, Save would be behind Calculator.
+    const desktop = onTop(onTop(fakeDesktop(), { ref: '200', rect: rect(140, 140, 200, 100) }), {
+        ref: '500',
+        title: '',
+        pid: 11,
+        owner: '100',
+        rect: rect(140, 140, 120, 60)
     });
-    await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'appears', name: 'Saved' }, timeoutMs: 1000 });
-    assert.ok(asked.length > 0, 'coverage was checked');
+    fakeHelper(
+        {
+            find_elements: p => (p.name === 'Save' ? [inMenu] : []),
+            covered: p => {
+                asked.push(p.window);
+                return { fraction: 0, centre_covered: false, by: [] };
+            }
+        },
+        desktop
+    );
+    const { text } = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'appears', name: 'Saved' }, timeoutMs: 1000 });
+    assert.equal(/WARNING|behind/.test(text), false, text);
     assert.ok(asked.every(w => w === '500'), `measured against ${asked.join(', ')}`);
 });
 
 test('when the chat panel is what covers the target, the advice is to move the panel', async () => {
-    fakeHelper({
-        find_elements: finder(() => [saved]),
-        covered: () => ({ fraction: 0.9, centre_covered: true, by: ["the overlay's chat panel"] })
-    });
+    const desktop = onTop(fakeDesktop(), { ref: '400', rect: rect(140, 140, 200, 100) });
+    fakeHelper({ find_elements: finder(() => [saved]) }, { ...desktop, hud: '400' });
     const { text } = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
     assert.match(text, /behind "the overlay's chat panel"; ask the user to drag the chat panel aside or hide it with Ctrl\+Shift\+O\./);
     assert.equal(/focus_window \{window/.test(text), false);

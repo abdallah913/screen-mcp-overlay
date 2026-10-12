@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { call, fakeDesktop, fakeHelper, harness, rect } from './support/fake-helper.mjs';
+import { call, fakeDesktop, fakeHelper, harness, onTop, rect } from './support/fake-helper.mjs';
 
 /*
  * Reading, drawing and acting tools against the fake helper: what an agent is
@@ -77,7 +77,7 @@ test('a covered target is drawn, marked and warned about, only when the cover is
     assert.doesNotMatch(text, /WARNING|behind|another window|Chrome/);
     assert.equal(store.list()[0].covered, 'another window');
 
-    fakeHelper({ covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Calculator'] }) });
+    fakeHelper({}, onTop(fakeDesktop(), { ref: '200', rect: rect(150, 150, 68, 24) }));
     const shared = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
     assert.match(shared.text, /is behind "Calculator"/);
 });

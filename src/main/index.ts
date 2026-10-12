@@ -1,4 +1,4 @@
-import { app, clipboard, globalShortcut, ipcMain, Menu, nativeImage, Tray, type MenuItemConstructorOptions } from 'electron';
+import { app, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, Tray, type MenuItemConstructorOptions } from 'electron';
 import { readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { cleanupCaptureDir, initCaptureDir } from './capture.js';
@@ -50,7 +50,8 @@ import {
     stopSharingWindow,
     syncHelper,
     toggleFrontWindow,
-    windowsWithSharing
+    windowsWithSharing,
+    type ShareConfirm
 } from './sharing.js';
 
 const DEFAULT_PORT = Number(process.env.SCREEN_OVERLAY_PORT || 7777);
@@ -217,11 +218,31 @@ function registerShareKey(): void {
 
 let toggling = false;
 
+/**
+ * The share key's question (see ShareConfirm), as a native dialog. "Don't
+ * share" is the default, so a key held down or an Enter pressed by habit
+ * shares nothing.
+ */
+const confirmShare: ShareConfirm = async ({ message, detail, options }) => {
+    const { response } = await dialog.showMessageBox({
+        type: 'question',
+        title: 'Screen MCP Overlay',
+        message,
+        detail,
+        buttons: options,
+        defaultId: options.length - 1,
+        cancelId: options.length - 1,
+        noLink: true
+    });
+    return options[response] ?? null;
+};
+
 function onShareKey(): void {
-    // A held key repeats; one press is one toggle.
+    // A held key repeats; one press is one toggle, and while its question is
+    // open the key does nothing else.
     if (toggling) return;
     toggling = true;
-    toggleFrontWindow(shareKeyLabel)
+    toggleFrontWindow(shareKeyLabel, confirmShare)
         .then(
             text => pushMessage('system', text),
             err => pushMessage('error', `Could not share the window in front: ${(err as Error).message}`)

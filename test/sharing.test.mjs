@@ -209,11 +209,24 @@ async function heard(fn) {
     return lines;
 }
 
-test('the share key shares the window in front, and a second press stops it', async () => {
+/** The share key's question, answered with `pick`; what it asked is kept in `asked`. */
+const asked = [];
+const answer = pick => async question => {
+    asked.push(question);
+    return typeof pick === 'function' ? pick(question) : pick;
+};
+const neverAsked = async () => assert.fail('the share key asked something');
+
+test('the share key asks first, shares the window in front, and a second press stops it', async () => {
     ui.resetSharing();
     const front = win('100', 'Budget.xlsx - Excel', 11, { exe: 'excel.exe', foreground: true });
     desk([front, PRIVATE]);
-    const said = await ui.toggleFrontWindow('Ctrl+Shift+F8');
+    asked.length = 0;
+    const said = await ui.toggleFrontWindow('Ctrl+Shift+F8', answer('This window'));
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].message, 'Share “Budget.xlsx - Excel” with the AI?');
+    assert.match(asked[0].detail, /^It is a window of Excel\. The AI will see this window and the dialogs it opens, nothing else/);
+    assert.deepEqual(asked[0].options, ['This window', 'All Excel windows', "Don't share"]);
     assert.match(said, /^Now sharing “Budget\.xlsx - Excel” with the AI/);
     assert.match(said, /Press Ctrl\+Shift\+F8 in it again to stop/);
     assert.deepEqual(ui.sharingSummary().windows.map(g => g.ref), ['100']);
@@ -221,11 +234,43 @@ test('the share key shares the window in front, and a second press stops it', as
 
     let revoked = 0;
     const stop = ui.onSharingRevoked(() => (revoked += 1));
-    const again = await ui.toggleFrontWindow('Ctrl+Shift+F8');
+    // Stopping needs no question.
+    const again = await ui.toggleFrontWindow('Ctrl+Shift+F8', neverAsked);
     stop();
     assert.match(again, /^Stopped sharing “Budget\.xlsx - Excel” with the AI\. What an agent already saw stays in its conversation/);
     assert.deepEqual(ui.sharingSummary().windows, []);
     assert.equal(revoked, 1, 'stopping a share is what deletes captures');
+});
+
+test('the share key shares nothing unless the user says so', async () => {
+    ui.resetSharing();
+    // A page can call itself anything; the question names the app too.
+    const tab = win('500', 'Untitled - Notepad', 40, { exe: 'chrome.exe', foreground: true });
+    desk([tab, PRIVATE]);
+    for (const pick of ["Don't share", null, 'All Chrome windows', 'something else']) {
+        asked.length = 0;
+        const said = await ui.toggleFrontWindow('Ctrl+Shift+F8', answer(pick));
+        assert.equal(said, 'Did not share “Untitled - Notepad”.', String(pick));
+        assert.deepEqual(ui.sharingSummary(), { windows: [], apps: [] }, String(pick));
+    }
+    assert.match(asked[0].detail, /^It is a window of Chrome\./);
+    // A browser holds every site in one app: it is offered one window only.
+    assert.deepEqual(asked[0].options, ['This window', "Don't share"]);
+    // A question that fails shares nothing either.
+    const failed = await ui.toggleFrontWindow('Ctrl+Shift+F8', async () => {
+        throw new Error('no dialog');
+    });
+    assert.equal(failed, 'Did not share “Untitled - Notepad”.');
+    assert.deepEqual(ui.sharingSummary(), { windows: [], apps: [] });
+});
+
+test('the share key can share a whole app, when the user picks that', async () => {
+    ui.resetSharing();
+    desk([win('100', 'Budget.xlsx - Excel', 11, { exe: 'excel.exe', foreground: true }), PRIVATE]);
+    const said = await ui.toggleFrontWindow('Ctrl+Shift+F8', answer('All Excel windows'));
+    assert.match(said, /^Now sharing every Excel window with the AI/);
+    assert.deepEqual(ui.sharingSummary().apps, ['excel.exe']);
+    ui.resetSharing();
 });
 
 test('the share key says when the window is already shared through its app or its owner', async () => {
@@ -234,12 +279,12 @@ test('the share key says when the window is already shared through its app or it
     const dialog = win('101', 'Save As', 11, { exe: 'notepad.exe', owner: '100', root_owner: '100', foreground: true });
     desk([main, dialog]);
     ui.shareWindow(main);
-    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8'), /^“Save As” is already shared, because the window it belongs to is\./);
+    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8', neverAsked), /^“Save As” is already shared, because the window it belongs to is\./);
     assert.deepEqual(ui.sharingSummary().windows.map(g => g.ref), ['100'], 'the key did not stop or add anything');
 
     ui.resetSharing();
     ui.shareApp('notepad.exe');
-    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8'), /because all Notepad windows are\. Stop that from the tray menu/);
+    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8', neverAsked), /because all Notepad windows are\. Stop that from the tray menu/);
     assert.deepEqual(ui.sharingSummary().windows, []);
     ui.resetSharing();
 });
@@ -247,9 +292,9 @@ test('the share key says when the window is already shared through its app or it
 test('the share key never shares a window the user is not in, or our own panel', async () => {
     ui.resetSharing();
     desk([PRIVATE, win('300', 'Minimised', 13, { minimized: true, foreground: true })]);
-    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8'), /^Click into the window you want to share first, then press Ctrl\+Shift\+F8/);
+    assert.match(await ui.toggleFrontWindow('Ctrl+Shift+F8', neverAsked), /^Click into the window you want to share first, then press Ctrl\+Shift\+F8/);
     desk([win('400', 'Overlay panel', process.pid, { foreground: true }), PRIVATE]);
-    assert.match(await ui.toggleFrontWindow(''), /then press the share key/);
+    assert.match(await ui.toggleFrontWindow('', neverAsked), /then press the share key/);
     assert.deepEqual(ui.sharingSummary(), { windows: [], apps: [] });
 });
 
@@ -309,8 +354,8 @@ test("a window's title in the app's own lines is one quoted line with nothing hi
     const told = await heard(async () => {
         ui.shareWindow(doc, { byUser: true });
         ui.stopSharingWindow('100', { byUser: true });
-        said.push(await ui.toggleFrontWindow('Ctrl+Shift+F8'));
-        said.push(await ui.toggleFrontWindow('Ctrl+Shift+F8'));
+        said.push(await ui.toggleFrontWindow('Ctrl+Shift+F8', answer('This window')));
+        said.push(await ui.toggleFrontWindow('Ctrl+Shift+F8', neverAsked));
     });
     assert.equal(told.length + said.length, 4);
     for (const line of [...told, ...said]) {

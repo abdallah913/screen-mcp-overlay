@@ -36,6 +36,20 @@ export function fakeDesktop() {
 }
 
 /**
+ * `win` put in front of every other window of `desktop`, as the z-order (front
+ * first, the order of `windows`) has it: an existing window moved there (by
+ * ref) with whatever `win` changes, or a new one. What the agent hears about
+ * covers is measured from where shared windows sit, so a test puts one over
+ * its target this way. Returns the desktop.
+ */
+export function onTop(desktop, win) {
+    const at = desktop.windows.findIndex(w => w.ref === win.ref);
+    const was = at >= 0 ? desktop.windows.splice(at, 1)[0] : { class: 'X', pid: 90 + desktop.windows.length, foreground: false, ...flags };
+    desktop.windows.unshift({ ...was, ...win });
+    return desktop;
+}
+
+/**
  * Install the fake helper. Returns `calls` (every op and its params, in order)
  * and the desktop it answers from, which a test may mutate between calls.
  *
@@ -46,6 +60,8 @@ export function fakeHelper(overrides = {}, desktop = fakeDesktop()) {
     const calls = [];
     const { windows, controls, tree } = desktop;
     harness.resetSharing();
+    // The chat panel, when a test has one: the window with this ref.
+    harness.setHudWindowRef(desktop.hud);
     for (const w of windows) if (!w.private && w.pid !== process.pid) harness.shareWindow(w);
     const contains = (r, x, y) => x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height;
     const handlers = {

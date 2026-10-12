@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { call, fakeDesktop, fakeHelper, harness, rect } from './support/fake-helper.mjs';
+import { call, fakeDesktop, fakeHelper, harness, onTop, rect } from './support/fake-helper.mjs';
 
 /*
  * A window the user stops sharing reads as not open from that moment on
@@ -380,9 +380,15 @@ const savedText = { ref: 'el_5', name: 'Saved', role: 'text', rect: rect(0, 0, 1
 const finds = p => (p.name === 'Save' ? [save] : p.name === 'Saved' ? [savedText] : []);
 
 /** The warning a step starts with, and what a STUCK says of the target, with `cover` on top of it. */
-async function coverWords(cover) {
+/** What a step, and then a STUCK on it, say with `over` (front first) on top of everything. */
+async function coverWords(...over) {
     const desktop = fakeDesktop();
     desktop.windows.push(video);
+    for (const w of [...over].reverse()) onTop(desktop, w);
+    // The helper's look at the screen sees the front window over Save's
+    // centre; only the overlay's note to the user may use it.
+    const front = over.find(w => w.rect.x <= 190 && w.rect.x + w.rect.width > 190);
+    const cover = front ? { fraction: 1, centre_covered: true, by: [front.ref === video.ref ? video.title : 'Calculator'] } : { fraction: 0, centre_covered: false, by: [] };
     fakeHelper({ find_elements: finds, covered: () => cover }, desktop);
     const started = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
     const stuck = call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'appears', name: 'Nothing' }, timeoutMs: 60000 });
@@ -396,20 +402,29 @@ test('a private window over a target reads as nothing on top, wherever it is', a
     // covers the centre, most of it or a corner, the words are the ones with
     // nothing on top. A warning that came and went with it, in whatever
     // fixed words, mapped where it was.
+    // Save is at 150,150, 80 by 24, its centre at 190,162.
+    const at = r => ({ ref: video.ref, rect: r });
     const answers = [];
-    for (const [fraction, centre] of [[0.55, true], [0.75, true], [0.95, true], [1, true], [0.3, true], [0.6, false], [0.1, false], [0.45, false]]) {
-        answers.push(await coverWords({ fraction, centre_covered: centre, by: [video.title] }));
+    for (const r of [rect(140, 140, 200, 100), rect(150, 150, 44, 24), rect(150, 150, 60, 24), rect(186, 150, 8, 24), rect(150, 150, 24, 24), rect(200, 150, 48, 24), rect(220, 165, 40, 40)]) {
+        answers.push(await coverWords(at(r)));
     }
-    const nothing = await coverWords({ fraction: 0, centre_covered: false, by: [] });
+    const nothing = await coverWords();
     for (const t of answers) assert.equal(t, nothing);
     assert.match(nothing, /The circled control is visible and uncovered/);
     assert.equal(/WARNING|behind|covered by|another window|YouTube/.test(nothing), false, nothing);
-    // Alongside a shared cover too: its share of the target would include the private one's.
-    assert.equal(await coverWords({ fraction: 0.9, centre_covered: true, by: ['Calculator', video.title] }), nothing);
+    // Alongside a shared cover too, in front of it or behind it: what is said
+    // of the shared one does not move with the private one.
+    const calc = { ref: '200', rect: rect(150, 150, 68, 24) };
+    const calcAlone = await coverWords(calc);
+    assert.match(calcAlone, /85% behind "Calculator"/);
+    for (const r of [rect(140, 140, 200, 100), rect(200, 150, 48, 24), rect(150, 150, 24, 24)]) {
+        assert.equal(await coverWords(at(r), calc), calcAlone);
+        assert.equal(await coverWords(calc, at(r)), calcAlone);
+    }
 });
 
 test('a shared cover is still named and measured', async () => {
-    fakeHelper({ find_elements: finds, covered: () => ({ fraction: 0.3, centre_covered: false, by: ['Calculator'] }) });
+    fakeHelper({ find_elements: finds }, onTop(fakeDesktop(), { ref: '200', rect: rect(150, 150, 24, 24) }));
     const stuck = call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'appears', name: 'Nothing' }, timeoutMs: 60000 });
     await eventually(() => currentStep() !== null);
     answerStep({ kind: 'stuck', text: 'cannot see it' });

@@ -387,7 +387,9 @@ function stepChanged(): void {
     const previous = shownStep;
     shownStep = step;
 
-    if (spokenFor && spokenFor !== step?.id) stopSpeaking();
+    // The app's own question is never spoken over, by a step or by an
+    // agent's show_message: whatever was being said stops as it shows.
+    if ((spokenFor && spokenFor !== step?.id) || step?.fromApp) stopSpeaking();
     // The overlay stops capturing clicks; drawings go back above the panel.
     if (previous?.mode === 'click' && step?.mode !== 'click') raiseOverlays();
     if (!step) return;
@@ -405,11 +407,18 @@ function stepChanged(): void {
     sayStep(step);
 }
 
-/** Read a step's instruction aloud, when the user asked for that. */
+/**
+ * Read a step's instruction aloud, when the user asked for that: an agent's
+ * steps only. The app's own questions (sharing a window) are shown, with its
+ * badge, and never spoken. Heard, there is no badge, and an agent's words
+ * that do not use the app's name are spoken unlabelled, so a spoken "click
+ * into the window you need help with" could pass for the app asking; with
+ * the app never speaking, everything said aloud is an agent's.
+ */
 function sayStep(step: StepView): void {
     const prefs = settings();
-    if (!prefs.readStepsAloud) return;
-    // Already labelled if it is an agent's (beginStep), and the app's own if not.
+    if (!prefs.readStepsAloud || step.fromApp) return;
+    // Already labelled if it names the app (beginStep).
     const line = parseProgress(step.prompt)?.rest ?? step.prompt;
     if (say(line, prefs.speechRate)) spokenFor = step.id;
 }

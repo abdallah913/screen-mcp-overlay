@@ -1,19 +1,23 @@
 import { screen } from 'electron';
 import type { AnchorSelector, AnchorSpec, Annotation, Point, Rect } from '../shared/types.js';
 import { clean, rankMatches, recoveredMatch } from '../shared/uitree.js';
+import { coveredFraction, intersect } from '../shared/visible.js';
 import { coverVerdict } from '../shared/windows.js';
 import { onSharingChanged, sharedOf, sharedWindows, wasRevoked } from './sharing.js';
 import { store } from './store.js';
 import {
     coverage,
     findElements,
+    hudWindowRef,
     knownControl,
     listAllWindows,
     resolveRefs,
     selectorForRef,
+    windowStack,
     type Coverage,
     type ElementInfo,
     type ResolvedRef,
+    type StackWindow,
     type WindowInfo
 } from './uia.js';
 
@@ -180,7 +184,7 @@ export const ANOTHER_WINDOW = 'another window';
  * rather than a cover. Coverage is measured over every window, since anything
  * can sit on top of a shared one; only its wording is limited to what the
  * user shared. This is for the overlay, which shows the user what hides a
- * target; what the agent hears goes through sharedCovers.
+ * target; what the agent hears is sharedCoverage.
  */
 export function safeCoverNames(by: readonly string[], shared: readonly Pick<WindowInfo, 'title'>[]): string[] {
     const titles = new Set(shared.map(w => clean(w.title)).filter(Boolean));
@@ -196,24 +200,62 @@ export function safeCoverNames(by: readonly string[], shared: readonly Pick<Wind
 }
 
 /**
- * The covers the agent may hear of, or null when any of them may be a window
- * the user did not share: "another window", or an untitled cover, which may
- * be anyone's. Then the agent hears nothing about covers at all, as if
- * nothing were on top. Even the fixed phrase "behind another window" came
- * and went as the user moved a private window over the target and off it,
- * so asking about one control after another mapped where that window was;
- * a fraction or a centre test of the rest would still include its overlap.
- * What is left is measured over shared windows and the chat panel alone.
+ * How covered `window` (or `rect` in it) is, as the agent may hear it:
+ * measured over shared windows and the chat panel alone, from where they sit
+ * in the z-order, as if nothing else were open. A window the user did not
+ * share changes neither the figures nor the names, wherever it is: the
+ * helper's own measurement looks at the screen, where a private window over
+ * a shared cover hides it, so a warning that came and went with it, or a
+ * figure that moved, traced where it was. Untitled windows (a menu, a
+ * tooltip) are no cover, as for the helper. Null when the target is not on
+ * screen.
  */
-export function sharedCovers(by: readonly string[], shared: readonly Pick<WindowInfo, 'title'>[]): string[] | null {
-    const names = safeCoverNames(by, shared);
-    return names.some(n => n === '' || n === ANOTHER_WINDOW) ? null : names;
+export function sharedCoverage(
+    window: string,
+    rect: Rect | undefined,
+    stack: readonly StackWindow[],
+    shared: readonly Pick<WindowInfo, 'ref' | 'title'>[],
+    panel?: string
+): Coverage | null {
+    const at = stack.findIndex(w => w.ref === window);
+    if (at < 0) return null;
+    const area = rect ?? stack[at]!.rect;
+    if (area.width <= 0 || area.height <= 0) return null;
+    const covers: { name: string; rect: Rect; over: number }[] = [];
+    for (const w of stack.slice(0, at)) {
+        const s = shared.find(x => x.ref === w.ref);
+        const name = s ? clean(s.title) : panel !== undefined && w.ref === panel ? PANEL_COVER : '';
+        const over = name ? intersect(w.rect, area) : null;
+        if (over) covers.push({ name, rect: w.rect, over: over.width * over.height });
+    }
+    const cx = area.x + area.width / 2;
+    const cy = area.y + area.height / 2;
+    const by: string[] = [];
+    for (const c of [...covers].sort((a, b) => b.over - a.over)) if (!by.includes(c.name)) by.push(c.name);
+    return {
+        fraction: coveredFraction(area, covers.map(c => c.rect)),
+        centre_covered: covers.some(c => cx >= c.rect.x && cx < c.rect.x + c.rect.width && cy >= c.rect.y && cy < c.rect.y + c.rect.height),
+        by
+    };
 }
 
-/** coverVerdict for the agent: null unless every cover is shared (see sharedCovers). */
-export function agentCoverVerdict(c: Coverage, shared: readonly Pick<WindowInfo, 'title'>[]): string | null {
-    const by = sharedCovers(c.by, shared);
-    return by && by.length > 0 ? coverVerdict({ ...c, by }) : null;
+/**
+ * sharedCoverage read now. The window stack and the shared list are read
+ * every time, whatever is on top, so the round trips say nothing either.
+ * Null when it could not be read: a failed read costs the caller nothing.
+ */
+export async function agentCoverage(window: string, rect?: Rect): Promise<Coverage | null> {
+    try {
+        const [stack, shared] = await Promise.all([windowStack(), sharedWindows()]);
+        return sharedCoverage(window, rect, stack, shared, hudWindowRef());
+    } catch {
+        return null;
+    }
+}
+
+/** coverVerdict for the agent, from sharedCoverage. */
+export function agentCoverVerdict(c: Coverage | null): string | null {
+    return c && c.by.length > 0 ? coverVerdict(c) : null;
 }
 
 /**

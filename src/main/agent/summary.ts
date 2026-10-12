@@ -1,14 +1,19 @@
-import { flatText, quoteAgentText } from '../steps.js';
+import { quoteAgentText } from '../steps.js';
 
 /**
  * Tool calls as the panel shows them: a line a person can read ("reading
  * “Notepad”") rather than a tool name. Shared by the built-in agent and by
  * Follow mode, which mirrors an editor session's transcript.
  *
- * The arguments are the agent's words, and these lines look like the app's
+ * The arguments are the agent's words, and so is a tool's name (any MCP
+ * server the agent uses names its own), and these lines sit among the app's
  * own notices, so each is quoted the way the app quotes an agent: one short
- * line that cannot close its quote, and never the app's name.
+ * line that cannot close its quote, and never the app's name. The panel also
+ * marks every one of them as the agent's (hud.css), which no words can undo.
  */
+
+/** The shapes annotate draws; anything else in a call is "shape", not the agent's word for it. */
+const SHAPES = new Set(['box', 'highlight', 'circle', 'arrow', 'label', 'spotlight', 'step']);
 
 /**
  * The overlay's own step tools put their prompt in the panel as a step card or
@@ -44,8 +49,12 @@ export function summarise(name: string, input: unknown): string {
         }
         case 'annotate': {
             const shapes = Array.isArray(args.shapes) ? args.shapes : [];
-            const kinds = shapes.map(s => flatText(String((s as { type?: unknown }).type ?? '?'), 12));
-            return `drawing ${kinds.length} shape(s): ${kinds.join(', ')}`;
+            const kinds = shapes.map(s => {
+                const type = (s as { type?: unknown } | null)?.type;
+                return typeof type === 'string' && SHAPES.has(type) ? type : 'shape';
+            });
+            const more = kinds.length > 4 ? ', …' : '';
+            return `drawing ${kinds.length} shape(s): ${kinds.slice(0, 4).join(', ')}${more}`;
         }
         case 'clear_annotations':
             return 'clearing the screen';
@@ -60,6 +69,7 @@ export function summarise(name: string, input: unknown): string {
             // Room for a whole path, which says what the agent tried to open.
             return `reading ${quoted(args.file_path, 'a file it named after this app', 120)}`;
         default:
-            return short;
+            // Another server's tool, named whatever it likes.
+            return `using ${quoted(short, 'a tool named after this app', 40) || 'a tool'}`;
     }
 }

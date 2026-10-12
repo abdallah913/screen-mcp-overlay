@@ -33,7 +33,7 @@ import {
     type ElementInfo,
     type WindowInfo
 } from '../../uia.js';
-import { agentCoverVerdict, findRanked, geometryFor, screenCoverVerdict, wakeAnchorTracking } from '../../anchors.js';
+import { agentCoverage, agentCoverVerdict, findRanked, geometryFor, screenCoverVerdict, wakeAnchorTracking } from '../../anchors.js';
 import { DEFAULT_COLORS, RECT_SHAPES } from './common.js';
 
 /**
@@ -96,10 +96,10 @@ export function coveredBy(covered: string): string {
 }
 
 /**
- * How covered a target is: for the agent, only when every cover is shared
- * (agentCoverVerdict), and for the overlay, which tells the user about a
- * private window on top as well (screenCoverVerdict). Null when it could
- * not be read: a failed read costs the drawing nothing.
+ * How covered a target is: for the agent, measured over shared windows alone
+ * (agentCoverage), and for the overlay, which tells the user about a private
+ * window on top as well (screenCoverVerdict). Both are read every time. Null
+ * when one could not be read: a failed read costs the drawing nothing.
  */
 async function coveredNow(
     window: string,
@@ -107,12 +107,13 @@ async function coveredNow(
     role: string | undefined,
     shared: readonly WindowInfo[]
 ): Promise<{ agent: string | null; screen: string | null }> {
-    try {
-        const c = await coverage(window, rect, role);
-        return { agent: agentCoverVerdict(c, shared), screen: screenCoverVerdict(c, shared) };
-    } catch {
-        return { agent: null, screen: null };
-    }
+    const [agent, screen] = await Promise.all([
+        agentCoverage(window, rect).then(agentCoverVerdict),
+        coverage(window, rect, role)
+            .then(c => screenCoverVerdict(c, shared))
+            .catch(() => null)
+    ]);
+    return { agent, screen };
 }
 
 // ------------------------------------------------------------------ geometry
@@ -251,8 +252,8 @@ export interface ResolvedAnchor {
     offscreen?: boolean;
     /**
      * What covers it, when it is mostly hidden, as the agent may hear it:
-     * shared windows by title, or the chat panel. Unset whenever a window
-     * the user did not share is among the covers (see sharedCovers).
+     * shared windows by title, or the chat panel, measured over those alone
+     * (see sharedCoverage): a window the user did not share is never one.
      */
     covered?: string;
     /**

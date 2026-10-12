@@ -160,16 +160,16 @@ test('shared windows keep their order: the one in front covers the one behind', 
     assertNothingPrivate(img, 'two shared windows');
 });
 
-test('a shared window that cannot render itself falls back to the masked screen, with wide margins', async () => {
+test('a shared window that cannot render itself is left blank, and the screen is never read', async () => {
     captureHelper(videoAt(BESIDE_NOTEPAD), { renders: { 100: 'blank' } });
     const r = await call('capture_screen', { display: 'primary', maxDimension: 4096 });
     assert.equal(r.isError, false, r.text);
     const img = imageOf(r.text);
-    assert.equal(stub.__state.grabs, 1);
-    // Neither the video's shadow nor the corners around Notepad survive.
-    assertNothingPrivate(img, 'masked fallback');
-    assert.deepEqual(at(img, 300, 400), COLOURS.notepad, 'with nothing else over it, it is the screen there');
-    assert.deepEqual(at(img, 104, 400), BLANK, 'its edge is pulled in');
+    // A screen copy holds whatever is in front of the window or shows through it.
+    assert.equal(stub.__state.grabs, 0);
+    assertNothingPrivate(img, 'no screen copy');
+    assert.ok(allBlank(img, rect(100, 100, 800, 600)), 'Notepad is blank whole');
+    assert.deepEqual(at(img, 1100, 400), COLOURS.calculator, 'Calculator still renders itself');
 });
 
 for (const how of ['fallback', 'blank']) {
@@ -265,7 +265,7 @@ test('asRendered names a shared window on top, worded the same with the video op
 test('capture_screen of a window that refused to render says the same with the video open or closed', async () => {
     const { text } = await sameWithAndWithout('capture_screen', { window: 'Notepad' }, { 100: 'fallback' }, false);
     assert.doesNotMatch(text, /\d+%/);
-    assert.match(text, /This window cannot render itself, so it comes from the screen and may be partly or wholly blank\./);
+    assert.match(text, /This window cannot render itself \(a GPU or video surface\), so it is left blank; nothing is read from the screen in its place\./);
 });
 
 test('whether a refusing window reads as blank depends on its own render, never on what covers it', async () => {
@@ -284,7 +284,7 @@ test('whether a refusing window reads as blank depends on its own render, never 
     const readOpen = await call('read_text', { window: 'Notepad' });
     // What it found may differ (nothing at all under the video), but never why.
     assert.deepEqual(notes(read.text), notes(readOpen.text));
-    assert.doesNotMatch(read.text, /rendered blank|GPU/);
+    assert.doesNotMatch(read.text, /rendered blank|flat colour/);
 });
 
 // --- read_text of a window --------------------------------------------------------------
@@ -296,9 +296,9 @@ for (const how of ['fallback', 'blank']) {
         captureHelper(videoAt(null), { renders: { 100: how } });
         const closed = await call('read_text', { window: 'Notepad' });
         assert.equal(normal(beside.text), normal(closed.text));
-        assert.match(beside.text, /notepad text/);
-        assert.doesNotMatch(beside.text, /private text|shadow|\d+%|nothing covered/);
-        assert.match(beside.text, /This window cannot render itself, so it comes from the screen and may be partly or wholly blank\./);
+        // Nothing is read from the screen in its place, so there is nothing to find.
+        assert.doesNotMatch(beside.text, /notepad text|private text|shadow|\d+%|nothing covered/);
+        assert.match(beside.text, /This window cannot render itself \(a GPU or video surface\), so it is left blank; nothing is read from the screen in its place\./);
         // Over it, the note is the same word for word.
         captureHelper(videoAt(OVER_NOTEPAD[1]), { renders: { 100: how } });
         const over = await call('read_text', { window: 'Notepad' });
@@ -374,7 +374,7 @@ test('with content protection off, our overlay is cut from screen copies like an
 });
 
 test('with content protection on, our overlay is not in the grab, so it hides nothing', async () => {
-    captureHelper(withOverlay(captureDesktop(false)), { renders: { 100: 'blank' } });
+    captureHelper(withOverlay(captureDesktop(false)));
     const r = await call('capture_screen', { display: 'primary', maxDimension: 4096 });
     assert.deepEqual(at(imageOf(r.text), 300, 400), COLOURS.notepad);
 });

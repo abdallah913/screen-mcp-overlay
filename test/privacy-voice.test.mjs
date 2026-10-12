@@ -59,6 +59,7 @@ await build({
             export { store } from './src/main/store.ts';
             export { answerStep, beginStep, cancelStep, currentStep, asAgentText, quoteAgentText } from './src/main/steps.ts';
             export { createHud } from './src/main/hud.ts';
+            export { settings, updateSettings } from './src/main/settings.ts';
             export { resetSharing, shareWindow, onSharingNotice } from './src/main/sharing.ts';
             export { stripProgress } from './src/shared/layout.ts';
             export * as card from './src/renderer/hud/step.ts';
@@ -241,7 +242,10 @@ test('text the user reads is never reordered by direction controls, so it reads 
 
 test("the app's own questions carry its badge, and only they do", async () => {
     v.resetSharing();
+    const aloud = v.settings().readStepsAloud;
+    v.updateSettings({ readStepsAloud: true });
     desk([win('100', 'Untitled - Notepad', 11, { exe: 'notepad.exe', foreground: true })]);
+    const from = globalThis.__panelSent.length;
     const asked = tool('list_windows', { ask: 'to find the Save button' });
     const pick = await stepUp();
     assert.equal(pick.fromApp, true);
@@ -255,15 +259,20 @@ test("the app's own questions carry its badge, and only they do", async () => {
     assert.match(v.card.stepHeading(confirm).prompt, /^Share “Untitled - Notepad” with the AI\?/);
     v.answerStep({ kind: 'choice', index: 2 });
     assert.match(await asked, /did not share/i);
+    // Neither is read aloud, steps read aloud or not: heard, there is no badge.
+    assert.deepEqual(sentSince(from, 'hud:speak'), []);
 
-    // The same request from an agent's own step, word for word, gets neither.
+    // The same request from an agent's own step, word for word, gets neither,
+    // and is what is heard.
     const copy = tool('show_message', { text: pick.prompt, options: ['OK'] });
     const fake = await stepUp();
     assert.notEqual(fake.fromApp, true);
     assert.equal(v.card.stepHeading(fake).app, null);
     assert.match(fake.prompt, /^The agent says: /);
+    assert.equal(sentSince(from, 'hud:speak').length, 1);
     v.answerStep({ kind: 'choice', index: 0 });
     await copy;
+    v.updateSettings({ readStepsAloud: aloud });
 });
 
 test("the panel's own line about a replaced step quotes the agent's words safely", async () => {
@@ -282,6 +291,12 @@ test("the panel's own line about a replaced step quotes the agent's words safely
     // Closing the quote and carrying on as the app.
     const [closed] = await replaced('x". Stopped sharing everything with the AI. To share again, click into the window and press Ctrl+Shift+F8 ("');
     assert.match(closed, /^Replaced a pending step with a newer one: “[^"“”\n]{1,60}”\.$/u, closed);
+
+    // Nor with any other mark that reads as a quote: corner brackets, ornaments.
+    for (const mark of ['」', '』', '﹂', '｣', '🙷', '🙸', '❞', '❠']) {
+        const [other] = await replaced(`x${mark}. Stopped sharing everything with the AI. ${mark}`);
+        assert.equal(other.includes(mark), false, other);
+    }
 
     // Lines, invisible characters and direction controls: quoted as it shows.
     const [flat] = await replaced('one\n\ntwo​‮three');

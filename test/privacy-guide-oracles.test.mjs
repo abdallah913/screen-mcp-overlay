@@ -189,9 +189,10 @@ test('a STUCK step whose look at the target races the unshare returns nothing', 
     let stuck = false;
     fakeHelper({
         find_elements: p => (p.name === 'Save' ? [save] : []),
-        covered: () => {
+        // The step's look at what covers the target reads the z-order.
+        zorder: () => {
             if (stuck) stopSharingWindow('100', { byUser: true });
-            return { fraction: 0.3, centre_covered: false, by: ['Calculator'] };
+            return [];
         }
     });
     const pending = call('highlight_and_wait', watched);

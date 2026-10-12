@@ -249,42 +249,6 @@ pub fn exe_of(pid: u32) -> Option<String> {
     exe
 }
 
-fn parent_pid() -> u32 {
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-    };
-    let own = std::process::id();
-    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else { return 0 };
-    let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-    let mut parent = 0;
-    let mut more = unsafe { Process32FirstW(snap, &mut entry) }.is_ok();
-    while more {
-        if entry.th32ProcessID == own {
-            parent = entry.th32ParentProcessID;
-            break;
-        }
-        more = unsafe { Process32NextW(snap, &mut entry) }.is_ok();
-    }
-    let _ = unsafe { CloseHandle(snap) };
-    parent
-}
-
-thread_local! {
-    /// The overlay app that started this helper, asked once.
-    static PARENT: u32 = parent_pid();
-}
-
-/// The overlay app's pid: the one a request names, else the process that
-/// started this helper (the Electron main process owns every window the app
-/// shows).
-pub fn ours(named: u32) -> u32 {
-    if named != 0 {
-        named
-    } else {
-        PARENT.with(|p| *p)
-    }
-}
-
 // ------------------------------------------------------------- elevation
 
 /// What a token query said about a process's integrity level.

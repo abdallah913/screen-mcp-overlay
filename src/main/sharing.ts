@@ -504,10 +504,22 @@ export async function askToShare(opts: {
 }
 
 /**
- * The share key: share the window in front, or stop sharing it if it is.
- * Returns what to tell the user in the panel. Never reaches the agent.
+ * The share key's own question, asked outside any step: a native dialog of
+ * the app's, which no agent's words can draw, and which leaves a step the
+ * agent has open alone (replacing it would tell the agent the key was
+ * pressed). Resolves to the option picked, or null when it was dismissed.
  */
-export async function toggleFrontWindow(keyLabel: string): Promise<string> {
+export type ShareConfirm = (question: { message: string; detail: string; options: string[] }) => Promise<string | null>;
+
+/**
+ * The share key: share the window in front, once the user confirms it, or
+ * stop sharing it if it is. The confirmation names the window and its app,
+ * so a user talked into pressing the key in a window they would not share
+ * (by an agent's step saying "press Ctrl+Shift+F8 to continue") sees which
+ * window it is before anything is shared. Returns what to tell the user in
+ * the panel. Never reaches the agent.
+ */
+export async function toggleFrontWindow(keyLabel: string, confirm: ShareConfirm): Promise<string> {
     const all = await listAllWindows();
     forgetClosed(all);
     const front = frontOf(all);
@@ -520,8 +532,25 @@ export async function toggleFrontWindow(keyLabel: string): Promise<string> {
         const how = front.exe && appSet().has(front.exe.toLowerCase()) ? `all ${appLabel(front.exe)} windows are` : 'the window it belongs to is';
         return `${titled(front.title)} is already shared, because ${how}. Stop that from the tray menu.`;
     }
-    shareWindow(front);
-    return `Now sharing ${titled(front.title)} with the AI, and the dialogs it opens${keyLabel ? `. Press ${keyLabel} in it again to stop` : ''}.`;
+    const app = front.exe ? appLabel(front.exe) : '';
+    const whole = canShareWholeApp(front.exe) ? `All ${app} windows` : undefined;
+    const options = ['This window', ...(whole ? [whole] : []), "Don't share"];
+    const picked = await confirm({
+        message: `Share ${titled(front.title)} with the AI?`,
+        detail:
+            `${app ? `It is a window of ${app}. ` : ''}The AI will see this window and the dialogs it opens, ` +
+            'nothing else on your screen, until you stop sharing it.',
+        options
+    }).catch(() => null);
+    if (picked === 'This window') {
+        shareWindow(front);
+        return `Now sharing ${titled(front.title)} with the AI, and the dialogs it opens${keyLabel ? `. Press ${keyLabel} in it again to stop` : ''}.`;
+    }
+    if (whole && picked === whole) {
+        shareApp(front.exe!);
+        return `Now sharing every ${app} window with the AI, now and after a restart. Stop that from the tray menu.`;
+    }
+    return `Did not share ${titled(front.title)}.`;
 }
 
 /** For tests and the share key: the share state is pushed to a helper that just started. */

@@ -1,53 +1,21 @@
 import type { Rect } from './types.js';
 
 /**
- * What a capture may show: composing one from shared windows' own renders,
- * and, where a window cannot render itself, which parts of the screen show a
- * shared window.
- *
- * Captures are composed (composeLayers): each shared window painted from its
- * own render onto a blank canvas, so nothing about any other window, its
- * outline included, is in them. A screen grab is the fallback for a window
- * that will not render, and it holds every window the user has open. Before
- * any of it reaches the agent (as an image, or as text read from one),
- * everything that is not a shared window on top is painted over with one flat
- * colour, so the desktop, the taskbar, a notification and a video playing on
- * the side all look alike. A hole cut around a window on top would still
- * trace where it is, so a window with anything unshared over it is not taken
- * from the screen at all (unsharedOver): it is blank whole.
+ * What a capture may show, composed from shared windows' own renders
+ * (composeLayers): each shared window painted from its own render onto a
+ * blank canvas, so nothing about any other window, its outline included, is
+ * in it. Nothing is ever taken from the screen, which holds every window the
+ * user has open: a shared window that will not render itself is left blank.
  */
 
-/** A window in z-order, front first. */
+/** A window in z-order, front first, and whether it is shared. */
 export interface Layer {
     rect: Rect;
     shared: boolean;
-    /** Ours and see-through (the overlay): neither shown nor hiding anything. */
-    ignore?: boolean;
 }
-
-/**
- * How far a shared window's area is pulled in at its edges when its pixels
- * come from the screen: Windows 11 rounds window corners (8px), and inside
- * that rounding the screen shows whatever is behind the window. With margin.
- * Mirrored by the helper's own screen-copy masking (native/uia-helper).
- */
-export const SHARED_INSET_PX = 10;
-
-/**
- * How far every window that is not shared is pushed out before it is cut
- * from a shared window: its drop shadow falls on the windows below, up to
- * about 16px from its edge, and a band of shadow along a shared window traces
- * the private window's outline as surely as the window itself. With margin.
- * Mirrored by the helper's own screen-copy masking (native/uia-helper).
- */
-export const OCCLUDER_SHADOW_PX = 20;
 
 const right = (r: Rect): number => r.x + r.width;
 const bottom = (r: Rect): number => r.y + r.height;
-
-function grow(r: Rect, by: number): Rect {
-    return { x: r.x - by, y: r.y - by, width: Math.max(0, r.width + 2 * by), height: Math.max(0, r.height + 2 * by) };
-}
 
 export function intersect(a: Rect, b: Rect): Rect | null {
     const x = Math.max(a.x, b.x);
@@ -67,72 +35,6 @@ function minus(a: Rect, b: Rect): Rect[] {
     if (i.x > a.x) out.push({ x: a.x, y: i.y, width: i.x - a.x, height: i.height });
     if (right(i) < right(a)) out.push({ x: right(i), y: i.y, width: right(a) - right(i), height: i.height });
     return out;
-}
-
-/**
- * The parts of shared windows that are on top, in the stack's coordinates.
- * Everything not covered by the result is to be masked.
- */
-export function visibleRegions(
-    stack: readonly Layer[],
-    inset = SHARED_INSET_PX,
-    shadow = OCCLUDER_SHADOW_PX
-): Rect[] {
-    const covering: Rect[] = [];
-    const shown: Rect[] = [];
-    for (const layer of stack) {
-        if (layer.ignore || layer.rect.width <= 0 || layer.rect.height <= 0) continue;
-        if (layer.shared) {
-            let parts = [grow(layer.rect, -inset)].filter(r => r.width > 0 && r.height > 0);
-            for (const c of covering) parts = parts.flatMap(p => minus(p, c));
-            shown.push(...parts);
-        }
-        // A shared window hides what is behind it too, without spilling.
-        covering.push(layer.shared ? layer.rect : grow(layer.rect, shadow));
-    }
-    return shown;
-}
-
-/**
- * Whether anything not shared is in front of the window at `at` (front
- * first) within `clip`, its shadow included: then the screen there shows that
- * window, and masking it out would leave a hole its shape, which follows it
- * as it moves. Our see-through overlay does not count. What is behind the
- * window does not either: on screen it shows only past the window's corners,
- * which are pulled in anyway (SHARED_INSET_PX).
- */
-export function unsharedOver(stack: readonly Layer[], at: number, clip: Rect, shadow = OCCLUDER_SHADOW_PX): boolean {
-    return stack
-        .slice(0, Math.max(0, at))
-        .some(l => !l.shared && !l.ignore && l.rect.width > 0 && l.rect.height > 0 && intersect(grow(l.rect, shadow), clip) !== null);
-}
-
-/**
- * The parts shown in both of two readings of the screen. Windows can move
- * between listing them and the capture landing, so only what was a shared
- * window's both before and after is kept.
- */
-export function both(a: readonly Rect[], b: readonly Rect[]): Rect[] {
-    const out: Rect[] = [];
-    for (const x of a) for (const y of b) {
-        const i = intersect(x, y);
-        if (i) out.push(i);
-    }
-    return out;
-}
-
-/** Rects moved by (-dx, -dy) and scaled by k: virtual-screen physical into an image's pixels. */
-export function toImage(rects: readonly Rect[], origin: { x: number; y: number }, kx: number, ky = kx): Rect[] {
-    return rects.map(r => {
-        const x = Math.floor((r.x - origin.x) * kx);
-        const y = Math.floor((r.y - origin.y) * ky);
-        return {
-            x,
-            y,
-            width: Math.ceil((right(r) - origin.x) * kx) - x,
-            height: Math.ceil((bottom(r) - origin.y) * ky) - y
-        };
-    });
 }
 
 /** The flat colour hidden areas are painted, BGRA: a dark grey that reads as "nothing here". */

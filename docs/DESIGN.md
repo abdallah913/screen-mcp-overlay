@@ -47,8 +47,12 @@ along, because to the user it is a different thing, and in a browser it may be t
 
 **How the user shares.** Three ways, all owned by the app rather than the agent:
 
-- **The share key** (`shareKey`, `Ctrl+Shift+F8`) shares the window in front, or stops sharing it.
-  It is held for the whole session, unlike the step keys, because sharing comes before an agent asks.
+- **The share key** (`shareKey`, `Ctrl+Shift+F8`) shares the window in front once the user confirms
+  it, or stops sharing it. The confirmation is a native dialog naming the window and its app, with
+  *Don't share* as the default: an agent's step can say "press Ctrl+Shift+F8 to continue" while the
+  user is in a window they would never share, and a page can title itself "Untitled - Notepad". It is
+  not a step, because replacing an agent's open step would tell the agent the key was pressed. The key
+  is held for the whole session, unlike the step keys, because sharing comes before an agent asks.
   It is never allowed to be one of the overlay's own chords.
 - **`list_windows {ask: "<why>"}`** puts two steps on screen: click into the window you mean and press
   Done, then confirm what is about to be shared (this window, all of the app's windows where that is
@@ -88,16 +92,21 @@ hole a covering window leaves traces its outline. So a capture of a display or a
 screen grab: it is composed ([capture.ts](../src/main/capture.ts),
 [visible.ts](../src/shared/visible.ts)) on a blank canvas from each shared window's own render, back to
 front in z-order, so nothing of any other window (pixels, outline, drop shadow, rounded corners), the
-desktop, the taskbar, a notification or the overlay is ever read. Only a shared window that cannot
-render itself (some GPU and DirectX surfaces) comes from the screen, painted around with wide margins
-(10 px in for rounded corners, 20 px out for shadows), and blank whole whenever anything unshared is in
-front of it, so no hole follows a private window. Every screen-copied result carries the same fixed
-note, whatever covers it. Images are composed at full resolution, before OCR, before shrinking and
-before anything is written to disk, under names an agent cannot guess.
+desktop, the taskbar, a notification or the overlay is ever read. Nothing is copied from the screen
+at all, by the app or by the helper: a shared window that cannot render itself (some GPU and DirectX
+surfaces) is left blank, with one fixed note. A screen copy holds whatever is in front of a window or
+shows through it, and masking that out by z-order still left the masks' shapes, their timing and the
+windows `EnumWindows` order does not place (Start, notifications, Alt+Tab's thumbnails) to chance.
+Images are composed at full resolution, before OCR, before shrinking and before anything is written to
+disk, under names an agent cannot guess.
 
 **Nothing in the wording either.** Which window has focus is not reported, and "foreground" means the
-frontmost shared window, so nothing says whether the user is working in an unshared app. Coverage is
-mentioned only when what covers a target is shared or is the chat panel. A tool call during which the
+frontmost shared window, so nothing says whether the user is working in an unshared app. Coverage, as
+the agent hears it, is measured over shared windows and the chat panel alone, from where they sit in
+the z-order (`sharedCoverage` in [anchors.ts](../src/main/anchors.ts)), as if nothing else were open.
+The helper's own measurement samples the screen, where a private window over a shared cover hides it,
+so a warning that came and went, or a figure that moved, traced the private window. The overlay's
+note to the user still uses the screen. A tool call during which the
 user stops sharing anything returns one fixed sentence and nothing it read, and a window the user
 stopped sharing is never reported again, not even when it closes. `since=` baselines of a window are
 dropped when its share ends and are refused if older than its current share.
@@ -446,8 +455,9 @@ not taken as consent to share it.
   edge when the target is off every display, and say on the other displays where the step is.
 - **A target behind another window** is drawn dashed with "behind another window" (or the covering
   window's title when that is shared too), instead of a confident circle on the covering window. The
-  agent is told only when what covers it is shared, or is the chat panel: hearing that something
-  unshared sits over a control would say where that window is. **A scrolled-out target** gets a pointer rather
+  agent hears only of shared windows and the chat panel, measured as if nothing else were open:
+  hearing that something unshared sits over a control, or a figure that moved with it, would say
+  where that window is. **A scrolled-out target** gets a pointer rather
   than a ring on unrelated UI, and `scroll_window {name}` brings it into view.
 - **The overlay's own UI moves out of the way.** The step strip docks away from the target, the panel
   dodges to a free corner when a drawing lands under it (never while focused or in use), and a
@@ -488,8 +498,8 @@ not taken as consent to share it.
   one not responding are marked as such, instead of failing as "not open" or "no accessibility
   provider". A window that is not shared gets none of these: it gets the one refusal.
 - **read_text reads the window it was asked about**, rendered by PrintWindow as capture_screen does.
-  A window that cannot render itself is read from the screen instead, with one fixed note, and blank
-  whenever anything unshared is in front of it.
+  A window that cannot render itself is left blank, with one fixed note; nothing is read from the
+  screen in its place.
 - **Fewer cross-process calls.** Property reads are batched with UI Automation cache requests (with a
   live read on any error, but not after a timeout or a dead provider), and bounded connection and
   transaction timeouts stop a hung app from wedging the single-threaded helper. The anchor tracker's
@@ -689,7 +699,7 @@ run. The tray menu sets most of them:
 |---|---|---|
 | `openAtLogin` | `false` | Start with Windows (the panel stays closed) |
 | `showInCapture` | `false` | Annotations appear in screen recordings and shares |
-| `readStepsAloud` | `false` | Speak each step's instruction when it appears (local voices only) |
+| `readStepsAloud` | `false` | Speak each agent step's instruction when it appears (local voices only); the app's own questions are never spoken |
 | `speechRate` | `1` | Rate for spoken steps and `show_message {speak}` |
 | `soundCues` | `false` | A short tone when a step starts and when it is done |
 | `stepKeys` | `Control+Shift+F9`, `Control+Shift+F10` | Done and Can't-find-it keys while a step is pending; empty disables one |
@@ -828,10 +838,9 @@ v0.1. The base was verified end to end on Windows 11. Not yet done:
   `delta-check.mjs` and `smoke.mjs` exercise much of it.
 - **Sharing is not yet verified on Windows either.** Check first: composed captures against real
   windows (PrintWindow per shared window, its invisible resize border, DPI scaling and monitors with
-  negative origins); the screen-copy fallback for windows that cannot render themselves, against the
-  bands `EnumWindows` order does not reflect (Start, notifications, Alt+Tab, which shows thumbnails of
-  every window); owned-window sharing for a packaged app's cross-process file picker; and the share
-  key with an elevated window in front.
+  negative origins); which real windows fail to render and come out blank (video players, games);
+  shared-only coverage against the helper's on-screen sampling; owned-window sharing for a packaged
+  app's cross-process file picker; and the share key's dialog with an elevated window in front.
 - **Event-driven waits** — waits poll (400-500 ms; `changes` on a whole window at most once a second
   over 80 nodes). UIA event subscriptions would cut latency further, but they mean COM event handlers
   on UIA's own threads writing into a single-threaded helper, which cannot be tested off Windows and
