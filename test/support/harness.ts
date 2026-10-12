@@ -17,7 +17,9 @@ export {
     shareWindow,
     sharingSummary,
     stopSharingEverything,
-    stopSharingWindow
+    stopSharingWindow,
+    wasRevoked,
+    revocationCount
 } from '../../src/main/sharing.js';
 export { Client } from '@modelcontextprotocol/sdk/client/index.js';
 export { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';

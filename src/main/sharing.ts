@@ -71,6 +71,18 @@ const MULTI_WINDOW_HOSTS = new Set([
 const OWNER_HOPS = 8;
 
 const grants = new Map<string, WindowGrant>();
+/** The last full window list seen, and which of it was shared then. */
+let lastAll: Identity[] = [];
+let sharedThen = new Set<string>();
+/**
+ * Windows the user stopped sharing this session, while still open. They read
+ * as not open from then on, so nothing may report them later, not even that
+ * they closed: a wait started while one was shared would otherwise tell the
+ * agent when it closed.
+ */
+const revokedRefs = new Set<string>();
+/** Bumped whenever the user stops sharing something: a read in flight when it moves must not be returned. */
+let revocations = 0;
 let apps: Set<string> | undefined;
 const listeners = new Set<() => void>();
 const revokedListeners = new Set<() => void>();
@@ -164,6 +176,7 @@ export function windowName(w: Identity & { title?: string }, all: readonly Ident
 
 /** Drop shares whose window closed or whose handle now belongs to another process. */
 function forgetClosed(all: readonly Identity[]): void {
+    lastAll = [...all];
     const live = new Map(all.map(w => [w.ref, w.pid]));
     let changed = false;
     for (const [ref, g] of grants) {
@@ -175,6 +188,17 @@ function forgetClosed(all: readonly Identity[]): void {
         }
     }
     if (changed) announce();
+    sharedThen = new Set(sharedOf(lastAll).map(w => w.ref));
+}
+
+/** Whether the user stopped sharing this window while it was open (see revokedRefs). */
+export function wasRevoked(ref: string): boolean {
+    return revokedRefs.has(ref);
+}
+
+/** How many times the user has stopped sharing something; compare before and after a read. */
+export function revocationCount(): number {
+    return revocations;
 }
 
 export function shareWindow(w: Pick<WindowInfo, 'ref' | 'pid' | 'title' | 'exe'>, how: ShareChange = {}): void {
@@ -187,6 +211,8 @@ export function stopSharingWindow(ref: string, how: ShareChange = {}): void {
     const g = grants.get(ref);
     if (!g) return;
     grants.delete(ref);
+    // Known even before any window list was read.
+    revokedRefs.add(ref);
     revoked();
     if (how.byUser) tell(`Stopped sharing “${g.title}” with the AI. ${ALREADY_SEEN}`);
 }
@@ -270,6 +296,9 @@ function tell(text: string): void {
 }
 
 function revoked(): void {
+    revocations += 1;
+    const still = new Set(sharedOf(lastAll).map(w => w.ref));
+    for (const ref of sharedThen) if (!still.has(ref)) revokedRefs.add(ref);
     announce();
     for (const fn of revokedListeners) {
         try {
@@ -289,6 +318,9 @@ export function setShareKeyInUse(label: string): void {
 }
 
 function announce(): void {
+    sharedThen = new Set(sharedOf(lastAll).map(w => w.ref));
+    // Shared again: it is the user's to show once more.
+    for (const ref of sharedThen) revokedRefs.delete(ref);
     const state = helperShareState();
     // The helper refuses unshared windows on its own as well; a failed push
     // leaves it with the older (smaller or larger) set until the next change
@@ -350,6 +382,9 @@ export function onRefused(fn: (what: string) => void): () => void {
 export function resetSharing(): void {
     grants.clear();
     apps = new Set();
+    lastAll = [];
+    sharedThen = new Set();
+    revokedRefs.clear();
     refusedAt.clear();
 }
 
