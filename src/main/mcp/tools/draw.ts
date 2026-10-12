@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Annotation } from '../../../shared/types.js';
 import { anchoredWindow } from '../../anchors.js';
-import { windowsWithSharing } from '../../sharing.js';
+import { wasRevoked, windowsWithSharing } from '../../sharing.js';
 import { store } from '../../store.js';
 import { SHAPE_TYPES, guarded, text } from './common.js';
 import { anchorNotes, ids, placeAnchored, placeFixed, resolveAnchor, stepRange } from './anchoring.js';
@@ -129,12 +129,13 @@ async function hiddenNote(): Promise<string> {
     // Whether a window is minimised or on another desktop is the user's
     // business once they stop sharing it. Its drawings are cleared when that
     // happens (anchors.ts); this covers the moment in between. A window that
-    // closed is no longer anyone's, and "closed" stays the useful answer.
+    // closed while shared is no longer anyone's, and "closed" stays the
+    // useful answer; one the user stopped sharing first is never reported.
     const lists = await windowsWithSharing().catch(() => undefined);
     const gone = hidden.filter(a => {
         const home = anchoredWindow(a);
         if (home === undefined) return true;
-        if (!lists) return false;
+        if (!lists || wasRevoked(home)) return false;
         return !lists.all.some(w => w.ref === home) || lists.shared.some(w => w.ref === home);
     });
     if (gone.length === 0) return '';

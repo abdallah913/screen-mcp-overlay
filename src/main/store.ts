@@ -202,18 +202,20 @@ class Store extends EventEmitter {
      * Forget what was read from windows the user stopped sharing: their tree
      * snapshots (a since= diff would replay their controls) and their window
      * captures, files included, since the capture directory is readable by
-     * the panel agent's own file tools. Returns how many records went.
+     * the panel agent's own file tools. `refs` says which windows, as a set
+     * or a test: a window the user stopped sharing and then closed is in no
+     * window list. Returns how many records went.
      */
-    forgetWindows(refs: ReadonlySet<string>): number {
-        if (refs.size === 0) return 0;
+    forgetWindows(refs: ReadonlySet<string> | ((ref: string) => boolean)): number {
+        const gone = typeof refs === 'function' ? refs : (ref: string): boolean => refs.has(ref);
         let n = 0;
         for (const [id, s] of this.snapshots) {
-            if (!refs.has(s.windowRef)) continue;
+            if (!gone(s.windowRef)) continue;
             this.snapshots.delete(id);
             n += 1;
         }
         for (const [id, c] of this.captures) {
-            if (!c.windowRef || !refs.has(c.windowRef)) continue;
+            if (!c.windowRef || !gone(c.windowRef)) continue;
             this.captures.delete(id);
             n += 1;
             try {

@@ -1,6 +1,6 @@
 import type { SnapshotNode } from '../shared/types.js';
 import { toSnapshotNodes, type TreeRow } from '../shared/uitree.js';
-import { isShared, onSharingChanged, sharedOf, windowsWithSharing } from './sharing.js';
+import { isShared, onSharingChanged, sharedOf, wasRevoked, windowsWithSharing } from './sharing.js';
 import {
     describeWindow,
     findElements,
@@ -30,7 +30,9 @@ import {
  * share opening, closing or carrying a matching control never meets a wait,
  * never ends one and is never reported, so a wait cannot tell the agent what
  * else is open. The full window list is still read, to tell a window opening
- * from one being shared, and closing from being unshared.
+ * from one being shared, and closing from being unshared. A window the user
+ * stops sharing during a wait is one of those from then on (wasRevoked): its
+ * closing later is not news either.
  */
 
 export type WaitCondition = 'appears' | 'disappears' | 'enabled' | 'changes';
@@ -267,6 +269,12 @@ type Check = ((final: false | 'done' | 'timeout') => Promise<Probe>) & { slow?: 
  * window opening, and unsharing one is not a window closing: either would
  * end a wait on something the agent cannot see, at a moment that says what
  * the user did elsewhere. Without a baseline the first look is the start.
+ *
+ * A window counts as closing only if it was shared when last seen open. One
+ * the user stopped sharing leaves the count as soon as that is known
+ * (wasRevoked, or a look that finds it open and not shared), so its closing
+ * later, even before the next look, does not end the wait: that would tell
+ * the agent whether and when a window it was denied closed.
  */
 function windowWatch(
     pick: (shared: WindowInfo[], all: WindowInfo[]) => WindowInfo[],
@@ -282,15 +290,22 @@ function windowWatch(
     if (baseline) begin(baseline, sharedOf(baseline));
     return (all, shared) => {
         if (!counted || !hidden) begin(all, shared);
+        const open = new Set(all.map(w => w.ref));
+        const visible = new Set(shared.map(w => w.ref));
+        for (const ref of [...counted!]) {
+            // Unshared from now on: never counted again, and not a window
+            // opening if the user shares it once more.
+            if (wasRevoked(ref) || (open.has(ref) && !visible.has(ref))) {
+                counted!.delete(ref);
+                hidden!.add(ref);
+            }
+        }
         const now = pick(shared, all);
         const fresh = now.find(w => !counted!.has(w.ref) && !hidden!.has(w.ref));
         if (fresh) return { hit: asElement(fresh) };
-        const open = new Set(all.map(w => w.ref));
-        const visible = new Set(shared.map(w => w.ref));
         const still = new Set(now.map(w => w.ref));
-        // Gone because it closed (or its title no longer matches), not
-        // because the user stopped sharing it.
-        const gone = [...counted!].some(ref => !still.has(ref) && !(open.has(ref) && !visible.has(ref)));
+        // Gone because it closed (or its title no longer matches) while it was still shared.
+        const gone = [...counted!].some(ref => !still.has(ref));
         return { hit: gone ? null : false };
     };
 }
@@ -487,11 +502,14 @@ function unlessAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promi
 export const NO_LONGER_SHARED = 'the user stopped sharing the window it was watching';
 
 /**
- * Whether the user stopped sharing a window that is still open: a closed
- * window is not that, and the waits and steps answer it the way they always
- * have. False when the window list cannot be read: that is no news either way.
+ * Whether the user stopped sharing this window. One that closed while shared
+ * is not that, and the waits and steps answer it the way they always have;
+ * one the user stopped sharing and then closed is, however soon it closed:
+ * it must not read as closed. False when the window list cannot be read and
+ * nothing else says so: that is no news either way.
  */
 export async function unsharedNow(ref: string): Promise<boolean> {
+    if (wasRevoked(ref)) return true;
     try {
         // Not windowsWithSharing: this runs from sharing listeners, which
         // judge what changed and must not prune shares themselves.
@@ -515,7 +533,10 @@ function watchShare(window: string | undefined): { revoked: () => boolean; stop:
             revoked ||= gone;
         });
     });
-    return { revoked: () => revoked, stop: () => void stop() };
+    // Asked directly as well: a check that failed because the window closed
+    // right after the user stopped sharing it must not read as it closing
+    // while the listing above is still in flight.
+    return { revoked: () => revoked || wasRevoked(window), stop: () => void stop() };
 }
 
 export async function waitForElement(req: WaitRequest): Promise<WaitOutcome> {

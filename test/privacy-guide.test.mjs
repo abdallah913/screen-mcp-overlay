@@ -92,7 +92,7 @@ async function sameAsMissing(calls, tool, argsFor, query, missing) {
 
 // --- naming the private window ------------------------------------------------
 
-test('drawing on the private window by title, ref or "foreground" is refused like a missing window', async () => {
+test('drawing on the private window by title or ref is refused like a missing window; "foreground" never means it', async () => {
     const desktop = withVideo({ ...video, foreground: true });
     desktop.windows[0].foreground = false;
     const { calls } = fakeHelper({}, desktop);
@@ -103,12 +103,18 @@ test('drawing on the private window by title, ref or "foreground" is refused lik
     await sameAsMissing(calls, 'annotate', q => ({ anchor: { ref: q }, shapes }), '500', '987654');
     await sameAsMissing(calls, 'annotate', q => ({ anchor: { window: q, name: 'Save' }, shapes }), 'Lofi', 'Zzzqq');
 
-    // The video is in front: "foreground" is not it, and not some other window either.
-    const front = await call('annotate', { anchor: { window: 'foreground' }, shapes });
-    assert.equal(front.isError, true);
-    noLeak(front.text);
-    assert.match(front.text, /no shared window matches "foreground"/);
     assert.equal(store.list().length, 0, 'nothing was drawn');
+
+    // The video is in front: "foreground" is not it. It is the frontmost
+    // shared window, as in the reading tools, and reads exactly as it does
+    // with Notepad in front: refusing it would say a private window is.
+    const front = await call('annotate', { anchor: { window: 'foreground' }, shapes });
+    noLeak(front.text);
+    assert.match(front.text, /^Drew ann_\d+ on window 100 "Untitled - Notepad"/);
+    desktop.windows[0].foreground = true;
+    desktop.windows.find(w => w.ref === video.ref).foreground = false;
+    const notepad = await call('annotate', { anchor: { window: 'foreground' }, shapes });
+    assert.equal(front.text.replace(/ann_\d+/g, 'ann_N'), notepad.text.replace(/ann_\d+/g, 'ann_N'));
     assert.equal(calls.some(c => c.params?.window === '500' || c.params?.refs?.includes('500')), false);
 });
 
@@ -382,7 +388,8 @@ test('a target covered by the private window says "another window", on screen to
 
     const step = await call('highlight_and_wait', { ...watched, until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
     noLeak(step.text);
-    assert.match(step.text, /is mostly behind another window;/);
+    assert.match(step.text, /is behind another window;/);
+    assert.equal(/\d+%|mostly|partly|almost/.test(step.text), false, step.text);
 });
 
 test('a click where the target is, under the private window, does not name it', async () => {

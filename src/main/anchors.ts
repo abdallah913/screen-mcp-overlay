@@ -2,7 +2,7 @@ import { screen } from 'electron';
 import type { AnchorSelector, AnchorSpec, Annotation, Point, Rect } from '../shared/types.js';
 import { clean, rankMatches, recoveredMatch } from '../shared/uitree.js';
 import { coverVerdict } from '../shared/windows.js';
-import { onSharingChanged, sharedOf, sharedWindows } from './sharing.js';
+import { onSharingChanged, sharedOf, sharedWindows, wasRevoked } from './sharing.js';
 import { store } from './store.js';
 import {
     coverage,
@@ -200,8 +200,11 @@ export function agentCoverVerdict(c: Coverage, shared: readonly Pick<WindowInfo,
  * The user stopped sharing something. Drawings on a window that is still open
  * but no longer shared go, as does what was read from it (tree snapshots,
  * captures): the agent must not keep following, describing or diffing a
- * window it can no longer see. A window that closed keeps its drawings: the
- * tracker hides them, and says the window closed, as it always has.
+ * window it can no longer see. A window that closed while shared keeps its
+ * drawings: the tracker hides them, and says the window closed, as it always
+ * has. One the user stopped sharing goes even if it has closed by the time
+ * the list is read (wasRevoked): kept, its drawing would later read "its
+ * window was closed", telling the agent when a window it was denied closed.
  */
 async function forgetUnshared(): Promise<void> {
     let open: WindowInfo[];
@@ -210,15 +213,17 @@ async function forgetUnshared(): Promise<void> {
         // shares itself (that announces again, from inside an announcement).
         open = await listAllWindows();
     } catch {
-        // The helper is down, so nothing is drawn or read anyway; the
-        // next change, or the helper's own refusal, catches up.
-        return;
+        // The helper is down, so nothing is drawn or read anyway; the next
+        // change, or the helper's own refusal, catches up with the rest.
+        // What the user stopped sharing goes now all the same.
+        open = [];
     }
     const visible = new Set(sharedOf(open).map(w => w.ref));
-    const hidden = new Set(open.map(w => w.ref).filter(ref => !visible.has(ref)));
+    const unshared = new Set(open.map(w => w.ref).filter(ref => !visible.has(ref)));
+    const hidden = (ref: string): boolean => unshared.has(ref) || wasRevoked(ref);
     const gone = store.anchored().filter(a => {
         const home = anchoredWindow(a);
-        return home !== undefined && hidden.has(home);
+        return home !== undefined && hidden(home);
     });
     if (gone.length > 0) store.clear(gone.map(a => a.id));
     store.forgetWindows(hidden);

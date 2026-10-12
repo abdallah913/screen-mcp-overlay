@@ -16,11 +16,12 @@ import {
     toPhysicalRect
 } from '../../../shared/geometry.js';
 import { clean, isAmbiguous, recoveredMatch, whereIn } from '../../../shared/uitree.js';
-import { isWindowRef, pickWindow, windowBlocker } from '../../../shared/windows.js';
+import { isWindowRef, notShared, pickWindow, windowBlocker } from '../../../shared/windows.js';
 import { listDisplays, resolveDisplay } from '../../displays.js';
 import { noteRefused, windowsWithSharing } from '../../sharing.js';
 import { store } from '../../store.js';
 import {
+    NotSharedError,
     StaleRefError,
     collapsedControls,
     coverage,
@@ -53,39 +54,23 @@ export interface SharedTarget {
     shared: WindowInfo[];
 }
 
-/** The most shared windows a refusal lists. */
-const REFUSAL_LIST = 8;
-
-/** Words that mean "whatever the user is looking at", as pickWindow takes them. */
-const FOREGROUND = new Set(['foreground', 'active', 'focused', 'current']);
-
-/**
- * The one answer for a window the agent may not use: one that is not shared,
- * one that is not open, and a made-up ref all read the same, so a refusal
- * never tells the agent that something it guessed is open. It lists only
- * what is shared, and may echo the agent's own query, which tells it nothing.
- */
-export function notSharedMessage(query: string, shared: readonly WindowInfo[]): string {
-    const listed = shared
-        .slice(0, REFUSAL_LIST)
-        .map(w => `${w.ref} "${clean(w.title).slice(0, 50)}"`)
-        .join(', ');
-    const more = shared.length > REFUSAL_LIST ? ', …' : '';
-    return (
-        `no shared window matches "${clean(query)}"${listed ? `. Shared: ${listed}${more}` : ''}. ` +
-        'Windows stay private until the user shares them; list_windows with ask:"<why you need it>" asks the user to share one.'
-    );
-}
-
 /**
  * Resolve a window the agent named (a ref, a title substring or "foreground")
  * among the shared windows only, before anything is asked of the window
  * itself: a refusal costs the same one window listing whether the window is
- * open or not, and nothing about an unshared window is read. "foreground" is
- * the window in front only when that is shared; otherwise it is refused as
- * if nothing were in front, rather than quietly standing for another window.
- * Throws the uniform refusal, and tells the user's panel, unless `internal`:
- * a window the server carried over itself is no agent's request.
+ * open or not, and nothing about an unshared window is read.
+ *
+ * A name is resolved exactly as the reading tools resolve it (uia.ts
+ * resolveWindowInfo, step for step, on the one listing the decisions are
+ * also made on), so it means the same window here as in describe_window, and
+ * a refusal reads the same word for word (privacy-revoked.test.mjs compares
+ * them). "foreground" is the frontmost shared window: the shared one in
+ * front, else the first visible shared one in z-order, whatever the user is
+ * really in. Refusing it when a private window is in front, as this used to,
+ * told the agent exactly that.
+ *
+ * Tells the user's panel of a refusal, unless `internal`: a window the server
+ * carried over itself is no agent's request.
  */
 export async function sharedWindowFor(query: string, internal = false): Promise<SharedTarget> {
     const { all, shared } = await windowsWithSharing();
@@ -94,16 +79,13 @@ export async function sharedWindowFor(query: string, internal = false): Promise<
     if (isWindowRef(q)) {
         const w = shared.find(x => x.ref === q);
         found = w ? { window: w } : undefined;
-    } else if (FOREGROUND.has(q.toLowerCase())) {
-        const w = shared.find(x => x.foreground && !x.minimized && !x.cloaked);
-        found = w ? { window: w } : undefined;
     } else {
         const picked = pickWindow(q, shared);
         found = typeof picked === 'string' ? undefined : picked;
     }
     if (!found) {
         if (!internal) noteRefused(q);
-        throw new Error(notSharedMessage(q, shared));
+        throw new NotSharedError(notShared(q, shared));
     }
     return { ref: found.window.ref, window: found.window, note: found.note, all, shared };
 }

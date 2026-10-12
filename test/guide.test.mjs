@@ -173,14 +173,14 @@ test('a covered target is drawn with a warning; an untitled popup on top is not 
     let r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
     assert.match(r.text, /WARNING: "Save" \[button\] el_1 is 85% behind "Calculator"; focus_window \{window:"Untitled - Notepad"\}/);
 
-    // A cover the user did not share is not named, nor measured to the percent.
+    // A cover the user did not share is not named, nor measured at all.
     fakeHelper({
         find_elements: finder(() => [saved]),
         covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] })
     });
     r = await call('highlight_and_wait', { window: 'Notepad', name: 'Save', prompt: 'p', until: { condition: 'disappears', name: 'Saved' }, timeoutMs: 1000 });
-    assert.match(r.text, /WARNING: "Save" \[button\] el_1 is mostly behind another window; focus_window \{window:"Untitled - Notepad"\}/);
-    assert.equal(/Chrome|85%/.test(r.text), false, r.text);
+    assert.match(r.text, /WARNING: "Save" \[button\] el_1 is behind another window; focus_window \{window:"Untitled - Notepad"\}/);
+    assert.equal(/Chrome|85%|mostly|partly|almost/.test(r.text), false, r.text);
 
     fakeHelper({
         find_elements: finder(() => [saved]),

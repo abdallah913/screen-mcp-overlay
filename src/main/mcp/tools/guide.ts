@@ -12,7 +12,7 @@ import { beginStep } from '../../steps.js';
 import { postToHud } from '../../hud.js';
 import { listDisplays } from '../../displays.js';
 import { ANOTHER_WINDOW, PANEL_COVER, safeCoverNames } from '../../anchors.js';
-import { isShared, onSharingChanged, sharedOf, sharedWindows, windowsWithSharing } from '../../sharing.js';
+import { isShared, onSharingChanged, sharedOf, sharedWindows, wasRevoked, windowsWithSharing } from '../../sharing.js';
 import {
     coverage,
     describeWindow,
@@ -281,8 +281,11 @@ function goneWhy(reason: Annotation['hiddenReason'], windowTitle: string): strin
  * every menu step. A tooltip is untitled too, and passes in a moment.
  *
  * Covers are named only when shared (or the panel), as `shared` allows; any
- * other is "another window", and how much it hides is said in words, not a
- * percentage that would trace its outline as the user moves it.
+ * other is "another window". How much is hidden is given only when every
+ * cover is shared: with a private window among them the fraction is mostly
+ * its overlap, and even a word for it ("mostly", "almost entirely") would
+ * change as the user moves it and trace its outline. Then one fixed phrase
+ * says the target is behind it, on the one test any cover meets.
  */
 function coveredNote(c: Coverage, what: string, windowTitle: string, shared: readonly WindowInfo[]): string | null {
     const by = safeCoverNames(c.by, shared).filter(Boolean);
@@ -292,17 +295,12 @@ function coveredNote(c: Coverage, what: string, windowTitle: string, shared: rea
     const fix = by.every(t => t === PANEL_COVER)
         ? 'ask the user to drag the chat panel aside or hide it with Ctrl+Shift+O.'
         : `focus_window {window:${JSON.stringify(windowTitle)}} brings it forward.`;
-    const how = by.includes(ANOTHER_WINDOW) ? roughly(c.fraction) : `${Math.round(c.fraction * 100)}%`;
-    return `WARNING: ${what} is ${how} behind ${by.slice(0, 2).map(nameOrPhrase).join(', ')}; ${fix}`;
+    const how = by.includes(ANOTHER_WINDOW) ? '' : `${Math.round(c.fraction * 100)}% `;
+    return `WARNING: ${what} is ${how}behind ${by.slice(0, 2).map(nameOrPhrase).join(', ')}; ${fix}`;
 }
 
 /** A cover's name for a sentence: a title quoted, the generic phrase as it is. */
 const nameOrPhrase = (name: string): string => (name === ANOTHER_WINDOW ? name : quote(name));
-
-/** How much of a target an unshared window hides, coarse enough to say nothing of its shape. */
-function roughly(fraction: number): string {
-    return fraction >= 0.9 ? 'almost entirely' : fraction >= 0.5 ? 'mostly' : 'partly';
-}
 
 /**
  * Coverage of a control, measured against the top-level window it actually
@@ -344,9 +342,16 @@ async function targetStatus(circleId: string | undefined, windowRef: string, win
     }
     if (!rect) return 'The circled control is not on screen now.';
     const c = await coverageOf(windowRef, rect, circle.anchor.ref);
-    const covered = c && c.by.length > 0 ? coveredNote(c, 'the circled control', windowTitle, await sharedNow()) : null;
+    const shared = c && c.by.length > 0 ? await sharedNow() : [];
+    const covered = c && c.by.length > 0 ? coveredNote(c, 'the circled control', windowTitle, shared) : null;
     if (covered) return covered;
-    if (c && c.fraction > 0.2) return `The circled control is ${roughly(c.fraction)} covered by another window.`;
+    // Partly covered, by shared windows only: a private one grazing the
+    // target reads as nothing on top, or its overlap would show as it moves.
+    const by = c ? safeCoverNames(c.by, shared).filter(Boolean) : [];
+    if (c && c.fraction > 0.2 && by.length > 0 && !by.includes(ANOTHER_WINDOW)) {
+        const names = by.slice(0, 2).map(nameOrPhrase).join(', ');
+        return `The circled control is ${Math.round(c.fraction * 100)}% covered by ${names}.`;
+    }
     return 'The circled control is visible and uncovered: ask what they see, or describe it differently.';
 }
 
@@ -507,6 +512,11 @@ interface WindowDelta {
  * lists include minimised windows. Judged on every window, so restoring or
  * sharing a window is not it opening, then cut down to the shared ones: an
  * unshared window's comings and goings are left out without a count.
+ *
+ * A window closed only if it was shared when last seen open: shared when the
+ * step began, and not unshared by the user since (wasRevoked). One the user
+ * stopped sharing reads as not open from that moment, so its closing later
+ * is no more news than any other private window's.
  */
 function windowDelta(before: Before, now: WindowInfo[]): WindowDelta {
     const was = new Map(before.all.map(w => [w.ref, w]));
@@ -515,7 +525,7 @@ function windowDelta(before: Before, now: WindowInfo[]): WindowDelta {
     return {
         opened: now.filter(w => !was.has(w.ref) && shared.has(w.ref)),
         // Shared when the step began: a window's own share goes when it closes.
-        closed: before.all.filter(w => !is.has(w.ref) && before.shared.has(w.ref)),
+        closed: before.all.filter(w => !is.has(w.ref) && before.shared.has(w.ref) && !wasRevoked(w.ref)),
         minimized: now.filter(w => w.minimized && was.get(w.ref)?.minimized === false && shared.has(w.ref))
     };
 }
@@ -720,9 +730,12 @@ function settledIn(o: WaitOutcome, plan: WaitPlan, windowRef: string): string {
  * one in front, else any. Failing that, whatever is in front now. Only a
  * shared window is ever chosen: a plan never wanders into one the user kept
  * private, even of the same app. A window that is still open stays the
- * answer, shared or not, and the next step refuses it if it is not.
+ * answer, shared or not, and the next step refuses it if it is not. So does
+ * one the user stopped sharing, whether or not it has closed since: moving
+ * on only when it closed would tell the agent that it did.
  */
 async function nextWindow(ref: string, before: Before): Promise<string> {
+    if (wasRevoked(ref)) return ref;
     let all: WindowInfo[];
     let shared: WindowInfo[];
     try {
@@ -897,22 +910,26 @@ const NO_LONGER_SHARED_STEP =
 
 /**
  * Listen for the user to stop sharing a step's window while it is up. Closing
- * is not that: a step whose window closes is answered as it always was.
+ * is not that: a step whose window closes is answered as it always was. A
+ * window unshared and then closed is still unshared, however quickly it
+ * closed (wasRevoked), so the step never reports that close.
  * `revoked` asks the window list only when sharing changed during the step.
  */
 function watchShare(ref: string, onRevoked: () => void): { revoked: () => Promise<boolean>; stop: () => void } {
     let changed = false;
     let revoked = false;
+    const end = (): void => {
+        if (revoked) return;
+        revoked = true;
+        onRevoked();
+    };
     const off = onSharingChanged(() => {
         changed = true;
-        void unsharedNow(ref).then(gone => {
-            if (!gone || revoked) return;
-            revoked = true;
-            onRevoked();
-        });
+        if (wasRevoked(ref)) end();
+        else void unsharedNow(ref).then(gone => gone && end());
     });
     return {
-        revoked: async () => revoked || (changed && (await unsharedNow(ref))),
+        revoked: async () => revoked || wasRevoked(ref) || (changed && (await unsharedNow(ref))),
         stop: () => void off()
     };
 }
