@@ -430,6 +430,7 @@ export async function askToShare(opts: {
             `Screen MCP Overlay: an AI agent asks to see the window you need help with${why ? ` (it says: “${why}”)` : ''}. ` +
             'Click into that window, then press Done. Nothing else on your screen is shared; Skip shares nothing.',
         mode: 'watch',
+        fromApp: true,
         timeoutMs: opts.timeoutMs,
         signal: opts.signal
     });
@@ -474,6 +475,7 @@ export async function askToShare(opts: {
             `Screen MCP Overlay: share “${candidate.title}” with the AI? ` +
             'It will see this window and the dialogs it opens, nothing else, until you stop sharing it.',
         mode: 'choice',
+        fromApp: true,
         options,
         timeoutMs: Math.min(opts.timeoutMs, 60_000),
         signal: opts.signal

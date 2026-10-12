@@ -14,7 +14,7 @@ import { parseProgress } from '../shared/progress.js';
 import { listDisplays } from './displays.js';
 import { pingTargets, raiseOverlays } from './overlay.js';
 import { settings } from './settings.js';
-import { answerStep, cancelStep, currentStep, onStepEnded } from './steps.js';
+import { answerStep, asAgentText, cancelStep, currentStep, onStepEnded } from './steps.js';
 import { store } from './store.js';
 import { focusWindow, setHudWindowRef } from './uia.js';
 
@@ -340,8 +340,11 @@ export function postToHud(textBody: string, level: 'info' | 'warn' | 'error'): v
     const win = hudWindow();
     if (win && !win.isVisible()) win.showInactive();
     // The pending step's own card already says this.
-    if (level === 'info' && currentStep()?.prompt.trim() === textBody.trim()) return;
-    pushMessage(level === 'error' ? 'error' : level === 'warn' ? 'system' : 'guide', textBody);
+    if (level === 'info' && currentStep()?.prompt.trim() === asAgentText(textBody).trim()) return;
+    // Always in the agent's voice: the app's own notices (sharing, refusals)
+    // use the system style, and an agent's message must not pass for one.
+    const body = asAgentText(textBody);
+    pushMessage('guide', level === 'info' ? body : `${level === 'warn' ? 'Warning' : 'Error'}: ${body}`);
 }
 
 /**

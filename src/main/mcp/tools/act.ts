@@ -34,7 +34,12 @@ export function registerAct(server: McpServer): void {
                 // user kept private in front of them, and whether that worked
                 // would say it is open.
                 const w = await sharedWindowFor(args.window);
-                await focusWindow(w.ref);
+                await focusWindow(w.ref).catch(() => {
+                    // Why Windows refused (another app holding the focus lock,
+                    // one running as administrator) is about the window in
+                    // front, which may be one the user kept private.
+                    throw new Error(`Windows did not bring window ${w.ref} to the front; ask the user to click it.`);
+                });
                 // Restoring a minimised window, or fetching one from another
                 // desktop, is the usual reason to call this; say it happened.
                 const how = w.window.minimized ? ' (restored from minimized)' : w.window.cloaked ? ' (from another desktop)' : '';

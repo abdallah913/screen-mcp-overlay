@@ -422,7 +422,7 @@ pub fn print_window_png(hwnd: HWND, path: &str, ignore_pid: u32) -> Result<Print
         canvas.copy_screen((raw.left, raw.top));
         buf = canvas.pixels()?;
         let origin = (raw.left, raw.top);
-        let keep: Vec<Rect> = shown_parts(&stack_down_to(hwnd, ours(ignore_pid)), EDGE_PX)
+        let keep: Vec<Rect> = shown_parts(&stack_down_to(hwnd, ours(ignore_pid)), INSET_PX, SHADOW_PX)
             .into_iter()
             .map(|r| Rect { x: r.x - origin.0, y: r.y - origin.1, ..r })
             .collect();
@@ -459,10 +459,14 @@ pub fn print_window_png(hwnd: HWND, path: &str, ignore_pid: u32) -> Result<Print
 /// so a hole looks the same whichever side made it.
 const MASK_BGRA: [u8; 4] = [32, 32, 32, 255];
 
-/// How far a shared window's area is pulled in at its edges, and every other
-/// window's pushed out (EDGE_PX in src/shared/visible.ts): Windows 11 rounds
-/// window corners, and drop shadows spill onto the windows below.
-const EDGE_PX: i32 = 2;
+/// How far a shared window's area is pulled in at its edges: Windows 11
+/// rounds window corners by about 8 px, and inside them is whatever is behind
+/// the window. The same margin as the client's masking (src/shared/visible.ts).
+const INSET_PX: i32 = 10;
+
+/// How far every other window is pushed out: its drop shadow spills well past
+/// its frame onto the windows below, and would trace its outline.
+const SHADOW_PX: i32 = 20;
 
 /// WDA_EXCLUDEFROMCAPTURE: a window Windows leaves out of every screen copy.
 const EXCLUDED_FROM_CAPTURE: u32 = 0x11;
@@ -501,7 +505,7 @@ fn cut(a: &Rect, b: &Rect) -> Vec<Rect> {
 /// The parts of shared windows that are on top, for a stack of (rect,
 /// shared) front first; everything else is to be masked. The same rule as
 /// visibleRegions in src/shared/visible.ts.
-fn shown_parts(stack: &[(Rect, bool)], edge: i32) -> Vec<Rect> {
+fn shown_parts(stack: &[(Rect, bool)], inset: i32, shadow: i32) -> Vec<Rect> {
     let mut covering: Vec<Rect> = Vec::new();
     let mut shown: Vec<Rect> = Vec::new();
     for (rect, shared) in stack {
@@ -509,14 +513,14 @@ fn shown_parts(stack: &[(Rect, bool)], edge: i32) -> Vec<Rect> {
             continue;
         }
         if *shared {
-            let inner = grow(rect, -edge);
+            let inner = grow(rect, -inset);
             let mut parts: Vec<Rect> = if inner.width > 0 && inner.height > 0 { vec![inner] } else { Vec::new() };
             for c in &covering {
                 parts = parts.iter().flat_map(|p| cut(p, c)).collect();
             }
             shown.extend(parts);
         }
-        covering.push(if *shared { *rect } else { grow(rect, edge) });
+        covering.push(if *shared { *rect } else { grow(rect, shadow) });
     }
     shown
 }
@@ -1014,19 +1018,23 @@ mod tests {
         // A video (unshared) over the right half of the target window.
         let target = r(0, 0, 100, 100);
         let video = r(50, 0, 100, 100);
-        let shown = shown_parts(&[(video, false), (target, true)], 0);
+        let shown = shown_parts(&[(video, false), (target, true)], 0, 0);
         assert_eq!(shown, vec![r(0, 0, 50, 100)]);
         // Edges pull the shared window in and push the cover out.
-        let shown = shown_parts(&[(video, false), (target, true)], 2);
+        let shown = shown_parts(&[(video, false), (target, true)], 2, 2);
         assert_eq!(shown, vec![r(2, 2, 46, 96)]);
         // A shared menu over the target shows, and hides nothing it should.
         let menu = r(10, 10, 20, 20);
-        let shown = shown_parts(&[(menu, true), (target, true)], 0);
+        let shown = shown_parts(&[(menu, true), (target, true)], 0, 0);
         assert!(shown.contains(&menu));
         let area: i32 = shown.iter().map(|s| s.width * s.height).sum();
         assert_eq!(area, 100 * 100);
         // Nothing shared: nothing shown.
-        assert!(shown_parts(&[(video, false)], 2).is_empty());
+        assert!(shown_parts(&[(video, false)], 2, 2).is_empty());
+        // The real margins: the target's rounded corners pulled in, and the
+        // cover's shadow masked along with it, so neither traces the cover.
+        let shown = shown_parts(&[(video, false), (target, true)], INSET_PX, SHADOW_PX);
+        assert_eq!(shown, vec![r(10, 10, 20, 80)]);
     }
 
     #[test]

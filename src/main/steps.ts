@@ -38,6 +38,19 @@ export interface StepRequest {
     progress?: { n: number; of: number };
     /** What is circled and where, for the panel card and log. */
     target?: string;
+    /** The app's own question (asking to share a window), not an agent's. */
+    fromApp?: boolean;
+}
+
+/**
+ * Prompts that open with the app's name are the app speaking: asking the user
+ * to share a window. An agent's prompt that opens the same way is labelled as
+ * the agent's, so it cannot pass for that question.
+ */
+export const APP_VOICE = 'Screen MCP Overlay';
+
+export function asAgentText(text: string): string {
+    return text.trimStart().toLowerCase().startsWith(APP_VOICE.toLowerCase()) ? `The agent says: ${text.trim()}` : text;
 }
 
 export interface StepHandle {
@@ -136,7 +149,7 @@ export function beginStep(req: StepRequest): StepHandle {
     const p: Pending = {
         view: {
             id,
-            prompt: req.prompt,
+            prompt: req.fromApp ? req.prompt : asAgentText(req.prompt),
             mode: req.mode,
             count: req.mode === 'click' ? Math.max(1, req.count ?? 1) : 0,
             collected: 0,
