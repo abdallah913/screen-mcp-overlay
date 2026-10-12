@@ -9,7 +9,8 @@ import {
     sameText,
     stepButtons,
     stepHeading,
-    timeLeft
+    timeLeft,
+    withoutAppName
 } from './step.js';
 
 declare global {
@@ -59,6 +60,7 @@ const sendBtn = document.getElementById('send') as HTMLButtonElement;
 const statusEl = document.getElementById('status') as HTMLDivElement;
 const dot = document.getElementById('dot') as HTMLSpanElement;
 const card = document.getElementById('step-card') as HTMLElement;
+const cardApp = document.getElementById('step-app') as HTMLSpanElement;
 const cardProgress = document.getElementById('step-progress') as HTMLSpanElement;
 const cardKind = document.getElementById('step-kind') as HTMLSpanElement;
 const cardTime = document.getElementById('step-time') as HTMLSpanElement;
@@ -234,11 +236,16 @@ function logStep(s: StepView): void {
     const lastBody = last?.querySelector('.body') as HTMLElement | null;
     const stick = atBottom();
     let body: HTMLElement;
-    if (last?.classList.contains('guide') && !last.dataset.step && lastBody && sameText(lastBody.textContent ?? '', s.prompt)) {
+    // Never an agent's line as the entry for the app's own question: it would get the badge.
+    if (!s.fromApp && last?.classList.contains('guide') && !last.dataset.step && lastBody && sameText(lastBody.textContent ?? '', s.prompt)) {
         body = lastBody;
     } else {
         body = bubble('guide');
-        body.textContent = s.prompt;
+        body.textContent = s.fromApp ? withoutAppName(s.prompt) : s.prompt;
+    }
+    if (s.fromApp) {
+        (body.parentElement as HTMLElement).classList.add('app');
+        body.prepend(appBadge());
     }
     // What is circled and where, so the log still says which control a step
     // meant once its drawing is gone.
@@ -306,6 +313,14 @@ window.hudApi.onReplyReturned(text => {
     updateComposer();
 });
 
+/** The card's badge, for the app's own entries in the log. */
+function appBadge(): HTMLElement {
+    const badge = cardApp.cloneNode(true) as HTMLElement;
+    badge.removeAttribute('id');
+    badge.hidden = false;
+    return badge;
+}
+
 function answer(a: CardAnswer): void {
     if (step) window.hudApi.answerStep(step.id, a);
 }
@@ -318,9 +333,13 @@ function renderCard(): void {
 
     const s = step;
     const heading = stepHeading(s);
+    // Whose question this is, told by the badge rather than by any words in it.
+    card.classList.toggle('app', heading.app !== null);
+    cardApp.hidden = heading.app === null;
     cardProgress.hidden = !heading.progress;
     cardProgress.textContent = heading.progress ?? '';
-    cardKind.textContent = s.mode === 'choice' ? 'The agent asks' : s.mode === 'click' ? 'Point at it' : 'Your step';
+    cardKind.textContent =
+        s.mode === 'choice' ? (heading.app ? 'Confirm' : 'The agent asks') : s.mode === 'click' ? 'Point at it' : 'Your step';
     cardPrompt.textContent = heading.prompt;
     cardTarget.hidden = !s.target;
     cardTarget.textContent = s.target ?? '';

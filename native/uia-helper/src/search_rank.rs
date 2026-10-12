@@ -276,30 +276,33 @@ fn overlap_area(a: &Rect, b: &Rect) -> i64 {
 /// What ties a popup-like window of the target's process to the target.
 #[derive(Clone, Copy, Debug)]
 pub struct PopupLink {
-    /// A Win32 menu (#32768) created by the target's own thread. Menus have no
-    /// owner, but only the thread whose window opened one can create it.
-    pub menu_of_its_thread: bool,
+    /// It belongs to the target: the target ends its owner chain, or it is
+    /// an unowned menu or popup serving the target (windows::served). While
+    /// the target is itself a popup, one belonging to the same window as the
+    /// target does too: a submenu belongs to the window its parent menu does.
+    pub serves: bool,
     /// The target is its owner, directly or up the owner chain.
     pub owned: bool,
 }
 
 /// Whether a popup-like window really belongs to the target.
 ///
-/// Popup-like is not enough on its own. File Explorer windows share
-/// explorer.exe with the taskbar and the desktop, which are captionless,
-/// untitled and topmost too, and were searched as an open menu of every
-/// Explorer window. A real popup is the target's own menu, a window it owns,
-/// or one drawn over it. Overlap is strict: a maximised window only abuts the
-/// taskbar. Nothing that covers most of the display is a popup: that is the
-/// desktop or a shell surface.
-pub fn popup_of(link: PopupLink, rect: &Rect, target: Option<&Rect>, screen: Option<&Rect>) -> bool {
+/// Popup-like is not enough on its own, and neither is the same process or
+/// a popup drawn over the target. File Explorer windows share explorer.exe
+/// with the taskbar and the desktop, which are captionless, untitled and
+/// topmost too; every Chrome window shares a process and a UI thread, so a
+/// Picture-in-Picture video from another, unshared Chrome window sitting on
+/// the target is no part of it. A real popup is linked to the target itself.
+/// Nothing that covers most of the display is a popup, whatever its links:
+/// that is the desktop or a shell surface.
+pub fn popup_of(link: PopupLink, rect: &Rect, screen: Option<&Rect>) -> bool {
     if let Some(s) = screen {
         let area = i64::from(s.width) * i64::from(s.height);
         if area > 0 && overlap_area(rect, s) * 4 >= area * 3 {
             return false;
         }
     }
-    link.menu_of_its_thread || link.owned || target.is_some_and(|t| overlap_area(rect, t) > 0)
+    link.serves || link.owned
 }
 
 /// Why a target has no rect, judged from its top-level window: "closed",
@@ -581,22 +584,20 @@ mod tests {
     #[test]
     fn a_popup_must_belong_to_the_target() {
         let screen = r(0, 0, 1920, 1080);
-        let explorer = r(0, 0, 1920, 1032);
-        let none = PopupLink { menu_of_its_thread: false, owned: false };
+        let none = PopupLink { serves: false, owned: false };
         // The taskbar of the same explorer.exe only abuts a maximised window.
-        assert!(!popup_of(none, &r(0, 1032, 1920, 48), Some(&explorer), Some(&screen)));
-        // A dropdown drawn over the window belongs to it.
-        assert!(popup_of(none, &r(300, 200, 200, 300), Some(&explorer), Some(&screen)));
+        assert!(!popup_of(none, &r(0, 1032, 1920, 48), Some(&screen)));
+        // Drawn over the window is no link: a Picture-in-Picture video of
+        // another window of the same browser sits there too.
+        assert!(!popup_of(none, &r(300, 200, 200, 300), Some(&screen)));
         // A submenu cascading past the window's edge is still its own menu.
-        let small = r(100, 100, 400, 300);
-        let menu = PopupLink { menu_of_its_thread: true, owned: false };
-        assert!(popup_of(menu, &r(520, 120, 200, 300), Some(&small), Some(&screen)));
-        assert!(!popup_of(none, &r(520, 120, 200, 300), Some(&small), Some(&screen)));
-        let owned = PopupLink { menu_of_its_thread: false, owned: true };
-        assert!(popup_of(owned, &r(520, 120, 200, 300), Some(&small), Some(&screen)));
+        let menu = PopupLink { serves: true, owned: false };
+        assert!(popup_of(menu, &r(520, 120, 200, 300), Some(&screen)));
+        let owned = PopupLink { serves: false, owned: true };
+        assert!(popup_of(owned, &r(520, 120, 200, 300), Some(&screen)));
         // The desktop's icon host covers the display, whatever links it has.
-        assert!(!popup_of(menu, &screen, Some(&explorer), Some(&screen)));
-        assert!(!popup_of(none, &r(0, 0, 1920, 1032), Some(&explorer), Some(&screen)));
+        assert!(!popup_of(menu, &screen, Some(&screen)));
+        assert!(!popup_of(owned, &r(0, 0, 1920, 1032), Some(&screen)));
     }
 
     #[test]

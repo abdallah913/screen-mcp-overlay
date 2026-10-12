@@ -36,12 +36,33 @@ export function fakeDesktop() {
 }
 
 /**
+ * `win` put in front of every other window of `desktop`, as the z-order (front
+ * first, the order of `windows`) has it: an existing window moved there (by
+ * ref) with whatever `win` changes, or a new one. What the agent hears about
+ * covers is measured from where shared windows sit, so a test puts one over
+ * its target this way. Returns the desktop.
+ */
+export function onTop(desktop, win) {
+    const at = desktop.windows.findIndex(w => w.ref === win.ref);
+    const was = at >= 0 ? desktop.windows.splice(at, 1)[0] : { class: 'X', pid: 90 + desktop.windows.length, foreground: false, ...flags };
+    desktop.windows.unshift({ ...was, ...win });
+    return desktop;
+}
+
+/**
  * Install the fake helper. Returns `calls` (every op and its params, in order)
  * and the desktop it answers from, which a test may mutate between calls.
+ *
+ * Every window of the fake desktop is shared with the AI, as if the user had
+ * shared it, except one marked `private: true`: privacy tests add those.
  */
 export function fakeHelper(overrides = {}, desktop = fakeDesktop()) {
     const calls = [];
     const { windows, controls, tree } = desktop;
+    harness.resetSharing();
+    // The chat panel, when a test has one: the window with this ref.
+    harness.setHudWindowRef(desktop.hud);
+    for (const w of windows) if (!w.private && w.pid !== process.pid) harness.shareWindow(w);
     const contains = (r, x, y) => x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height;
     const handlers = {
         list_windows: () => windows,
@@ -76,6 +97,11 @@ export function fakeHelper(overrides = {}, desktop = fakeDesktop()) {
             return { scrolled: true, element };
         },
         suggest: p => controls.map(c => ({ name: c.name, role: c.role })).slice(0, p.limit ?? 3),
+        zorder: () =>
+            windows
+                .filter(w => !w.minimized && !w.cloaked)
+                .map(w => ({ ref: w.ref, pid: w.pid, rect: w.rect, owner: w.owner, root_owner: w.root_owner, exe: w.exe })),
+        set_shared: () => null,
         ...overrides
     };
     harness.useHelperTransport(async (op, params) => {

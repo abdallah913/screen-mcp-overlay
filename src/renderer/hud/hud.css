@@ -10,6 +10,8 @@
     --tool: rgba(255, 255, 255, 0.05);
     --danger: #ff6b6b;
     --guide: #ffc43d;
+    /* The app's own questions: a colour no agent's step is drawn in. */
+    --app: #7aa2ff;
     --radius: 14px;
 }
 
@@ -124,6 +126,26 @@ button {
     font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
     padding: 5px 9px;
     border-radius: 7px;
+}
+
+/* What the agent is doing: its tool calls, in its own words. Marked as the
+   agent's by the panel itself, which no text can draw or undo, since they
+   would otherwise look just like the app's own notices around them. */
+.msg.tool .body {
+    border-left: 2px solid rgba(122, 162, 255, 0.45);
+    border-radius: 3px 7px 7px 3px;
+}
+.msg.tool .body::before {
+    content: "AI";
+    display: inline-block;
+    margin-right: 7px;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: rgba(122, 162, 255, 0.18);
+    color: #b7cbff;
+    font-family: system-ui, "Segoe UI", sans-serif;
+    font-size: 10.5px;
+    font-weight: 600;
 }
 
 /* Instructions to the user: what to do next. They read as the main text of
@@ -394,6 +416,35 @@ button {
 #step-kind { text-transform: uppercase; font-weight: 600; }
 #step-time { font-variant-numeric: tabular-nums; }
 #step-show { padding: 1px 7px; font-size: 11px; }
+
+/* The app's own question (asking to share a window): badged and in its own
+   colour, which only the app can ask for (StepView.fromApp). */
+#step-card.app {
+    background: rgba(122, 162, 255, 0.1);
+    border-color: rgba(122, 162, 255, 0.6);
+}
+.app-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px 1px 5px;
+    border-radius: 9px;
+    background: var(--app);
+    color: #0b1838;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    text-transform: none;
+    white-space: nowrap;
+}
+.app-badge[hidden] { display: none; }
+.app-badge svg { width: 12px; height: 12px; flex: none; fill: currentColor; }
+.app-badge svg .tick { fill: none; stroke: var(--app); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.msg.guide.app .body {
+    background: rgba(122, 162, 255, 0.1);
+    border-left-color: var(--app);
+}
+.msg.app .app-badge { margin-right: 7px; vertical-align: 1px; }
 
 #step-prompt {
     font-size: 14.5px;

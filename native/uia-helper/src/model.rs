@@ -38,6 +38,34 @@ pub struct WindowInfo {
     /// packaged app's file picker is owned by the app window that opened it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// The end of the owner chain (GA_ROOTOWNER) when it is not the window
+    /// itself; for an unowned menu or popup, the window it serves (see
+    /// windows::served). What the client follows to share a window's dialogs
+    /// and menus along with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_owner: Option<String>,
+    /// The process's executable, lowercased file name ("notepad.exe"), for
+    /// the user's sharing choices. Absent when Windows will not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+}
+
+/// One visible top-level window in z-order, front first, unfiltered by title,
+/// size or style: what decides which window a screen pixel belongs to, for
+/// masking captures. Internal to the client, never meant for the agent.
+#[derive(Serialize)]
+pub struct StackWindow {
+    pub r#ref: String,
+    pub pid: u32,
+    /// DWM extended frame bounds: what is drawn, without the invisible border.
+    pub rect: Rect,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// As in WindowInfo, including the window an unowned menu serves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
 }
 
 /// The control that contains a hidden match: what must be opened first.
@@ -142,6 +170,8 @@ pub struct Resolved {
     pub offscreen: bool,
 }
 
+/// What element_at_point reports of the window under the point. Only ever a
+/// shared one: a point on any other window reports no window at all.
 #[derive(Serialize)]
 pub struct WindowRef {
     pub r#ref: String,
@@ -161,15 +191,19 @@ pub struct Coverage {
     /// Fraction of sample points whose top-level window is not the target, 0..1.
     pub fraction: f32,
     pub centre_covered: bool,
-    /// Titles of the covering windows, nearest first.
+    /// Names of the covering windows, most covering first: a shared window's
+    /// title, the chat panel's phrase, or "another window" for any window
+    /// that is not shared (once, however many there are).
     pub by: Vec<String>,
 }
 
 #[derive(Serialize)]
 pub struct PrintResult {
     pub rect: Rect,
-    /// PrintWindow refused and the pixels came from the screen instead, so
-    /// anything covering the window is in the image.
+    /// PrintWindow refused and the pixels came from the screen instead. Any
+    /// part a window that is not shared covered is painted flat (the mask
+    /// colour, as is the margin outside the window's frame); a shared window
+    /// on top of it stays in the image.
     pub fallback: bool,
 }
 

@@ -39,4 +39,10 @@ export interface AgentProvider {
 
     /** Stop the in-flight turn, if any. */
     interrupt(): Promise<void>;
+
+    /**
+     * End the conversation (the panel's New): the next send starts a new one,
+     * and nothing of this one, the shared windows it saw included, is kept.
+     */
+    reset(): Promise<void>;
 }

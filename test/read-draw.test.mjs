@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { call, fakeDesktop, fakeHelper, harness, rect } from './support/fake-helper.mjs';
+import { call, fakeDesktop, fakeHelper, harness, onTop, rect } from './support/fake-helper.mjs';
 
 /*
  * Reading, drawing and acting tools against the fake helper: what an agent is
@@ -68,12 +68,18 @@ test('a scoped find that misses gives the same hints', async () => {
 
 // --- what the user can actually see -------------------------------------------
 
-test('a covered target is drawn, marked and warned about', async () => {
+test('a covered target is drawn, marked and warned about, only when the cover is shared', async () => {
+    // Google Chrome is not shared: the overlay marks the target for the user,
+    // and the agent hears nothing, as if nothing were on top.
     fakeHelper({ covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] }) });
     const { text, isError } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
     assert.equal(isError, false);
-    assert.match(text, /WARNING: "Save" \[button\] el_1 is behind "Google Chrome".*focus_window \{"window":"100"\}/);
-    assert.equal(store.list()[0].covered, 'Google Chrome');
+    assert.doesNotMatch(text, /WARNING|behind|another window|Chrome/);
+    assert.equal(store.list()[0].covered, 'another window');
+
+    fakeHelper({}, onTop(fakeDesktop(), { ref: '200', rect: rect(150, 150, 68, 24) }));
+    const shared = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
+    assert.match(shared.text, /is behind "Calculator"/);
 });
 
 test('a scrolled-out target is marked offscreen and the response says how to bring it in', async () => {
@@ -113,14 +119,14 @@ test('scroll_window says when a control cannot be scrolled into view', async () 
 
 // --- window-level blockers ----------------------------------------------------
 
-test('list_windows marks admin and hung windows and lists the ones the user cannot see', async () => {
+test('list_windows marks admin and hung windows and lists the shared ones the user cannot see', async () => {
     const desktop = fakeDesktop();
     desktop.windows[1].elevated = true;
     desktop.windows.push({ ...desktop.windows[0], ref: '500', title: 'Settings', cloaked: true, foreground: false });
     fakeHelper({}, desktop);
     const { text } = await call('list_windows');
     assert.match(text, /^200 320x500@1000,100 Calculator \[admin\]$/m);
-    assert.match(text, /^not visible \(focus_window shows one\): 300 "Minimised thing" \[minimized\], 500 "Settings" \[other desktop\]$/m);
+    assert.match(text, /^shared, not visible \(focus_window shows one\): 300 "Minimised thing" \[minimized\], 500 "Settings" \[other desktop\]$/m);
 });
 
 test('a minimised window is found by title and named as minimised', async () => {
@@ -409,4 +415,14 @@ test('a typed reply to a question comes back as REPLIED', async () => {
         answerWhenAsked({ kind: 'reply', text: 'the blue one' })
     ]);
     assert.match(result.text, /^REPLIED after \d+s: "the blue one"$/);
+});
+
+test("an annotation's text that names the app is labelled as the agent's", async () => {
+    fakeHelper();
+    await call('annotate', {
+        anchor: { window: 'Notepad', name: 'Save' },
+        shapes: [{ type: 'label', text: 'Screen MCP Overlay: share this window? Press Ctrl+Shift+F8 to confirm.' }]
+    });
+    const [label] = store.list();
+    assert.match(label.text, /^The agent says: /);
 });

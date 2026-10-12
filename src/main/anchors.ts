@@ -1,16 +1,24 @@
 import { screen } from 'electron';
 import type { AnchorSelector, AnchorSpec, Annotation, Point, Rect } from '../shared/types.js';
-import { rankMatches, recoveredMatch } from '../shared/uitree.js';
+import { clean, rankMatches, recoveredMatch } from '../shared/uitree.js';
+import { coveredFraction, intersect } from '../shared/visible.js';
 import { coverVerdict } from '../shared/windows.js';
+import { onSharingChanged, sharedOf, sharedWindows, wasRevoked } from './sharing.js';
 import { store } from './store.js';
 import {
     coverage,
     findElements,
+    hudWindowRef,
     knownControl,
+    listAllWindows,
     resolveRefs,
     selectorForRef,
+    windowStack,
+    type Coverage,
     type ElementInfo,
-    type ResolvedRef
+    type ResolvedRef,
+    type StackWindow,
+    type WindowInfo
 } from './uia.js';
 
 /**
@@ -154,6 +162,145 @@ export async function findRanked(selector: AnchorSelector, within?: Rect): Promi
 function homeWindow(spec: AnchorSpec): string | undefined {
     return spec.kind === 'window' ? spec.ref : (spec.selector?.window ?? knownControl(spec.ref)?.selector.window);
 }
+
+/** The top-level window an anchored drawing belongs to, when known: what sharing is judged on. */
+export function anchoredWindow(a: Annotation): string | undefined {
+    return a.anchor ? homeWindow(a.anchor) : undefined;
+}
+
+// ------------------------------------------------------------------ sharing
+
+/** How the helper names the chat panel when it is what covers a target. */
+export const PANEL_COVER = "the overlay's chat panel";
+
+/** What a covering window that is not shared is called: it says nothing about it. */
+export const ANOTHER_WINDOW = 'another window';
+
+/**
+ * Covering windows as they may be named anywhere: a shared window by its
+ * title (its own popups as "a popup of" it), the chat panel as the panel,
+ * anything else as "another window", said once however many there are. An
+ * untitled cover stays empty, which callers read as an open menu or tooltip
+ * rather than a cover. Coverage is measured over every window, since anything
+ * can sit on top of a shared one; only its wording is limited to what the
+ * user shared. This is for the overlay, which shows the user what hides a
+ * target; what the agent hears is sharedCoverage.
+ */
+export function safeCoverNames(by: readonly string[], shared: readonly Pick<WindowInfo, 'title'>[]): string[] {
+    const titles = new Set(shared.map(w => clean(w.title)).filter(Boolean));
+    const out: string[] = [];
+    for (const t of by) {
+        const name = clean(t);
+        const popupOf = /^a popup of (.+)$/.exec(name)?.[1];
+        const known = name === PANEL_COVER || titles.has(name) || (popupOf !== undefined && titles.has(popupOf));
+        const safe = !name ? '' : known ? name : ANOTHER_WINDOW;
+        if (!safe || !out.includes(safe)) out.push(safe);
+    }
+    return out;
+}
+
+/**
+ * How covered `window` (or `rect` in it) is, as the agent may hear it:
+ * measured over shared windows and the chat panel alone, from where they sit
+ * in the z-order, as if nothing else were open. A window the user did not
+ * share changes neither the figures nor the names, wherever it is: the
+ * helper's own measurement looks at the screen, where a private window over
+ * a shared cover hides it, so a warning that came and went with it, or a
+ * figure that moved, traced where it was. Untitled windows (a menu, a
+ * tooltip) are no cover, as for the helper. Null when the target is not on
+ * screen.
+ */
+export function sharedCoverage(
+    window: string,
+    rect: Rect | undefined,
+    stack: readonly StackWindow[],
+    shared: readonly Pick<WindowInfo, 'ref' | 'title'>[],
+    panel?: string
+): Coverage | null {
+    const at = stack.findIndex(w => w.ref === window);
+    if (at < 0) return null;
+    const area = rect ?? stack[at]!.rect;
+    if (area.width <= 0 || area.height <= 0) return null;
+    const covers: { name: string; rect: Rect; over: number }[] = [];
+    for (const w of stack.slice(0, at)) {
+        const s = shared.find(x => x.ref === w.ref);
+        const name = s ? clean(s.title) : panel !== undefined && w.ref === panel ? PANEL_COVER : '';
+        const over = name ? intersect(w.rect, area) : null;
+        if (over) covers.push({ name, rect: w.rect, over: over.width * over.height });
+    }
+    const cx = area.x + area.width / 2;
+    const cy = area.y + area.height / 2;
+    const by: string[] = [];
+    for (const c of [...covers].sort((a, b) => b.over - a.over)) if (!by.includes(c.name)) by.push(c.name);
+    return {
+        fraction: coveredFraction(area, covers.map(c => c.rect)),
+        centre_covered: covers.some(c => cx >= c.rect.x && cx < c.rect.x + c.rect.width && cy >= c.rect.y && cy < c.rect.y + c.rect.height),
+        by
+    };
+}
+
+/**
+ * sharedCoverage read now. The window stack and the shared list are read
+ * every time, whatever is on top, so the round trips say nothing either.
+ * Null when it could not be read: a failed read costs the caller nothing.
+ */
+export async function agentCoverage(window: string, rect?: Rect): Promise<Coverage | null> {
+    try {
+        const [stack, shared] = await Promise.all([windowStack(), sharedWindows()]);
+        return sharedCoverage(window, rect, stack, shared, hudWindowRef());
+    } catch {
+        return null;
+    }
+}
+
+/** coverVerdict for the agent, from sharedCoverage. */
+export function agentCoverVerdict(c: Coverage | null): string | null {
+    return c && c.by.length > 0 ? coverVerdict(c) : null;
+}
+
+/**
+ * coverVerdict for the overlay, which tells the user what hides a target,
+ * a private window included, as "another window" (see safeCoverNames). No
+ * tool reports it: the agent hears agentCoverVerdict.
+ */
+export function screenCoverVerdict(c: Coverage, shared: readonly Pick<WindowInfo, 'title'>[]): string | null {
+    return coverVerdict({ ...c, by: safeCoverNames(c.by, shared) });
+}
+
+/**
+ * The user stopped sharing something. Drawings on a window that is still open
+ * but no longer shared go, as does what was read from it (tree snapshots,
+ * captures): the agent must not keep following, describing or diffing a
+ * window it can no longer see. A window that closed while shared keeps its
+ * drawings: the tracker hides them, and says the window closed, as it always
+ * has. One the user stopped sharing goes even if it has closed by the time
+ * the list is read (wasRevoked): kept, its drawing would later read "its
+ * window was closed", telling the agent when a window it was denied closed.
+ */
+async function forgetUnshared(): Promise<void> {
+    let open: WindowInfo[];
+    try {
+        // Not windowsWithSharing: a listener only judges, and must not prune
+        // shares itself (that announces again, from inside an announcement).
+        open = await listAllWindows();
+    } catch {
+        // The helper is down, so nothing is drawn or read anyway; the next
+        // change, or the helper's own refusal, catches up with the rest.
+        // What the user stopped sharing goes now all the same.
+        open = [];
+    }
+    const visible = new Set(sharedOf(open).map(w => w.ref));
+    const unshared = new Set(open.map(w => w.ref).filter(ref => !visible.has(ref)));
+    const hidden = (ref: string): boolean => unshared.has(ref) || wasRevoked(ref);
+    const gone = store.anchored().filter(a => {
+        const home = anchoredWindow(a);
+        return home !== undefined && hidden(home);
+    });
+    if (gone.length > 0) store.clear(gone.map(a => a.id));
+    store.forgetWindows(hidden);
+}
+
+onSharingChanged(() => void forgetUnshared());
 
 /** The top-level window a target lives in, when known: what coverage is measured against. */
 function targetWindow(spec: AnchorSpec): string | undefined {
@@ -343,6 +490,14 @@ async function refreshCoverage(
 
     const out = new Map<string, string | null>();
     const byTarget = new Map<string, Promise<string | null | undefined>>();
+    // Annotation.covered is the overlay's note to the user, and no tool
+    // reports it, so a private window on top shows there too, as "another
+    // window". It is drawn on screen, where a capture could hold it, so it
+    // still names nothing the user did not share. The shared list is read
+    // only when something covers.
+    let sharedNow: Promise<WindowInfo[]> | undefined;
+    const named = async (c: Coverage): Promise<string | null> =>
+        coverVerdict(c) === null ? null : screenCoverVerdict(c, await (sharedNow ??= sharedWindows().catch(() => [])));
     for (const a of anchored) {
         const spec = a.anchor!;
         const live = byRef.get(spec.ref);
@@ -359,7 +514,7 @@ async function refreshCoverage(
                 spec.kind === 'window' ? undefined : live.rect,
                 spec.kind === 'window' ? undefined : (knownControl(spec.ref)?.selector.role ?? spec.selector?.role)
             )
-                .then(coverVerdict)
+                .then(named)
                 .catch(() => undefined);
             byTarget.set(key, verdict);
         }

@@ -9,20 +9,25 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use windows::core::{BOOL, HRESULT};
-use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, HWND, LPARAM, RECT, TRUE};
+use windows::core::{BOOL, HRESULT, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
+    EnumWindows, GetAncestor, GetDesktopWindow, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow,
+    GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow,
+    IsIconic, IsWindowVisible, GA_ROOT, GA_ROOTOWNER, GUITHREADINFO, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_CAPTION,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use crate::model::{Rect, WindowInfo};
+use crate::model::{Rect, StackWindow, WindowInfo};
 
 pub fn rect_of(hwnd: HWND) -> Option<Rect> {
     // The DWM frame bounds exclude the invisible resize border that
@@ -90,6 +95,158 @@ pub fn class_of(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..n as usize])
+}
+
+pub fn pid_of(hwnd: HWND) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
+/// A window handle as the wire carries it.
+pub fn ref_of(hwnd: HWND) -> String {
+    format!("{}", hwnd.0 as isize)
+}
+
+/// The window's direct owner, if it has one.
+pub fn owner_of(hwnd: HWND) -> Option<HWND> {
+    unsafe { GetWindow(hwnd, GW_OWNER) }.ok().filter(|o| !o.is_invalid())
+}
+
+/// Classes of the shell's own surfaces: the desktop and its icon host, and
+/// the taskbars. They are never anyone's window to share, whatever process
+/// or owner they have; File Explorer shares explorer.exe with all of them.
+const SHELL_CLASSES: &[&str] = &["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+
+pub fn is_shell(hwnd: HWND) -> bool {
+    let desktop = unsafe { hwnd == GetDesktopWindow() || hwnd == GetShellWindow() };
+    desktop || SHELL_CLASSES.contains(&class_of(hwnd).as_str())
+}
+
+/// The class of a Win32 menu window.
+pub const MENU_CLASS: &str = "#32768";
+
+/// True when two rects share some area (touching edges do not count).
+pub fn overlaps(a: &Rect, b: &Rect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+/// The top-level window an unowned menu or popup is part of, when that can
+/// be told: a Win32 menu (#32768) or a captionless untitled popup has no
+/// owner, so its owner chain cannot say which window opened it.
+///
+/// A menu belongs to the window running the menu loop on its thread
+/// (hwndMenuOwner). Failing that, a popup is taken as its thread's active
+/// window's only when it is drawn over that window: one UI thread can serve
+/// several windows (every Chrome window, every Explorer window), and the
+/// active one is merely the one last used, which may not be what opened it.
+pub fn served(hwnd: HWND) -> Option<HWND> {
+    if owner_of(hwnd).is_some() {
+        return None;
+    }
+    let menu = class_of(hwnd) == MENU_CLASS;
+    if !menu {
+        let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+        let popup = style & WS_POPUP.0 != 0 && style & WS_CAPTION.0 != WS_CAPTION.0;
+        if !popup || !title_of(hwnd).trim().is_empty() {
+            return None;
+        }
+    }
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread == 0 {
+        return None;
+    }
+    let mut info = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    unsafe { GetGUIThreadInfo(thread, &mut info) }.ok()?;
+    let root = |h: HWND| -> Option<HWND> {
+        if h.is_invalid() {
+            return None;
+        }
+        let r = unsafe { GetAncestor(h, GA_ROOT) };
+        let r = if r.is_invalid() { h } else { r };
+        (r != hwnd).then_some(r)
+    };
+    if menu {
+        if let Some(owner) = root(info.hwndMenuOwner) {
+            return Some(owner);
+        }
+    }
+    let active = root(info.hwndActive)?;
+    overlaps(&rect_of(hwnd)?, &rect_of(active)?).then_some(active)
+}
+
+/// The window this one belongs to: the end of its owner chain when it has
+/// owners, else the window it serves as a menu or popup (see served).
+pub fn root_owner_of(hwnd: HWND) -> Option<HWND> {
+    let ro = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+    if !ro.is_invalid() && ro != hwnd {
+        return Some(ro);
+    }
+    served(hwnd)
+}
+
+// -------------------------------------------------------------- identity
+
+/// The lowercased file name at the end of an image path, "chrome.exe" from
+/// "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".
+fn file_name(path: &str) -> Option<String> {
+    let name = path.rsplit(['\\', '/']).next()?.trim();
+    (!name.is_empty()).then(|| name.to_lowercase())
+}
+
+/// The process's creation time: what tells a reused pid from the process
+/// that had it before.
+fn created(process: HANDLE) -> Option<u64> {
+    let (mut born, mut exit, mut kernel, mut user) =
+        (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    unsafe { GetProcessTimes(process, &mut born, &mut exit, &mut kernel, &mut user) }.ok()?;
+    Some((u64::from(born.dwHighDateTime) << 32) | u64::from(born.dwLowDateTime))
+}
+
+fn image_name(process: HANDLE) -> Option<String> {
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) }.ok()?;
+    file_name(&String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]))
+}
+
+/// Cached executable names kept at most; the cache is simply emptied past it.
+const EXE_CACHE_LIMIT: usize = 1024;
+
+thread_local! {
+    /// Per pid, with the process's creation time, so a pid Windows hands to a
+    /// new process is never taken for the old one's executable: whole-app
+    /// sharing goes by this name.
+    static EXES: RefCell<HashMap<u32, (u64, Option<String>)>> = RefCell::new(HashMap::new());
+}
+
+/// The process's executable, lowercased file name; None when Windows will
+/// not open the process to say (a protected one) or it has exited.
+pub fn exe_of(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let born = created(process);
+    let known = born.and_then(|b| EXES.with(|c| c.borrow().get(&pid).filter(|(t, _)| *t == b).map(|(_, e)| e.clone())));
+    let exe = match known {
+        Some(e) => e,
+        None => {
+            let e = image_name(process);
+            if let Some(b) = born {
+                EXES.with(|c| {
+                    let mut c = c.borrow_mut();
+                    if c.len() >= EXE_CACHE_LIMIT {
+                        c.clear();
+                    }
+                    c.insert(pid, (b, e.clone()));
+                });
+            }
+            e
+        }
+    };
+    let _ = unsafe { CloseHandle(process) };
+    exe
 }
 
 // ------------------------------------------------------------- elevation
@@ -205,6 +362,21 @@ pub fn is_elevated(pid: u32) -> bool {
 
 static mut COLLECTED: Vec<WindowInfo> = Vec::new();
 
+thread_local! {
+    /// Executable names already read during the current enumeration, by pid:
+    /// a browser has dozens of windows and one process.
+    static SEEN_EXES: RefCell<HashMap<u32, Option<String>>> = RefCell::new(HashMap::new());
+}
+
+fn exe_once(pid: u32) -> Option<String> {
+    if let Some(known) = SEEN_EXES.with(|s| s.borrow().get(&pid).cloned()) {
+        return known;
+    }
+    let exe = exe_of(pid);
+    SEEN_EXES.with(|s| s.borrow_mut().insert(pid, exe.clone()));
+    exe
+}
+
 unsafe extern "system" fn enum_proc(hwnd: HWND, _: LPARAM) -> BOOL {
     if !IsWindowVisible(hwnd).as_bool() {
         return TRUE;
@@ -238,15 +410,18 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _: LPARAM) -> BOOL {
         cloaked: is_cloaked(hwnd),
         elevated: is_elevated(pid),
         hung: is_hung(hwnd),
-        owner: GetWindow(hwnd, GW_OWNER)
-            .ok()
-            .filter(|o| !o.is_invalid())
-            .map(|o| format!("{}", o.0 as isize)),
+        owner: owner_of(hwnd).map(ref_of),
+        root_owner: root_owner_of(hwnd).map(ref_of),
+        exe: exe_once(pid),
     });
     TRUE
 }
 
+/// Every titled, sizeable top-level window, shared or not. The client needs
+/// them all to decide (what opened, what covers what, what the user may
+/// share) and filters what reaches the agent itself.
 pub fn list_windows() -> Vec<WindowInfo> {
+    SEEN_EXES.with(|s| s.borrow_mut().clear());
     let listed = unsafe {
         #[allow(static_mut_refs)]
         {
@@ -259,6 +434,38 @@ pub fn list_windows() -> Vec<WindowInfo> {
     let live: HashSet<u32> = listed.iter().map(|w| w.pid).collect();
     ELEVATED.with(|c| c.borrow_mut().retain(|pid, _| live.contains(pid)));
     listed
+}
+
+unsafe extern "system" fn stack_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let out = &mut *(lparam.0 as *mut Vec<StackWindow>);
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || is_cloaked(hwnd) {
+        return TRUE;
+    }
+    let Some(rect) = rect_of(hwnd) else { return TRUE };
+    if rect.width <= 0 || rect.height <= 0 {
+        return TRUE;
+    }
+    let pid = pid_of(hwnd);
+    out.push(StackWindow {
+        r#ref: ref_of(hwnd),
+        pid,
+        rect,
+        owner: owner_of(hwnd).map(ref_of),
+        root_owner: root_owner_of(hwnd).map(ref_of),
+        exe: exe_once(pid),
+    });
+    TRUE
+}
+
+/// Every visible top-level window on this desktop, front first (EnumWindows
+/// walks the z-order from the top), with no filter on title, style or size:
+/// tooltips, toasts, menus and the taskbar draw over shared windows as much
+/// as any app does, so masking a capture needs them all.
+pub fn zorder() -> Vec<StackWindow> {
+    SEEN_EXES.with(|s| s.borrow_mut().clear());
+    let mut out: Vec<StackWindow> = Vec::new();
+    let _ = unsafe { EnumWindows(Some(stack_proc), LPARAM(&mut out as *mut Vec<StackWindow> as isize)) };
+    out
 }
 
 #[cfg(test)]
@@ -285,5 +492,29 @@ mod tests {
     #[test]
     fn an_unknown_process_is_not_called_elevated() {
         assert!(!outranks(Integrity::Unknown, MEDIUM_INTEGRITY));
+    }
+
+    #[test]
+    fn an_exe_is_the_lowercased_file_name() {
+        assert_eq!(
+            file_name(r"C:\Program Files\Google\Chrome\Application\Chrome.EXE").as_deref(),
+            Some("chrome.exe")
+        );
+        assert_eq!(file_name(r"\\?\C:\Windows\notepad.exe").as_deref(), Some("notepad.exe"));
+        assert_eq!(file_name("excel.exe").as_deref(), Some("excel.exe"));
+        assert_eq!(file_name(r"C:\odd\"), None);
+        assert_eq!(file_name(""), None);
+    }
+
+    #[test]
+    fn only_shared_area_is_overlap() {
+        let r = |x, y, width, height| Rect { x, y, width, height };
+        let window = r(100, 100, 400, 300);
+        assert!(overlaps(&r(300, 200, 50, 50), &window));
+        assert!(overlaps(&r(450, 350, 200, 200), &window));
+        // A popup that only abuts the window is not drawn over it.
+        assert!(!overlaps(&r(500, 100, 100, 100), &window));
+        assert!(!overlaps(&r(100, 400, 400, 40), &window));
+        assert!(!overlaps(&r(0, 0, 0, 0), &window));
     }
 }

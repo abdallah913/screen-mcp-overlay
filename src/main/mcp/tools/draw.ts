@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Annotation } from '../../../shared/types.js';
+import { anchoredWindow } from '../../anchors.js';
+import { wasRevoked, windowsWithSharing } from '../../sharing.js';
 import { store } from '../../store.js';
 import { SHAPE_TYPES, guarded, text } from './common.js';
 import { anchorNotes, ids, placeAnchored, placeFixed, resolveAnchor, stepRange } from './anchoring.js';
@@ -77,12 +79,12 @@ export function registerDraw(server: McpServer): void {
                     return text(
                         `Drew ${ids(created)}${stepRange(created)} on ${target.label}; they follow it.${ttl}` +
                             anchorNotes(target) +
-                            hiddenNote()
+                            (await hiddenNote())
                     );
                 }
                 const { created, display, capture } = placeFixed(args, args.shapes);
                 const from = capture ? ` (from ${capture.id})` : '';
-                return text(`Drew ${ids(created)}${stepRange(created)} on display ${display.id}${from}.${ttl}${hiddenNote()}`);
+                return text(`Drew ${ids(created)}${stepRange(created)} on display ${display.id}${from}.${ttl}${await hiddenNote()}`);
             })
     );
 
@@ -94,10 +96,13 @@ export function registerDraw(server: McpServer): void {
             description: 'Remove drawings: the given ids, or all.',
             inputSchema: { ids: z.array(z.string()).optional() }
         },
-        async args => {
-            const n = store.clear(args.ids);
-            return text(`Cleared ${n}; ${store.list().length} remain.${hiddenNote()}`);
-        }
+        // Guarded like every tool that reads the window list: its note on
+        // hidden drawings can land just as the user stops a share.
+        args =>
+            guarded('clear_annotations', async () => {
+                const n = store.clear(args.ids);
+                return text(`Cleared ${n}; ${store.list().length} remain.${await hiddenNote()}`);
+            })
     );
 }
 
@@ -120,9 +125,22 @@ const HIDDEN_WHY: Record<NonNullable<Annotation['hiddenReason']> | 'unknown', st
  * guidance is on screen unless something says otherwise. Each reason gets its
  * own line, since each has a different fix.
  */
-function hiddenNote(): string {
+async function hiddenNote(): Promise<string> {
     const now = Date.now();
-    const gone = store.list().filter(a => a.hidden && a.hiddenSince !== undefined && now - a.hiddenSince > HIDDEN_NOTE_MS);
+    const hidden = store.list().filter(a => a.hidden && a.hiddenSince !== undefined && now - a.hiddenSince > HIDDEN_NOTE_MS);
+    if (hidden.length === 0) return '';
+    // Whether a window is minimised or on another desktop is the user's
+    // business once they stop sharing it. Its drawings are cleared when that
+    // happens (anchors.ts); this covers the moment in between. A window that
+    // closed while shared is no longer anyone's, and "closed" stays the
+    // useful answer; one the user stopped sharing first is never reported.
+    const lists = await windowsWithSharing().catch(() => undefined);
+    const gone = hidden.filter(a => {
+        const home = anchoredWindow(a);
+        if (home === undefined) return true;
+        if (!lists || wasRevoked(home)) return false;
+        return !lists.all.some(w => w.ref === home) || lists.shared.some(w => w.ref === home);
+    });
     if (gone.length === 0) return '';
     const byReason = new Map<keyof typeof HIDDEN_WHY, Annotation[]>();
     for (const a of gone) {

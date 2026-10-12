@@ -5,6 +5,7 @@ is the reasoning, the measurements and the things that turned out to be harder t
 
 ## Contents
 
+- [Sharing](#sharing--nothing-is-visible-until-the-user-shares-it)
 - [Cheap first, screenshots on escalation](#cheap-first-screenshots-on-escalation)
 - [Driving a walkthrough](#driving-a-walkthrough)
 - [Talking back](#talking-back)
@@ -22,6 +23,108 @@ is the reasoning, the measurements and the things that turned out to be harder t
 - [Status and limitations](#status)
 
 ---
+
+## Sharing — nothing is visible until the user shares it
+
+The first version saw every window on the desktop. An agent asked to help with a spreadsheet could
+list the video playing on the side, read its title, screenshot it and OCR it, and nothing the user did
+could stop that short of closing the video. Now **nothing is visible to an agent until the user shares
+it**, and a window that is not shared is indistinguishable from a window that is not open.
+[sharing.ts](../src/main/sharing.ts) holds the rule; every tool goes through it.
+
+**What can be shared.** One window, for the session or until it closes, or a whole app, kept in
+settings (`sharedApps`, by executable name). A window share is bound to the window's process as well as
+its handle, because Windows recycles handles: a share must not pass to whatever window gets the number
+next. Whole-app sharing is not offered for browsers, Explorer, `ApplicationFrameHost` (every packaged
+app) and shared runtimes such as `java.exe` and `python.exe`: their windows are unrelated things to the
+user, and "all Chrome windows" would share the video along with the web app.
+
+**Owned windows come along; same-process windows do not.** A shared window brings every window whose
+owner chain reaches it: its menus, its dialogs, and the file picker another process opens for it (a
+packaged app's picker is owned by the app's window). Every walkthrough needs those, and the user can see
+they came from the window they shared. A second top-level window of the same process does not come
+along, because to the user it is a different thing, and in a browser it may be the video.
+
+**How the user shares.** Three ways, all owned by the app rather than the agent:
+
+- **The share key** (`shareKey`, `Ctrl+Shift+F8`) shares the window in front once the user confirms
+  it, or stops sharing it. The confirmation is a native dialog naming the window and its app, with
+  *Don't share* as the default: an agent's step can say "press Ctrl+Shift+F8 to continue" while the
+  user is in a window they would never share, and a page can title itself "Untitled - Notepad". It is
+  not a step, because replacing an agent's open step would tell the agent the key was pressed. The key
+  is held for the whole session, unlike the step keys, because sharing comes before an agent asks.
+  It is never allowed to be one of the overlay's own chords.
+- **`list_windows {ask: "<why>"}`** puts two steps on screen: click into the window you mean and press
+  Done, then confirm what is about to be shared (this window, all of the app's windows where that is
+  offered, or don't share). The agent never names a window. A request that matched the agent's guess
+  against titles would answer the question by whether a prompt appeared, so the user picks instead,
+  and the agent learns only what they chose. Both steps say they come from the overlay, the agent's
+  reason is quoted as its words, and only Done followed by a button shares anything: a typed reply,
+  Skip, a timeout or another step taking over all share nothing.
+- **The tray menu** lists what is shared (each item unchecks to stop it) and has *Stop sharing
+  everything*. It is the one sharing UI that also works for someone who only uses a terminal agent.
+
+**One refusal.** Every window parameter resolves through `resolveWindowInfo` against the shared
+windows only. Whatever the reason a window cannot be had, an unshared window, a closed one or a made-up
+ref, the agent gets the same text:
+
+```
+no shared window matches "YouTube". Shared: 100 "Budget.xlsx - Excel". Windows stay private until the
+user shares them; list_windows with ask:"<why you need it>" asks the user to share one.
+```
+
+It may echo the agent's own query, and lists shared windows only. It is decided locally, before any
+helper round trip, so it takes about as long for a window that is open as for one that is not. The
+helper's own state words (minimised, not responding, other desktop, elevated) are given only for a
+shared window: for any other they would say it exists. Each refusal posts a line in the panel ("An
+agent asked for "YouTube", which you have not shared"), so a request for an app the user did not share
+is never silent; agents never see those lines.
+
+**Full access inside, nothing derived outside.** Deciding what covers a control, what opened during a
+step, which window a screen pixel belongs to and whether a shared window closed all need every window,
+so the full list is still read (`listAllWindows`, `windowStack`). What is derived from an unshared
+window may decide behaviour but never wording: it is "another window" at most, with no title, count or
+timing. A step whose `until` would be met by an unshared window does not see it; a window that opened
+or closed unshared is simply not in the After block.
+
+**Composed captures.** A screen grab holds every window, and even with the rest painted over, the
+hole a covering window leaves traces its outline. So a capture of a display or a region is never a
+screen grab: it is composed ([capture.ts](../src/main/capture.ts),
+[visible.ts](../src/shared/visible.ts)) on a blank canvas from each shared window's own render, back to
+front in z-order, so nothing of any other window (pixels, outline, drop shadow, rounded corners), the
+desktop, the taskbar, a notification or the overlay is ever read. Nothing is copied from the screen
+at all, by the app or by the helper: a shared window that cannot render itself (some GPU and DirectX
+surfaces) is left blank, with one fixed note. A screen copy holds whatever is in front of a window or
+shows through it, and masking that out by z-order still left the masks' shapes, their timing and the
+windows `EnumWindows` order does not place (Start, notifications, Alt+Tab's thumbnails) to chance.
+Images are composed at full resolution, before OCR, before shrinking and before anything is written to
+disk, under names an agent cannot guess.
+
+**Nothing in the wording either.** Which window has focus is not reported, and "foreground" means the
+frontmost shared window, so nothing says whether the user is working in an unshared app. Coverage, as
+the agent hears it, is measured over shared windows and the chat panel alone, from where they sit in
+the z-order (`sharedCoverage` in [anchors.ts](../src/main/anchors.ts)), as if nothing else were open.
+The helper's own measurement samples the screen, where a private window over a shared cover hides it,
+so a warning that came and went, or a figure that moved, traced the private window. The overlay's
+note to the user still uses the screen. A tool call during which the
+user stops sharing anything returns one fixed sentence and nothing it read, and a window the user
+stopped sharing is never reported again, not even when it closes. `since=` baselines of a window are
+dropped when its share ends and are refused if older than its current share.
+
+**The helper refuses on its own as well.** `set_shared` tells the Rust helper what is shared, and it
+refuses raw window handles and element refs outside that set, so a check the TypeScript side misses (a
+numeric ref, an `el_` ref minted earlier) still reaches nothing. The TypeScript checks come first, so
+the helper is a backstop, not the gate.
+
+**Stopping a share.** It takes effect at once, and deletes the capture files on disk, which an agent
+that kept a path could otherwise read back. It cannot take back what an agent already saw: that stays in
+its conversation and transcript, and the panel says so when the user stops sharing.
+
+**What sharing cannot hide.** A shared browser window exposes its tab strip, so other tabs' titles are
+readable, and switching that window to another tab shows it. Acrylic and Mica backdrops show a blurred
+version of what is behind a shared window. Sizes and positions of shared windows are visible by design.
+And an agent with its own shell or file access can read the screen outside this server entirely; the
+README says so plainly.
 
 ## Cheap first, screenshots on escalation
 
@@ -85,16 +188,10 @@ and you got the window in front — under the right name, so it looked correct a
 confidently. Verified by deliberately covering a window 72% and capturing it: the render shows the
 target, and the covering window does not appear at all.
 
-`asRendered: true` gives the old behaviour when you genuinely want what the user sees, occlusions
-included. It reports how much is covered and by what:
-
-```
-WARNING: about 72% of this window is covered by Xelqore-ml studio — Visual Studio Code.
-Those pixels belong to the covering window, not this one. Drop asRendered, or call focus_window first.
-```
-
-The overlay's own windows are excluded from that calculation — they span the whole screen, so
-counting them would report every window as fully covered, always.
+`asRendered: true` gives what the user sees, occlusions included, as far as sharing allows: the
+window and the shared windows in front of it, each from its own render. A window that is not shared
+is not in the picture at all, and not in the wording: how much of the window is covered is said only
+for shared windows and the chat panel, so the answer does not change as an unshared window moves.
 
 ### Deltas
 
@@ -133,7 +230,8 @@ indents and misrepresents the structure.
 
 ### Naming windows
 
-Every `window` parameter takes a ref, a title substring, or `"foreground"`. Before that, the first move
+Every `window` parameter takes a ref, a title substring, or `"foreground"`, matched against the shared
+windows only; `"foreground"` is the frontmost shared window, never whatever the user is in. Before that, the first move
 of almost every task was `list_windows`: a whole round trip, plus a response that grows by a line per open
 window, just to learn a number to pass to the next call. Now an agent goes straight to
 `describe_window {window: "Notepad"}`.
@@ -141,8 +239,10 @@ window, just to learn a number to pass to the next call. Now an agent goes strai
 Matching is in [src/shared/windows.ts](../src/shared/windows.ts): an exact title beats a substring, and
 among several matches the foreground window wins, then the frontmost (the list arrives in z-order). It
 guesses rather than reporting "ambiguous" because the chosen window's title is in every response, so a
-wrong guess is visible and cheap to correct. No match is an error that lists the open windows, so the
-agent can correct itself without a separate `list_windows`. A numeric ref skips the window list entirely.
+wrong guess is visible and cheap to correct. No match is the one refusal described under
+[Sharing](#sharing--nothing-is-visible-until-the-user-shares-it), which lists the shared windows, so the
+agent can correct itself without a separate `list_windows`. A numeric ref is checked against the shared
+set locally, without a round trip to the helper.
 
 Anchors store the resolved ref, not the title — a title like Notepad's changes the moment the document
 is edited.
@@ -190,8 +290,9 @@ the boilerplate that repeated their own descriptions.
 
 ### Resources and prompts
 
-`screen://windows` exposes the window list as an MCP resource, so a client that supports resources
-can hold it as ambient context instead of calling `list_windows`. The `guide_me_through` prompt
+`screen://windows` exposes the shared windows as an MCP resource, so a client that supports resources
+can hold them as ambient context instead of calling `list_windows`; with nothing shared it says so in
+fixed words that do not depend on the desktop. The `guide_me_through` prompt
 carries the walkthrough loop so it does not have to be rediscovered each time. Clients that support
 neither simply ignore them; the same data is available through tools.
 
@@ -243,10 +344,11 @@ What makes a step trustworthy:
   `expanded`), so "tick Dark mode" can be confirmed.
 - **A check that could not run is not a "no".** When the final check fails (the app hung, the helper
   restarted), the result says the `until` could not be checked rather than reporting NOT met.
-- **The result says what changed.** An `After:` block lists windows opened or closed since the step
-  began, the actionable rows of a new dialog (capped, with a snapshotId), or a capped diff of the step's
-  window, so the agent rarely needs a describe_window between steps. A step that is NOT met gets a digest
-  instead of a guess about the name: what opened, what is in front, and whether the target is still
+- **The result says what changed.** An `After:` block lists shared windows opened or closed since the
+  step began, the actionable rows of a new shared dialog (capped, with a snapshotId), or a capped diff of
+  the step's window, so the agent rarely needs a describe_window between steps. A window that is not
+  shared is left out entirely, not counted. A step that is NOT met gets a digest instead of a guess about
+  the name: what shared window opened, which shared window is in front, and whether the target is still
   there, scrolled away or covered.
 - **On success the circle turns into a green check for a second** rather than vanishing, so the user
   knows the step registered during the seconds the model takes to plan the next one.
@@ -283,8 +385,8 @@ enabled one existed.
 tool rather than a separate `check_state` because the machinery is identical and one denser tool
 beats two thin ones.
 
-**Always pass `window`.** An unscoped control search walks every window on the desktop — measured at
-~7 s per check, which also lets the timeout overshoot. Scoped, it is ~95 ms; waiting on a top-level
+**Always pass `window`.** An unscoped control search walks every shared window — measured at ~7 s per
+check over a full desktop, which also lets the timeout overshoot. Scoped, it is ~95 ms; waiting on a top-level
 window skips the accessibility tree entirely and uses the window list, measured at ~300 ms detection
 latency. The tool says so in its result when you forget.
 
@@ -332,7 +434,9 @@ counted as an active request for as long as a client stayed connected. A newer s
 and Ctrl+Shift+X clears the screen and ends the step.
 
 `wait_for_user_click` names what the user pointed at (`-> "Export As…" [menuitem] el_44 in "Paint"`)
-through UI Automation's ElementFromPoint, so a correction needs no describe and no geometry.
+through UI Automation's ElementFromPoint, so a correction needs no describe and no geometry. Only in a
+shared window: a click anywhere else returns its coordinates and nothing about what is there, and is
+not taken as consent to share it.
 `show_message {options}` asks a multiple-choice question that is answered on screen or in the panel.
 
 ## Drawing guidance people can follow
@@ -349,8 +453,11 @@ through UI Automation's ElementFromPoint, so a correction needs no describe and 
 - **Halo strokes and a contrast-checked palette.** The old red was about 1.1:1 against mid-grey UI.
 - **Drawings follow targets across monitors.** They are drawn on every display they touch, point at the
   edge when the target is off every display, and say on the other displays where the step is.
-- **A target behind another window** is drawn dashed with "behind Chrome", and the agent is told,
-  instead of a confident circle on the covering window. **A scrolled-out target** gets a pointer rather
+- **A target behind another window** is drawn dashed with "behind another window" (or the covering
+  window's title when that is shared too), instead of a confident circle on the covering window. The
+  agent hears only of shared windows and the chat panel, measured as if nothing else were open:
+  hearing that something unshared sits over a control, or a figure that moved with it, would say
+  where that window is. **A scrolled-out target** gets a pointer rather
   than a ring on unrelated UI, and `scroll_window {name}` brings it into view.
 - **The overlay's own UI moves out of the way.** The step strip docks away from the target, the panel
   dodges to a free corner when a drawing lands under it (never while focused or in use), and a
@@ -379,17 +486,20 @@ through UI Automation's ElementFromPoint, so a correction needs no describe and 
   drawing on a menu item is re-found when the menu reopens, not reported as its app closing.
 - **describe_window's budget counts the rows it prints**, not the unnamed wrappers it walked past, and
   it says when it stopped and which subtrees it never reached. Long lists are cut short in the walk
-  itself (eight rows of a run, plus any row that is selected, expanded or holds the focus, then a
-  count of the rest), so the budget reaches the buttons after them. Rows skipped this way are not
+  itself (eight rows of a run, plus any row that is selected or expanded, then a count of the
+  rest), so the budget reaches the buttons after them. Rows skipped this way are not
   read, so `since=` and a `changes` step that saw nothing say so, and point at naming the row. A control that vanishes mid-walk ends only its
   own branch; only a timeout or a dead provider stops the walk. Open popups get their own share of the budget. Rows carry state words
-  (`checked`, `expanded`, `selected`, `focused`), and the diff reports them
+  (`checked`, `expanded`, `selected`), and the diff reports them. Focus is not reported: which control
+  has it would say whether the user is working in a shared window or somewhere else
   (`~ Dark mode [checkbox] unchecked -> checked`).
-- **Window blockers have names.** A minimised window can still be named by title, with a note. One on
-  another virtual desktop, one running as administrator (UIPI blocks reading it) and one not responding
-  are marked as such, instead of failing as "not open" or "no accessibility provider".
-- **read_text reads the window it was asked about**, rendered by PrintWindow as capture_screen does,
-  and falls back to a screen crop with a warning when the render fails or comes back blank.
+- **Window blockers have names.** A minimised shared window can still be named by title, with a note.
+  A shared one on another virtual desktop, one running as administrator (UIPI blocks reading it) and
+  one not responding are marked as such, instead of failing as "not open" or "no accessibility
+  provider". A window that is not shared gets none of these: it gets the one refusal.
+- **read_text reads the window it was asked about**, rendered by PrintWindow as capture_screen does.
+  A window that cannot render itself is left blank, with one fixed note; nothing is read from the
+  screen in its place.
 - **Fewer cross-process calls.** Property reads are batched with UI Automation cache requests (with a
   live read on any error, but not after a timeout or a dead provider), and bounded connection and
   transaction timeouts stop a hung app from wedging the single-threaded helper. The anchor tracker's
@@ -489,7 +599,8 @@ unreadable.
 | Concern | Approach | Why |
 |---|---|---|
 | Access control | Bearer token (header or `?key=`), no CORS headers at all, browsers refused outright, DNS-rebinding protection on | An earlier version sent `Access-Control-Allow-Origin: *` on an unauthenticated endpoint that reads the screen — meaning any web page you visited could `fetch()` it. Private Network Access restrictions would mitigate that but are not universally enforced. Local MCP clients never send `Origin` and never need CORS, so refusing anything that does costs nothing. |
-| Audit | Every capture posts a line into the panel | A screen read should never be silent. |
+| Sharing | Nothing visible until shared; one refusal for unshared and absent alike; captures masked | See [Sharing](#sharing--nothing-is-visible-until-the-user-shares-it). |
+| Audit | Captures and requests for unshared windows post a line into the panel | A screen read, or an attempt at one, should never be silent. |
 | Transport | Streamable HTTP on loopback, stateless | stdio would tie the overlay's lifetime to one Claude Code session and spawn a second copy of the app per client. HTTP lets many clients share one long-lived overlay. |
 | Server state | None. Everything lives in [`store`](../src/main/store.ts) | Lets the MCP layer be stateless and still have every client see the same screen. |
 | Overlay windows | One transparent, click-through, always-on-top window per display, sized in DIPs | The canvas coordinate space *is* display-local DIPs, so the renderer needs no further mapping. |
@@ -518,10 +629,16 @@ The panel never handles credentials. It has no API-key, OAuth or login code at a
 authentication from the user's own Claude Code installation on their own machine, so usage bills to
 them and this project never sees, stores or proxies a credential.
 
-It is deliberately restricted: it may use the overlay tools plus `Read`, `Glob` and `Grep`.
-`Bash`, `Write`, `Edit` and everything else are refused by `canUseTool` in
-[src/main/agent/claude.ts](../src/main/agent/claude.ts). The panel is for guiding you around your
-screen, not for editing your machine.
+It is deliberately restricted: it may use the overlay tools plus `Read`, and `Read` only for the
+screenshots this server took and still holds, at the path it returned. `Glob`, `Grep`, `Bash`, `Write`
+and everything else are not offered at all. Sharing would mean little otherwise: a file listing or a
+browser history says what the user watches as plainly as a screenshot of the video, and the capture
+folder holds intermediate renders an agent is not meant to see. The rule is enforced twice in
+[src/main/agent/claude.ts](../src/main/agent/claude.ts), by a `PreToolUse` hook, which sees every call,
+and by `canUseTool`, because Claude Code reads inside the working directory without asking
+`canUseTool` at all. Its system prompt says it sees only shared windows and should ask for one rather
+than guess, and is fixed text, so nothing about the desktop can get into it. It presents the MCP token
+in an `Authorization` header like any other client.
 
 The overlay half of that allow-list is `TOOL_NAMES` from [tools.ts](../src/main/mcp/tools.ts), not a
 copy. The copy it replaced had drifted: it named `list_displays`, which no longer existed, and left out
@@ -582,10 +699,12 @@ run. The tray menu sets most of them:
 |---|---|---|
 | `openAtLogin` | `false` | Start with Windows (the panel stays closed) |
 | `showInCapture` | `false` | Annotations appear in screen recordings and shares |
-| `readStepsAloud` | `false` | Speak each step's instruction when it appears (local voices only) |
+| `readStepsAloud` | `false` | Speak each agent step's instruction when it appears (local voices only); the app's own questions are never spoken |
 | `speechRate` | `1` | Rate for spoken steps and `show_message {speak}` |
 | `soundCues` | `false` | A short tone when a step starts and when it is done |
 | `stepKeys` | `Control+Shift+F9`, `Control+Shift+F10` | Done and Can't-find-it keys while a step is pending; empty disables one |
+| `shareKey` | `Control+Shift+F8` | Shares the window in front with the AI, or stops sharing it; empty disables it |
+| `sharedApps` | `[]` | Apps whose every window is shared, by executable (`"excel.exe"`); the tray menu removes them |
 
 ---
 
@@ -717,6 +836,11 @@ v0.1. The base was verified end to end on Windows 11. Not yet done:
   stepping; `covered` sampling with the panel on top; elevation and hang detection; and that the
   bounded UIA timeouts never cut off a slow but healthy app. `scripts/describe-check.mjs`,
   `delta-check.mjs` and `smoke.mjs` exercise much of it.
+- **Sharing is not yet verified on Windows either.** Check first: composed captures against real
+  windows (PrintWindow per shared window, its invisible resize border, DPI scaling and monitors with
+  negative origins); which real windows fail to render and come out blank (video players, games);
+  shared-only coverage against the helper's on-screen sampling; owned-window sharing for a packaged
+  app's cross-process file picker; and the share key's dialog with an elevated window in front.
 - **Event-driven waits** — waits poll (400-500 ms; `changes` on a whole window at most once a second
   over 80 nodes). UIA event subscriptions would cut latency further, but they mean COM event handlers
   on UIA's own threads writing into a single-threaded helper, which cannot be tested off Windows and

@@ -102,14 +102,34 @@ export function returnsFocus(prev: StepView | null, next: StepView | null): bool
     return next.id !== prev?.id && next.mode !== 'choice';
 }
 
-/** The prompt without its "n/N " prefix, and the progress it carried. */
-export function stepHeading(step: StepView): { prompt: string; progress: string | null } {
+/**
+ * The badge on the app's own questions. It is drawn by the panel from
+ * StepView.fromApp, which only the app sets, so no agent's words can produce
+ * it: that, not the wording, is how the user tells the app from an agent.
+ */
+export const APP_BADGE = 'Screen MCP Overlay';
+
+/**
+ * The prompt without its "n/N " prefix, the progress it carried, and the
+ * app's badge for the app's own questions (null for an agent's), whose
+ * prompt then need not open with the app's name as well.
+ */
+export function stepHeading(step: StepView): { prompt: string; progress: string | null; app: string | null } {
     const parsed = parseProgress(step.prompt);
     const progress = step.progress ?? parsed;
+    const prompt = parsed?.rest ?? step.prompt;
     return {
-        prompt: parsed?.rest ?? step.prompt,
-        progress: progress ? `${progress.n}/${progress.of}` : null
+        prompt: step.fromApp ? withoutAppName(prompt) : prompt,
+        progress: progress ? `${progress.n}/${progress.of}` : null,
+        app: step.fromApp ? APP_BADGE : null
     };
+}
+
+/** "Screen MCP Overlay: share it?" under the app's badge: "Share it?". The overlay strip uses it too. */
+export function withoutAppName(prompt: string): string {
+    if (!prompt.startsWith(`${APP_BADGE}:`)) return prompt;
+    const rest = prompt.slice(APP_BADGE.length + 1).trimStart();
+    return rest.charAt(0).toUpperCase() + rest.slice(1);
 }
 
 export function timeLeft(deadline: number, now: number): string {

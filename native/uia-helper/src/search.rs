@@ -25,6 +25,7 @@ use crate::model::{
     ContainerInfo, Described, DescribedNode, ElementInfo, PointHit, Rect, Resolved, ScrollIntoView, Scrolled,
     Suggestion, WindowRef,
 };
+use crate::sharing::{allowed, root_of, shared_tops};
 use crate::windows::{is_cloaked, is_hung, rect_of, title_of};
 
 use props::Focus;
@@ -166,7 +167,8 @@ const SCROLL_SETTLE: Duration = Duration::from_millis(400);
 const SCROLL_POLL: Duration = Duration::from_millis(50);
 
 /// A cached element, the tick it was last used, and the top-level window it
-/// was found in (0 when unknown): its rect is judged against that window's.
+/// was found in: its rect is judged against that window's, and it is only
+/// ever answered for while that window is shared.
 pub struct Entry {
     el: UIElement,
     used: u64,
@@ -185,7 +187,7 @@ pub struct Session {
 /// One place a search looks: the window itself, or one of its open popups.
 struct Scope {
     root: UIElement,
-    /// The top-level window, as a raw HWND; 0 for the whole desktop.
+    /// The top-level window, as a raw HWND; always a shared one.
     top: isize,
     rect: Option<Rect>,
     popup: bool,
@@ -226,11 +228,22 @@ fn parse_window(w: &str) -> Result<isize, String> {
     w.parse().map_err(|_| format!("bad window ref '{w}'"))
 }
 
+/// What a window ref that names no shared window gets: the same words
+/// whether the window closed, never existed or is open but not shared, and
+/// before anything is asked of it, so neither the answer nor its timing says
+/// which.
+fn no_window(w: &str) -> String {
+    format!("no window for ref '{w}'")
+}
+
 /// A window ref to read controls from. A hung window answers UI Automation
 /// only after the transaction timeout, every call, so it is refused up front
 /// with the real reason instead of failing slowly with a misleading one.
 fn readable_window(w: &str) -> Result<isize, String> {
     let raw = parse_window(w)?;
+    if !allowed(hwnd_of(raw)) {
+        return Err(no_window(w));
+    }
     if is_hung(hwnd_of(raw)) {
         return Err(format!(
             "window {w} is not responding, so its controls cannot be read until it recovers"
@@ -515,6 +528,14 @@ impl Session {
         key
     }
 
+    /// Drop every cached control whose window is not shared any more, after
+    /// the client changed what is: resolve would refuse them anyway, and each
+    /// pins memory in an app the user took back.
+    pub fn forget_unshared(&mut self) {
+        let mut shared: HashMap<isize, bool> = HashMap::new();
+        self.cache.retain(|_, e| *shared.entry(e.top).or_insert_with(|| allowed(hwnd_of(e.top))));
+    }
+
     /// The window's element, with its properties cached when possible.
     fn element_for(&self, raw: isize, req: Option<&UICacheRequest>) -> Result<(UIElement, bool), String> {
         if let Some(r) = req {
@@ -530,20 +551,31 @@ impl Session {
     }
 
     /// Where a search looks, in order: the window's open popups first (an open
-    /// menu is what the user is looking at), then the window. Without a window,
-    /// the whole desktop.
+    /// menu is what the user is looking at), then the window. Without a
+    /// window, every shared window, front first; never the desktop, which
+    /// holds every app the user did not share.
     fn scopes(&self, window_ref: Option<&str>) -> Result<Vec<Scope>, String> {
         let Some(w) = window_ref else {
-            let root = self.auto.get_root_element().map_err(|e| e.to_string())?;
-            return Ok(vec![Scope { root, top: 0, rect: None, popup: false }]);
+            return Ok(shared_tops()
+                .into_iter()
+                .filter_map(|h| {
+                    let top = h.0 as isize;
+                    let root = self.auto.element_from_handle(Handle::from(top)).ok()?;
+                    Some(Scope { root, top, rect: rect_of(h), popup: popups::is_popup(h) })
+                })
+                .collect());
         };
         let raw = readable_window(w)?;
         let main = self
             .auto
             .element_from_handle(Handle::from(raw))
-            .map_err(|e| format!("no window for ref '{w}': {e}"))?;
+            .map_err(|e| format!("{}: {e}", no_window(w)))?;
+        // Popups are tied to the window by their owner or as its menus, so
+        // they are shared with it; checked again all the same, since their
+        // refs go back to the caller.
         let mut out: Vec<Scope> = popups::popups_of(hwnd_of(raw))
             .into_iter()
+            .filter(|(h, _)| allowed(*h))
             .filter_map(|(h, rect)| {
                 let top = h.0 as isize;
                 let root = self.auto.element_from_handle(Handle::from(top)).ok()?;
@@ -868,8 +900,15 @@ impl Session {
         let Ok(walker) = self.auto.get_control_view_walker() else { return ("no-rect", None) };
         let mut cur = el.clone();
         let mut open: Option<(&'static str, UIElement, i32)> = None;
+        let home = root_of(hwnd_of(top));
         for _ in 0..PARENT_WALK {
             let Ok(parent) = walker.get_parent(&cur) else { break };
+            // A popup's tree has no window node above its content, so the
+            // walk could climb out of it onto the desktop and on into other
+            // apps; it ends where the window it searched ends.
+            if props::native_window(&parent, false).is_some_and(|h| !h.is_invalid() && root_of(h) != home) {
+                break;
+            }
             let ctrl = props::control_type(&parent, false);
             let role = role_name(ctrl);
             if role == "window" {
@@ -1014,7 +1053,13 @@ impl Session {
             .map_err(|e| format!("no window for ref '{window_ref}': {e}"))?;
         let walker = self.auto.get_control_view_walker().map_err(|e| e.to_string())?;
         let reserve = rank::popup_reserve(max_nodes);
-        let popups = if reserve > 0 { popups::popups_of(hwnd_of(raw)) } else { Vec::new() };
+        // Shared with the window by construction (see scopes); checked again
+        // since their refs go back to the caller.
+        let popups: Vec<(HWND, Rect)> = if reserve > 0 {
+            popups::popups_of(hwnd_of(raw)).into_iter().filter(|(h, _)| allowed(*h)).collect()
+        } else {
+            Vec::new()
+        };
         let mut tops: Vec<isize> = popups.iter().map(|(h, _)| h.0 as isize).collect();
         tops.push(raw);
         let focus = if ignore_focus { Focus::none() } else { Focus::now_with_ancestors(&self.auto, &tops) };
@@ -1119,6 +1164,9 @@ impl Session {
         let now = self.clock;
         let req = props::request_for(&self.auto, props::PLACE);
         let mut silent: Vec<isize> = Vec::new();
+        // Asked once per window per batch: the tracker sends many refs of
+        // the same few windows.
+        let mut shared: HashMap<isize, bool> = HashMap::new();
         let mut out = Vec::with_capacity(refs.len());
         for r in refs {
             let missing = |reason: Option<&str>| Resolved {
@@ -1128,8 +1176,15 @@ impl Session {
                 offscreen: false,
             };
             if let Some(entry) = self.cache.get_mut(r) {
-                entry.used = now;
                 let top = entry.top;
+                // A control of a window that is not shared, or no longer is,
+                // answers exactly as a ref never handed out does, before its
+                // window is asked anything.
+                if !*shared.entry(top).or_insert_with(|| allowed(hwnd_of(top))) {
+                    out.push(missing(Some("gone")));
+                    continue;
+                }
+                entry.used = now;
                 if top != 0 && (silent.contains(&top) || is_hung(hwnd_of(top))) {
                     // Not gone, so no reason: the window is still there and
                     // its controls come back when it answers again.
@@ -1173,6 +1228,13 @@ impl Session {
                 out.push(Resolved { r#ref: r.clone(), rect, reason, offscreen });
             } else if let Ok(raw) = r.parse::<isize>() {
                 let hwnd = hwnd_of(raw);
+                // A window that is not shared reads as one that has closed:
+                // where it is, and whether it is minimised or elsewhere, are
+                // the user's business.
+                if !allowed(hwnd) {
+                    out.push(missing(Some(if raw == 0 { "gone" } else { "closed" })));
+                    continue;
+                }
                 let shown = unsafe { IsWindowVisible(hwnd) }.as_bool()
                     && !unsafe { IsIconic(hwnd) }.as_bool()
                     && !is_cloaked(hwnd);
@@ -1193,16 +1255,24 @@ impl Session {
     /// The overlay is click-through, so hit-testing already passes through it,
     /// but the chat panel is not: a point on the panel must come back as
     /// nothing rather than as the user's answer.
+    ///
+    /// A point on a window that is not shared comes back as nothing too, the
+    /// same as bare desktop, before that window is asked anything: what the
+    /// user clicked in some other app is not the agent's to know.
     pub fn element_at_point(&mut self, x: i32, y: i32, ignore_pid: u32) -> Result<PointHit, String> {
         let ours = |pid: u32| ignore_pid != 0 && pid == ignore_pid;
         let window_of = |top: HWND| {
             (!top.is_invalid() && !ours(popups::pid_of(top)))
                 .then(|| WindowRef { r#ref: (top.0 as isize).to_string(), title: title_of(top) })
         };
+        let none = PointHit { element: None, window: None };
+        let under = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
+        if !allowed(under) {
+            return Ok(none);
+        }
         // A window that is not responding would hold every call below for the
         // full timeout; it is still the window that was clicked.
-        let under = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
-        if !under.is_invalid() && is_hung(under) {
+        if is_hung(under) {
             return Ok(PointHit { element: None, window: window_of(under) });
         }
         let _bound = CallBound::new(&self.auto, HOT_CALL_TIMEOUT_MS);
@@ -1231,21 +1301,27 @@ impl Session {
             }
         };
         if ours(pid) {
-            return Ok(PointHit { element: None, window: None });
+            return Ok(none);
         }
         // Windowless content (a browser page, a XAML island) has no handle of
         // its own; the window at the point is then the one it is drawn in.
         let own: HWND = props::native_window(&el, cached).unwrap_or_default();
         let at = if own.is_invalid() { unsafe { WindowFromPoint(POINT { x, y }) } } else { own };
         let top = unsafe { GetAncestor(at, GA_ROOT) };
-        let window = window_of(top);
-        let top_raw = if window.is_some() { top.0 as isize } else { 0 };
+        // The hit test can land outside the window under the point (a
+        // provider answering for something drawn over it); that element is
+        // neither read nor remembered unless its own window is shared too.
+        if !allowed(top) {
+            return Ok(none);
+        }
+        let Some(window) = window_of(top) else { return Ok(none) };
+        let top_raw = top.0 as isize;
 
         let element = match props::rect(&el, cached) {
             Some(rect) => {
                 let name = props::name(&el, cached);
                 let enabled = props::enabled(&el, cached);
-                let top_rect = if top_raw != 0 { rect_of(top) } else { None };
+                let top_rect = rect_of(top);
                 let offscreen = props::offscreen(&el, cached) || top_rect.is_some_and(|t| rank::outside(&rect, &t));
                 let focus = Focus::now(&self.auto, &[top_raw]);
                 let seen = Seen { name, rect, enabled, offscreen };
@@ -1253,7 +1329,7 @@ impl Session {
             }
             None => None,
         };
-        Ok(PointHit { element, window })
+        Ok(PointHit { element, window: Some(window) })
     }
 
     /// Bring a control into view with ScrollItemPattern, or failing that by
@@ -1423,6 +1499,11 @@ impl Session {
     /// can say so instead of sending the agent off to re-read an unchanged
     /// view.
     pub fn scroll_window(&mut self, hwnd: HWND, notches: i32) -> Result<Scrolled, String> {
+        // A window that is not shared is neither asked nor scrolled, and gets
+        // the words a closed one gets from winops::scroll.
+        if !allowed(hwnd) {
+            return Err(crate::winops::CLOSED.into());
+        }
         // A window that is not responding gets the scroll's own error, before
         // any UI Automation call can wait on it. IsHungAppWindow only trips
         // after 5 s; one that froze a moment ago is caught by a WM_NULL round

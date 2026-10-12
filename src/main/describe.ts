@@ -1,5 +1,7 @@
-import { describeWindow, windowInfo, type Described, type WindowInfo } from './uia.js';
+import { describeWindow, sharedWindowInfo, type Described, type WindowInfo } from './uia.js';
 import { store } from './store.js';
+import { onSharingRevoked, sharingSummary } from './sharing.js';
+import type { UiSnapshot } from '../shared/types.js';
 import { clean, collapseRuns, diagnoseTree, diffLines, elevatedNote, row, toSnapshotNodes } from '../shared/uitree.js';
 /**
  * Renders a window's accessible tree as compact indented text, and diffs it
@@ -16,6 +18,13 @@ import { clean, collapseRuns, diagnoseTree, diffLines, elevatedNote, row, toSnap
  * back a token naming it. Same reasoning as captureId for image coordinates.
  */
 
+// Baselines go whenever the user stops sharing anything, as the captures do,
+// at once (a share given back right away must not bring them back): all but
+// those of windows still shared by themselves, under the share they were
+// taken in, from which nothing has been taken back. Registered here, with the
+// code that reads them, so every server built from these modules does it.
+onSharingRevoked(() => store.dropSnapshots(s => !underCurrentShare(s)));
+
 export interface DescribeOptions {
     window: string;
     maxNodes?: number;
@@ -28,9 +37,30 @@ export interface DescribeOptions {
     info?: WindowInfo;
 }
 
-/** The window's flags, fetched only on the paths that need them: the common case pays nothing. */
+/**
+ * The window's flags, fetched only on the paths that need them: the common case
+ * pays nothing. Only a shared window's: its title and state go into the text,
+ * and a window that is not shared has neither as far as the agent can tell.
+ */
 async function lookup(opts: DescribeOptions): Promise<WindowInfo | undefined> {
-    return opts.info ?? (await windowInfo(opts.window).catch(() => undefined));
+    return opts.info ?? (await sharedWindowInfo(opts.window).catch(() => undefined));
+}
+
+/**
+ * When the window's current share began, when it was shared by itself. A
+ * baseline from before then was read under a share that ended (the window
+ * closed, or was taken back, and was shared again), so it is not used.
+ * Undefined for a window shared through its app, or a dialog through its
+ * owner: such a share ends only when the user stops one, and that drops
+ * their baselines (see above).
+ */
+function sharedSince(ref: string): number | undefined {
+    return sharingSummary().windows.find(g => g.ref === ref)?.since;
+}
+
+function underCurrentShare(s: UiSnapshot): boolean {
+    const began = sharedSince(s.windowRef);
+    return began !== undefined && s.at >= began;
 }
 
 /**
@@ -114,7 +144,10 @@ export async function describeWindowAsText(opts: DescribeOptions): Promise<strin
 
     if (!opts.since) return full;
 
-    const baseline = store.snapshot(opts.since);
+    const found = store.snapshot(opts.since);
+    const began = sharedSince(opts.window);
+    // One from before the current share reads exactly like one never taken.
+    const baseline = found && (began === undefined || found.at >= began) ? found : undefined;
     // An unresolvable baseline must degrade to a full snapshot, never error:
     // trading tokens for fragility would defeat the point of the feature.
     if (!baseline) {

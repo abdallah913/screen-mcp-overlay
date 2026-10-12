@@ -1,4 +1,6 @@
+import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { rmSync } from 'node:fs';
 import type { Annotation, CaptureRecord, Point, Rect, StepView, UiSnapshot } from '../shared/types.js';
 
 /**
@@ -16,6 +18,10 @@ class Store extends EventEmitter {
     private sweeper: NodeJS.Timeout | null = null;
 
     nextId(prefix: string): string {
+        // A snapshot id is a key to a window's content (since= replays it), and
+        // the server is shared by every client: one that counted could use
+        // another's. So those are random, in digits to keep the ids' shape.
+        if (prefix === 'snap') return `snap_${randomBytes(8).readBigUInt64BE().toString().padStart(20, '0')}`;
         this.seq += 1;
         return `${prefix}_${this.seq}`;
     }
@@ -195,6 +201,44 @@ class Store extends EventEmitter {
 
     snapshot(id: string): UiSnapshot | undefined {
         return this.snapshots.get(id);
+    }
+
+    /**
+     * Forget baselines (`which` of them; all by default): when the user stops
+     * sharing something, as the capture files go. A since= diff against one
+     * would replay what was read before, to whoever holds its id.
+     */
+    dropSnapshots(which: (s: UiSnapshot) => boolean = () => true): void {
+        for (const [id, s] of this.snapshots) if (which(s)) this.snapshots.delete(id);
+    }
+
+    /**
+     * Forget what was read from windows the user stopped sharing: their tree
+     * snapshots (a since= diff would replay their controls) and their window
+     * captures, files included, since the capture directory is readable by
+     * the panel agent's own file tools. `refs` says which windows, as a set
+     * or a test: a window the user stopped sharing and then closed is in no
+     * window list. Returns how many records went.
+     */
+    forgetWindows(refs: ReadonlySet<string> | ((ref: string) => boolean)): number {
+        const gone = typeof refs === 'function' ? refs : (ref: string): boolean => refs.has(ref);
+        let n = 0;
+        for (const [id, s] of this.snapshots) {
+            if (!gone(s.windowRef)) continue;
+            this.snapshots.delete(id);
+            n += 1;
+        }
+        for (const [id, c] of this.captures) {
+            if (!c.windowRef || !gone(c.windowRef)) continue;
+            this.captures.delete(id);
+            n += 1;
+            try {
+                rmSync(c.path, { force: true });
+            } catch {
+                // A file still open elsewhere goes when the app quits, with the rest.
+            }
+        }
+        return n;
     }
 
     // ---- the pending step ---------------------------------------------------

@@ -3,8 +3,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { registerTools } from './tools/index.js';
-import { listWindows } from '../uia.js';
-import { windowLine } from '../../shared/windows.js';
+import { redact, redactResult, withAgentInput } from './tools/common.js';
+import { sharedWindowsText } from './tools/read.js';
 import { store } from '../store.js';
 import { settings } from '../settings.js';
 import { noteRequest } from '../idle.js';
@@ -32,10 +32,15 @@ let activeRequests = 0;
  * Sent once per connection and typically placed in the agent's system prompt,
  * so it carries the strategy the individual tool descriptions cannot: which
  * tool to reach for first, and the shape of a walkthrough.
+ *
+ * Fixed text, never built from anything on screen: it is cached in system
+ * prompts, so a window list in it would outlive every share.
  */
 const INSTRUCTIONS =
-    "See the user's screen and draw guidance on it; drawings are click-through. Any window parameter takes " +
-    'a ref, a title substring or "foreground".\n' +
+    'See the windows the user shares and draw guidance on them; drawings are click-through. Window ' +
+    'parameters take a ref, a title substring or "foreground".\n' +
+    'Only windows the user shares are visible. If the app you need is not listed, call list_windows with ask ' +
+    'instead of guessing titles.\n' +
     'Read cheapest first: describe_window (text tree; since= for changes) > read_text (OCR, when the tree is ' +
     'empty) > capture_screen (only to see visuals).\n' +
     'Point by anchoring to the control, e.g. annotate anchor {window:"Notepad", name:"Save"}: drawings follow ' +
@@ -51,15 +56,17 @@ const INSTRUCTIONS =
     'wait_for_user_click when you cannot tell what they mean; show_message options for a quick question.';
 
 export function buildServer(): McpServer {
-    const server = new McpServer({ name: 'screen-mcp-overlay', version: '0.2.0' }, { instructions: INSTRUCTIONS });
+    const server = new McpServer({ name: 'screen-mcp-overlay', version: '0.3.0' }, { instructions: INSTRUCTIONS });
     registerTools(server);
     compactToolList(server);
+    redactToolResults(server);
     registerResources(server);
     registerPrompts(server);
     return server;
 }
 
 type ListHandler = (request: unknown, extra: unknown) => Promise<{ tools: unknown[] }>;
+type CallHandler = (request: unknown, extra: unknown) => Promise<unknown>;
 let compactedList: { tools: unknown[] } | undefined;
 
 /**
@@ -92,6 +99,28 @@ function compactToolList(server: McpServer): void {
     });
 }
 
+/**
+ * The last check on every tool result, whichever tool and whatever path
+ * produced it (a schema rejection included): a title of a window the user has
+ * not shared never leaves (see redact). The agent's own arguments are in scope
+ * while it runs, so text the agent sent and gets echoed back is left as it
+ * was: changing it only when it names an open window would say the window is
+ * open. Same private handler map as compactToolList; without it, guarded()
+ * still redacts each tool's own output.
+ */
+function redactToolResults(server: McpServer): void {
+    const handlers = (server.server as unknown as { _requestHandlers?: Map<string, CallHandler> })._requestHandlers;
+    const original = handlers?.get('tools/call');
+    if (!handlers || !original) return;
+    handlers.set('tools/call', (request, extra) =>
+        withAgentInput((request as { params?: { arguments?: unknown } }).params?.arguments, async () => {
+            const result = await original(request, extra);
+            const content = (result as { content?: unknown } | undefined)?.content;
+            return Array.isArray(content) ? redactResult(result as { content: unknown[] }) : result;
+        })
+    );
+}
+
 export function stripSchemaNoise(node: unknown): unknown {
     if (Array.isArray(node)) return node.map(stripSchemaNoise);
     if (!node || typeof node !== 'object') return node;
@@ -105,33 +134,25 @@ export function stripSchemaNoise(node: unknown): unknown {
 }
 
 /**
- * The window list as a resource as well as a tool.
+ * The shared windows as a resource as well as a tool.
  *
  * A client that supports resources can keep it as ambient context and skip the
  * list_windows round trip entirely; one that does not simply ignores it. Same
- * data either way, so there is nothing to keep in sync.
+ * text as list_windows, from the same function, so it can never list more.
+ * A copy a client already read stays in its context after a share ends.
  */
 function registerResources(server: McpServer): void {
     server.registerResource(
         'windows',
         'screen://windows',
         {
-            title: 'Open windows',
-            description: 'Visible top-level windows: ref WxH@x,y title.',
+            title: 'Shared windows',
+            description: 'Windows the user has shared: ref WxH@x,y title.',
             mimeType: 'text/plain'
         },
-        async uri => {
-            const body = (await listWindows()).map(windowLine).join('\n');
-            return {
-                contents: [
-                    {
-                        uri: uri.href,
-                        mimeType: 'text/plain',
-                        text: body || 'no visible windows'
-                    }
-                ]
-            };
-        }
+        async uri => ({
+            contents: [{ uri: uri.href, mimeType: 'text/plain', text: redact(await sharedWindowsText()) }]
+        })
     );
 }
 
@@ -152,6 +173,8 @@ function registerPrompts(server: McpServer): void {
                         type: 'text',
                         text:
                             `Guide me through: ${task}\n\n` +
+                            'Work only in windows I have shared; if the app is not among them, call list_windows ' +
+                            'with ask instead of guessing its title. ' +
                             'Look first with describe_window, not a screenshot unless something visual matters, ' +
                             'and tell me in one line how many steps it will take. Then give one highlight_and_wait ' +
                             'per step: the control as the target, one action using its exact on-screen label as ' +
@@ -232,17 +255,14 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
         const body = req.method === 'POST' ? await readBody(req) : undefined;
         await transport.handleRequest(req as IncomingMessage & { auth?: never }, res, body);
     } catch (err) {
+        // The detail stays here: whatever threw outside a tool handler may
+        // carry helper text about any window, and the client gets nothing of it.
+        console.error('MCP request failed:', err);
         if (!res.headersSent) {
             res.writeHead(500, { 'content-type': 'application/json' });
         }
         if (!res.writableEnded) {
-            res.end(
-                JSON.stringify({
-                    jsonrpc: '2.0',
-                    error: { code: -32603, message: `internal error: ${(err as Error).message}` },
-                    id: null
-                })
-            );
+            res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'internal error' }, id: null }));
         }
     }
 }

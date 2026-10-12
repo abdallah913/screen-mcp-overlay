@@ -5,8 +5,9 @@ import { windowBlocker } from '../../../shared/windows.js';
 import { hasLocalVoice, postToHud, speak } from '../../hud.js';
 import { settings } from '../../settings.js';
 import { beginStep } from '../../steps.js';
-import { focusWindow, resolveWindowInfo, scrollIntoView, scrollWindow } from '../../uia.js';
+import { focusWindow, scrollIntoView, scrollWindow } from '../../uia.js';
 import { answerText } from './answers.js';
+import { sharedWindowFor } from './anchoring.js';
 import { WINDOW, guarded, text } from './common.js';
 
 /** Acting on windows and talking to the user: focus_window, scroll_window, show_message. */
@@ -29,11 +30,19 @@ export function registerAct(server: McpServer): void {
         },
         args =>
             guarded('focus_window', async () => {
-                const w = await resolveWindowInfo(args.window);
-                await focusWindow(w.ref);
+                // Shared windows only: raising another would put an app the
+                // user kept private in front of them, and whether that worked
+                // would say it is open.
+                const w = await sharedWindowFor(args.window);
+                await focusWindow(w.ref).catch(() => {
+                    // Why Windows refused (another app holding the focus lock,
+                    // one running as administrator) is about the window in
+                    // front, which may be one the user kept private.
+                    throw new Error(`Windows did not bring window ${w.ref} to the front; ask the user to click it.`);
+                });
                 // Restoring a minimised window, or fetching one from another
                 // desktop, is the usual reason to call this; say it happened.
-                const how = w.window?.minimized ? ' (restored from minimized)' : w.window?.cloaked ? ' (from another desktop)' : '';
+                const how = w.window.minimized ? ' (restored from minimized)' : w.window.cloaked ? ' (from another desktop)' : '';
                 return text(`Window ${w.ref} is in front${how}.`);
             })
     );
@@ -56,8 +65,10 @@ export function registerAct(server: McpServer): void {
         },
         args =>
             guarded('scroll_window', async () => {
-                const w = await resolveWindowInfo(args.window);
-                const blocker = w.window && windowBlocker(w.window, 'scroll');
+                // A window's state and its controls' names are reported for
+                // shared windows only, and only they are scrolled.
+                const w = await sharedWindowFor(args.window);
+                const blocker = windowBlocker(w.window, 'scroll');
                 if (blocker) throw new Error(blocker);
 
                 // "The first button" is no place to scroll to, and the helper

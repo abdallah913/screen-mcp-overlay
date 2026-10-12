@@ -31,6 +31,13 @@ export interface Settings {
      * registered only while one is pending. Empty string disables one.
      */
     stepKeys: { done: string; stuck: string };
+    /**
+     * Apps the user shares with the AI as a whole, by executable file name
+     * ("excel.exe"). Windows are otherwise private: see sharing.ts.
+     */
+    sharedApps: string[];
+    /** Global accelerator that shares (or stops sharing) the window in front. Empty disables it. */
+    shareKey: string;
 }
 
 const DEFAULTS: Settings = {
@@ -44,7 +51,10 @@ const DEFAULTS: Settings = {
     // Chords nothing common claims. Ctrl+Shift+H is VS Code's Replace in Files,
     // Ctrl+Shift+Enter is an array formula in Excel, and Ctrl+Alt chords are
     // AltGr on many European layouts, where they type characters.
-    stepKeys: { done: 'Control+Shift+F9', stuck: 'Control+Shift+F10' }
+    stepKeys: { done: 'Control+Shift+F9', stuck: 'Control+Shift+F10' },
+    sharedApps: [],
+    // Next to the step keys, and as unclaimed by common apps.
+    shareKey: 'Control+Shift+F8'
 };
 
 let cache: Settings | undefined;
@@ -103,7 +113,11 @@ export function normalizeSettings(stored: unknown): Settings {
         readStepsAloud: flag('readStepsAloud'),
         speechRate: Math.min(2, Math.max(0.5, rate)),
         soundCues: flag('soundCues'),
-        stepKeys: { done: chord('done'), stuck: chord('stuck') }
+        stepKeys: { done: chord('done'), stuck: chord('stuck') },
+        sharedApps: Array.isArray(s.sharedApps)
+            ? [...new Set(s.sharedApps.filter((a): a is string => typeof a === 'string' && a.trim() !== '').map(a => a.trim().toLowerCase()))]
+            : [],
+        shareKey: typeof s.shareKey === 'string' ? s.shareKey : s.shareKey === null ? '' : DEFAULTS.shareKey
     };
 }
 

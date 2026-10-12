@@ -65,8 +65,8 @@ export interface CaptureRecord {
      */
     windowRef?: string;
     /**
-     * The window refused to render itself and the pixels came from the screen
-     * instead, so anything covering it is in the image.
+     * The window refused to render itself, so the image is blank: nothing is
+     * taken from the screen in its place.
      */
     fallback?: boolean;
 }
@@ -231,6 +231,12 @@ export interface StepView {
      * cancels in click mode only.
      */
     keys: { done?: string; stuck?: string; cancel?: string };
+    /**
+     * The app's own question (asking to share a window), never an agent's.
+     * The panel card and the overlay strip badge it as the app's: what lets
+     * the user tell the app from an agent is this, not the wording.
+     */
+    fromApp?: boolean;
 }
 
 /** What the user can answer from the overlay strip, the panel or a hotkey. */

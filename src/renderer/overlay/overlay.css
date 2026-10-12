@@ -72,6 +72,28 @@ body.picking #c { cursor: crosshair; }
     animation: blink 1.2s ease-in-out infinite;
 }
 
+/* The app's own question (asking to share a window): badged and outlined in a
+   colour no agent's step gets (StepView.fromApp). */
+#strip.app { border-color: rgba(122, 162, 255, 0.85); }
+#strip.app #strip-dot { display: none; }
+#strip-app {
+    display: inline-flex;
+    flex: none;
+    align-self: center;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px 1px 5px;
+    border-radius: 9px;
+    background: #7aa2ff;
+    color: #0b1838;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+#strip-app[hidden] { display: none; }
+#strip-app svg { width: 13px; height: 13px; flex: none; fill: currentColor; }
+#strip-app svg .tick { fill: none; stroke: #7aa2ff; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
 #strip-progress {
     flex: none;
     padding: 1px 7px;

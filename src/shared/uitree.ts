@@ -152,9 +152,14 @@ const RUN_LIMIT = 8;
 /** ...to its first few rows plus a marker. */
 const RUN_SHOWN = 5;
 
-/** A row the user is on. Never collapsed away: it is usually the one that matters. */
+/**
+ * A row the user is on. Never collapsed away: it is usually the one that
+ * matters. Selected only, not focused: focus is in a shared window only while
+ * the user is, so a row kept for it would say whether they are working in a
+ * window they did not share.
+ */
 function isCurrent(n: Pick<SnapshotNode, 'state'>): boolean {
-    return /\b(selected|focused)\b/.test(n.state ?? '');
+    return /\bselected\b/.test(n.state ?? '');
 }
 
 /**
@@ -271,12 +276,16 @@ export function toSnapshotNodes(raw: RawNode[]): TreeRow[] {
     }));
 }
 
-/** State words as printed: "checked focused". */
+/**
+ * State words as printed: "checked expanded". Never "focused": focus is in a
+ * shared window only while the user is, so the mark (or its absence across
+ * every shared window) would say whether they are in one they did not share.
+ */
 function words(state: string | undefined): string {
     return (state ?? '')
         .split(',')
         .map(w => w.trim())
-        .filter(Boolean)
+        .filter(w => w && w !== 'focused')
         .join(' ');
 }
 
@@ -389,14 +398,6 @@ export function elevatedNote(): string {
     );
 }
 
-/** State that matters in a diff. Focus moves with every click, so it is left out as churn. */
-function steady(state: string | undefined): string {
-    return words(state)
-        .split(' ')
-        .filter(w => w && w !== 'focused')
-        .join(' ');
-}
-
 /**
  * How a row changed, naming only what differs on each side:
  * `unchecked -> checked`, `"abc" -> "abcdef"`, `enabled -> disabled`.
@@ -408,8 +409,9 @@ function change(old: TreeRow, n: TreeRow): string | null {
         before.push(`"${old.value ?? ''}"`);
         after.push(`"${n.value ?? ''}"`);
     }
-    const s0 = steady(old.state);
-    const s1 = steady(n.state);
+    // Without focus (see words), which moves with every click and would make every diff noisy.
+    const s0 = words(old.state);
+    const s1 = words(n.state);
     if (s0 !== s1) {
         // "selected" losing its word reads better as "not selected" than as nothing.
         before.push(s0 || `not ${s1}`);

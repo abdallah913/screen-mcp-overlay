@@ -74,12 +74,12 @@ test('stripSchemaNoise keeps real bounds', () => {
 
 // --- windows by title ---------------------------------------------------------
 
-test('list_windows prints one compact line per window, without our own or minimised ones', async () => {
+test('list_windows prints one compact line per shared window, without our own or minimised ones', async () => {
     fakeHelper();
     const { text } = await call('list_windows');
     const lines = text.split('\n');
-    assert.equal(lines[0], '2 window(s), ref WxH@x,y title:');
-    assert.equal(lines[1], '100 800x600@100,100 Untitled - Notepad [foreground]');
+    assert.equal(lines[0], '2 shared window(s), ref WxH@x,y title:');
+    assert.equal(lines[1], '100 800x600@100,100 Untitled - Notepad');
     assert.equal(lines[2], '200 320x500@1000,100 Calculator');
     assert.match(lines[3], /^displays: 1 primary 1920x1080 scale 1$/);
 });
@@ -96,18 +96,18 @@ test('describe_window resolves a title and prunes echo rows', async () => {
     assert.match(text, /snapshotId: snap_\d+/);
 });
 
-test('a numeric ref skips the window list entirely', async () => {
+test('a numeric ref is checked against the shared windows before the helper is asked about it', async () => {
     const { calls } = fakeHelper();
     await call('describe_window', { window: '100' });
-    assert.equal(calls.some(c => c.op === 'list_windows'), false);
+    assert.deepEqual(calls.map(c => c.op), ['list_windows', 'describe']);
 });
 
-test('an unknown title is an error that lists what is open', async () => {
+test('an unknown title is an error that lists the shared windows', async () => {
     fakeHelper();
     const { text, isError } = await call('describe_window', { window: 'Photoshop' });
     assert.equal(isError, true);
-    assert.match(text, /no window title contains "Photoshop"/);
-    assert.match(text, /100 "Untitled - Notepad"/);
+    assert.match(text, /no shared window matches "Photoshop"\. Shared: 100 "Untitled - Notepad", 200 "Calculator"/);
+    assert.match(text, /list_windows with ask/);
 });
 
 test('"foreground" names the foreground window', async () => {

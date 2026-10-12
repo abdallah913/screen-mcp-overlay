@@ -11,11 +11,13 @@
 //! call that blocks until it recovers.
 
 use serde::Serialize;
-use windows::Win32::Foundation::{GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT, WIN32_ERROR, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     MonitorFromPoint, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
-    HGDIOBJ, MONITOR_DEFAULTTONULL, SRCCOPY,
+    HGDIOBJ, MONITOR_DEFAULTTONULL,
 };
 // PrintWindow lives under Storage::Xps, and AttachThreadInput under
 // System::Threading, rather than where their use would suggest.
@@ -23,15 +25,17 @@ use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetAncestor, GetClientRect, GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindow,
-    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SendMessageTimeoutW,
-    SetForegroundWindow, ShowWindow, WindowFromPoint, GA_ROOT, GA_ROOTOWNER, GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV,
-    SMTO_ABORTIFHUNG, SW_RESTORE, WM_MOUSEWHEEL, WM_NULL, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    BringWindowToTop, GetAncestor, GetClientRect, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
+    GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, SendMessageTimeoutW, SetForegroundWindow, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
+    GW_HWNDNEXT, GW_HWNDPREV, SMTO_ABORTIFHUNG, SW_RESTORE, WM_MOUSEWHEEL, WM_NULL, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT,
 };
 
 use crate::model::{Coverage, PrintResult, Rect};
 use crate::search::popups::{is_popup, popups_of};
-use crate::windows::{class_of, is_cloaked, is_elevated, is_hung, rect_of, title_of};
+use crate::sharing::{allowed, ANOTHER_WINDOW};
+use crate::windows::{class_of, is_cloaked, is_elevated, is_hung, rect_of, root_owner_of, title_of};
 
 /// PW_RENDERFULLCONTENT: renders DirectComposition surfaces too, which is what
 /// makes this work for Chromium and other GPU-composited apps.
@@ -44,14 +48,22 @@ const MESSAGE_TIMEOUT_MS: u32 = 1000;
 
 const NOT_RESPONDING: &str = "that window is not responding, so Windows cannot reach it until the app recovers. \
      Wait for it, or ask the user whether it has frozen";
-const CLOSED: &str = "that window has closed";
+pub const CLOSED: &str = "that window has closed";
 
 #[derive(Serialize)]
 pub struct Occlusion {
     /// Rough fraction of the window covered by windows above it, 0.0 to 1.0.
     pub covered: f32,
-    /// Titles of the windows sitting on top, nearest first.
+    /// Names of the windows sitting on top, nearest first, each once (see
+    /// cover_name).
     pub by: Vec<String>,
+}
+
+/// Whether the caller may act on this window: it exists and is shared. Every
+/// op that takes a window refuses one that is not with the very words it
+/// gives a window that has closed, so the two cannot be told apart.
+fn reachable(hwnd: HWND) -> bool {
+    exists(hwnd) && allowed(hwnd)
 }
 
 fn intersect(a: &Rect, b: &Rect) -> i64 {
@@ -79,8 +91,12 @@ fn exists(hwnd: HWND) -> bool {
 /// Approximate on purpose: overlapping occluders are summed rather than unioned,
 /// so the figure can overshoot. It is a "do not trust this capture" signal, not
 /// a measurement.
+///
+/// A window that is not shared gets what a closed one gets: nothing covered,
+/// by nothing.
 pub fn occlusion_of(hwnd: HWND, ignore_pid: u32) -> Occlusion {
-    let Some(target) = rect_of(hwnd) else {
+    let target = if allowed(hwnd) { rect_of(hwnd) } else { None };
+    let Some(target) = target else {
         return Occlusion { covered: 0.0, by: Vec::new() };
     };
     let area = (target.width as i64 * target.height as i64).max(1);
@@ -102,7 +118,10 @@ pub fn occlusion_of(hwnd: HWND, ignore_pid: u32) -> Occlusion {
                 let overlap = intersect(&target, &r);
                 if overlap > area / 100 {
                     covered += overlap;
-                    by.push(title_of(above));
+                    let name = cover_name(above, None);
+                    if !by.contains(&name) {
+                        by.push(name);
+                    }
                 }
             }
         }
@@ -168,7 +187,7 @@ pub fn responds(hwnd: HWND) -> bool {
 /// foreground thread's input queue first is the documented way round it, and is
 /// what every window-manager utility does.
 pub fn focus(hwnd: HWND) -> Result<(), String> {
-    if !exists(hwnd) {
+    if !reachable(hwnd) {
         return Err(CLOSED.into());
     }
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
@@ -251,14 +270,6 @@ impl Canvas {
             let bitmap = CreateCompatibleBitmap(screen, width, height);
             let old = SelectObject(mem, bitmap.into());
             Ok(Canvas { screen, mem, bitmap, old, width, height })
-        }
-    }
-
-    /// Copy what is on screen at `origin`: whatever is rendered there, which is
-    /// the target window only when nothing covers it.
-    fn copy_screen(&self, origin: (i32, i32)) {
-        unsafe {
-            let _ = BitBlt(self.mem, 0, 0, self.width, self.height, Some(self.screen), origin.0, origin.1, SRCCOPY);
         }
     }
 
@@ -362,10 +373,12 @@ fn client_region(hwnd: HWND, raw: &RECT) -> (usize, usize, usize, usize) {
 /// PrintWindow asks the window to render itself into a bitmap, so the result is
 /// the window's content rather than whatever happens to be on screen at those
 /// coordinates. When it cannot (the window refuses, is hung, or hands back a
-/// blank GPU surface) the screen is copied instead and `fallback` says so,
-/// because then anything covering the window is in the image.
+/// blank GPU surface) the image is left blank and `fallback` says so. The
+/// screen is never copied in its place: a screen copy holds whatever is in
+/// front of the window or shows through it, which may be a window the user
+/// did not share.
 pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
-    if !exists(hwnd) {
+    if !reachable(hwnd) {
         return Err(CLOSED.into());
     }
     if unsafe { IsIconic(hwnd) }.as_bool() {
@@ -395,8 +408,8 @@ pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
                         nothing of it on this screen to capture; focus_window brings it here"
                 .into());
         }
-        canvas.copy_screen((raw.left, raw.top));
-        buf = canvas.pixels()?;
+        // Blank, not the screen (see above); the client says it would not render.
+        blank(&mut buf);
     }
     drop(canvas);
 
@@ -420,6 +433,20 @@ pub fn print_window_png(hwnd: HWND, path: &str) -> Result<PrintResult, String> {
     // the DWM extended bounds trims, so image coordinates are relative to
     // this rectangle rather than to the one list_windows reports.
     Ok(PrintResult { rect: Rect { x: raw.left, y: raw.top, width, height }, fallback: !printed })
+}
+
+// ---------------------------------------------------------------- masking
+
+/// The colour a window that would not render is painted, BGRA: the client's
+/// own mask colour (MASK_BGRA in src/shared/visible.ts), so a blank looks the
+/// same whichever side made it.
+const MASK_BGRA: [u8; 4] = [32, 32, 32, 255];
+
+/// Paint a whole BGRA image the mask colour.
+fn blank(bgra: &mut [u8]) {
+    for px in bgra.chunks_exact_mut(4) {
+        px.copy_from_slice(&MASK_BGRA);
+    }
 }
 
 // ---------------------------------------------------------------- scroll
@@ -450,7 +477,7 @@ pub fn not_scrolled() -> String {
 /// control rather than a view change. The send is bounded, so a hung window
 /// costs at most a second instead of wedging the helper.
 pub fn scroll(hwnd: HWND, notches: i32) -> Result<(), String> {
-    if !exists(hwnd) {
+    if !reachable(hwnd) {
         return Err(CLOSED.into());
     }
     if is_hung(hwnd) {
@@ -619,25 +646,28 @@ fn root_at(x: i32, y: i32, ours: Ours) -> Option<HWND> {
 /// the app's name, which would read as some other program.
 const HUD_NAME: &str = "the overlay's chat panel";
 
-/// A name the user would recognise for a covering window. Menus and dropdowns
-/// have no title of their own, so they take their owner's ("a popup of Paint"
-/// reads better than a class name).
-fn covering_name(hwnd: HWND, hud: Option<HWND>) -> String {
+/// A name for a covering window. A shared one goes by its title; menus and
+/// dropdowns have none, so they take the shared window they belong to ("a
+/// popup of Paint"). Every window that is not shared is "another window",
+/// never its title, its owner's or its class: those name the app the user
+/// kept to themselves.
+fn cover_name(hwnd: HWND, hud: Option<HWND>) -> String {
     if Some(hwnd) == hud {
         return HUD_NAME.to_string();
     }
-    let title = title_of(hwnd);
-    if !title.trim().is_empty() {
-        return title;
-    }
-    let owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
-    if !owner.is_invalid() && owner != hwnd {
-        let owner_title = title_of(owner);
-        if !owner_title.trim().is_empty() {
-            return format!("a popup of {owner_title}");
+    if allowed(hwnd) {
+        let title = title_of(hwnd);
+        if !title.trim().is_empty() {
+            return title;
+        }
+        if let Some(owner) = root_owner_of(hwnd).filter(|o| allowed(*o)) {
+            let owner_title = title_of(owner);
+            if !owner_title.trim().is_empty() {
+                return format!("a popup of {owner_title}");
+            }
         }
     }
-    class_of(hwnd)
+    ANOTHER_WINDOW.to_string()
 }
 
 /// How much of `rect` (virtual-screen physical; the whole window when None) is
@@ -652,8 +682,12 @@ fn covering_name(hwnd: HWND, hud: Option<HWND>) -> String {
 /// forward, which closes the menu. A main window's own dropdown is not: an
 /// autocomplete list hanging over the circled Submit button hides it from the
 /// user like any other window, and the user would aim at the list entry.
+///
+/// The sampling sees every window, shared or not, since what the user sees is
+/// what counts; only the names are held back (cover_name). A target that is
+/// not shared is refused as if it had closed.
 pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND>, row: bool) -> Result<Coverage, String> {
-    if !exists(hwnd) {
+    if !reachable(hwnd) {
         return Err(CLOSED.into());
     }
     let target = unsafe { GetAncestor(hwnd, GA_ROOT) };
@@ -697,7 +731,7 @@ pub fn covered(hwnd: HWND, rect: Option<Rect>, ignore_pid: u32, hud: Option<HWND
     let (fraction, centre_covered, by) = tally(&samples);
     let mut names: Vec<String> = Vec::new();
     for h in by {
-        let name = covering_name(HWND(h as *mut std::ffi::c_void), hud);
+        let name = cover_name(HWND(h as *mut std::ffi::c_void), hud);
         if !names.contains(&name) {
             names.push(name);
         }
@@ -829,6 +863,13 @@ mod tests {
         assert_eq!(sample_of(4, 1, &[], || true), Sample::Nowhere);
         // The target is never mistaken for the desktop, nor asked about it.
         assert_eq!(sample_of(1, 1, &[], || panic!("asked")), Sample::Target);
+    }
+
+    #[test]
+    fn blanking_paints_everything() {
+        let mut buf = image(4, 3, [200, 100, 50, 255]);
+        blank(&mut buf);
+        assert!(buf.chunks_exact(4).all(|px| px == MASK_BGRA));
     }
 
     #[test]
