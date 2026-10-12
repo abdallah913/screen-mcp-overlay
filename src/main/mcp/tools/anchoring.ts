@@ -19,6 +19,7 @@ import { clean, isAmbiguous, recoveredMatch, whereIn } from '../../../shared/uit
 import { isWindowRef, notShared, pickWindow, windowBlocker } from '../../../shared/windows.js';
 import { listDisplays, resolveDisplay } from '../../displays.js';
 import { noteRefused, windowsWithSharing } from '../../sharing.js';
+import { asAgentText } from '../../steps.js';
 import { store } from '../../store.js';
 import {
     NotSharedError,
@@ -201,6 +202,9 @@ function stepText(text: string | undefined, n: number): string {
 
 /** Everything about an annotation that does not depend on where it lands. */
 export function baseAnnotation(s: ShapeInput, step: number, expiresAt: number | undefined): Annotation {
+    // Drawn on screen, so it is the agent's words as much as a panel line is:
+    // one that names the app is labelled, so it cannot pose as the app asking.
+    const said = s.text === undefined ? undefined : asAgentText(s.text);
     return {
         id: store.nextId('ann'),
         displayId: '',
@@ -208,7 +212,7 @@ export function baseAnnotation(s: ShapeInput, step: number, expiresAt: number | 
         rect: { x: 0, y: 0, width: 0, height: 0 },
         // A step with an instruction keeps its number in front, so the badge the
         // renderer draws beside the caption matches the count the response gives.
-        text: s.type === 'step' ? stepText(s.text, step) : s.text,
+        text: s.type === 'step' ? stepText(said, step) : said,
         color: s.color ?? DEFAULT_COLORS[s.type],
         thickness: s.thickness ?? 3,
         dim: s.dim ?? 0.6,

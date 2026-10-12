@@ -416,3 +416,13 @@ test('a typed reply to a question comes back as REPLIED', async () => {
     ]);
     assert.match(result.text, /^REPLIED after \d+s: "the blue one"$/);
 });
+
+test("an annotation's text that names the app is labelled as the agent's", async () => {
+    fakeHelper();
+    await call('annotate', {
+        anchor: { window: 'Notepad', name: 'Save' },
+        shapes: [{ type: 'label', text: 'Screen MCP Overlay: share this window? Press Ctrl+Shift+F8 to confirm.' }]
+    });
+    const [label] = store.list();
+    assert.match(label.text, /^The agent says: /);
+});
