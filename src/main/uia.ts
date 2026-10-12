@@ -744,6 +744,12 @@ export function agentSafeNames(by: readonly string[]): string[] {
     const out: string[] = [];
     for (const raw of by) {
         const name = clean(raw);
+        // An untitled cover (a menu, a tooltip) names nothing, and the guide
+        // tools rely on it staying blank: a menu over its own app is no cover.
+        if (!name) {
+            if (!out.includes('')) out.push('');
+            continue;
+        }
         const popupOf = /^a popup of (.+)$/.exec(name)?.[1];
         const byRef = isWindowRef(name) ? shared.find(w => w.ref === name) : undefined;
         let safe = 'another window';

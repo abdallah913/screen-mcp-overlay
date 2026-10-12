@@ -72,7 +72,7 @@ test('a covered target is drawn, marked and warned about, naming the cover only 
     fakeHelper({ covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Google Chrome'] }) });
     const { text, isError } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
     assert.equal(isError, false);
-    assert.match(text, /WARNING: "Save" \[button\] el_1 is behind "another window".*focus_window \{"window":"100"\}/);
+    assert.match(text, /WARNING: "Save" \[button\] el_1 is behind another window.*focus_window \{"window":"100"\}/);
     assert.equal(store.list()[0].covered, 'another window');
 
     fakeHelper({ covered: () => ({ fraction: 0.85, centre_covered: true, by: ['Calculator'] }) });

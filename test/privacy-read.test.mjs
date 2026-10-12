@@ -194,7 +194,7 @@ test('a private window covering a shared target is "another window", however the
         fakeHelper({ covered: () => ({ fraction: 0.9, centre_covered: true, by }) }, desktopWith(true));
         const { text } = await call('annotate', { anchor: { window: 'Notepad', name: 'Save' }, shapes: [{ type: 'circle' }] });
         assertNoLeak(text, JSON.stringify(by));
-        assert.match(text, /is behind "another window"/);
+        assert.match(text, /is behind another window/);
         assertNoLeak(String(store.list()[0].covered), 'the stored cover');
     }
 });
@@ -272,7 +272,7 @@ async function answerShare(choice) {
     for (let i = 0; i < 400 && !currentStep(); i += 1) await new Promise(r => setTimeout(r, 5));
     const ask = currentStep();
     assert.equal(ask.mode, 'watch');
-    assert.match(ask.prompt, /The AI asks to see the window you need help with \(to read the video title\)/);
+    assert.match(ask.prompt, /an AI agent asks to see the window you need help with \(it says: “to read the video title”\)/);
     answerStep({ kind: 'done' }, ask.id);
     if (choice === undefined) return;
     for (let i = 0; i < 400 && currentStep()?.mode !== 'choice'; i += 1) await new Promise(r => setTimeout(r, 5));
