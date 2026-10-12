@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync, writeFileSync } from 'node:fs';
+import { readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -70,6 +70,49 @@ async function sameWithAndWithout(tool, args, renders = {}, pixels = true) {
 
 const at = (img, x, y) => [...img.data.subarray((y * img.width + x) * 4, (y * img.width + x) * 4 + 4)];
 
+const BLANK = [32, 32, 32, 255];
+
+/** Every pixel of `r` (in the image's own pixels) is the blank colour. */
+function allBlank(img, r) {
+    for (let y = r.y; y < r.y + r.height; y += 1) {
+        for (let x = r.x; x < r.x + r.width; x += 1) {
+            if (at(img, x, y).join() !== BLANK.join()) return false;
+        }
+    }
+    return true;
+}
+
+/** The desktop with the video at `where` (in front of everything), or with it closed when null. */
+function videoAt(where) {
+    const desktop = captureDesktop(where !== null);
+    if (where) desktop.windows[0].rect = where;
+    return desktop;
+}
+
+/** Over part of Notepad, at two places: anything that follows it would differ between them. */
+const OVER_NOTEPAD = [rect(600, 120, 900, 600), rect(300, 400, 400, 200)];
+/** Over Calculator, more than a shadow's width from Notepad. */
+const BESIDE_NOTEPAD = rect(1000, 650, 300, 200);
+
+/**
+ * OCR that also keeps the image it was given, so a test can compare what
+ * read_text read and not only the lines it found.
+ */
+function recordingOcr(seen) {
+    return p => {
+        const img = readImage(p.path);
+        seen.push(img);
+        const colours = coloursIn(img);
+        const lines = [];
+        if (colours.has('notepad')) lines.push({ text: 'notepad text', rect: rect(10, 40, 100, 12) });
+        if (colours.has('private') || colours.has('privateBar')) lines.push({ text: 'private text', rect: rect(10, 80, 100, 12) });
+        return lines;
+    };
+}
+
+/** The Note lines of a response: what it says about where its pixels came from. */
+const notes = text => text.split('\n').filter(l => l.startsWith('Note:'));
+
 // --- display and region captures -----------------------------------------------------
 
 test('a display capture is drawn from the shared windows themselves: nothing traces the private window', async () => {
@@ -118,16 +161,58 @@ test('shared windows keep their order: the one in front covers the one behind', 
 });
 
 test('a shared window that cannot render itself falls back to the masked screen, with wide margins', async () => {
-    captureHelper(captureDesktop(true), { renders: { 100: 'blank' } });
+    captureHelper(videoAt(BESIDE_NOTEPAD), { renders: { 100: 'blank' } });
     const r = await call('capture_screen', { display: 'primary', maxDimension: 4096 });
     assert.equal(r.isError, false, r.text);
     const img = imageOf(r.text);
     assert.equal(stub.__state.grabs, 1);
     // Neither the video's shadow nor the corners around Notepad survive.
     assertNothingPrivate(img, 'masked fallback');
-    assert.deepEqual(at(img, 300, 400), COLOURS.notepad, 'the uncovered part is the screen there');
-    assert.deepEqual(at(img, 700, 400), [32, 32, 32, 255], 'under the video is blank');
+    assert.deepEqual(at(img, 300, 400), COLOURS.notepad, 'with nothing else over it, it is the screen there');
+    assert.deepEqual(at(img, 104, 400), BLANK, 'its edge is pulled in');
 });
+
+for (const how of ['fallback', 'blank']) {
+    test(`a shared window that renders ${how} with the video over part of it is blank whole, wherever the video is`, async () => {
+        const images = [];
+        for (const where of OVER_NOTEPAD) {
+            captureHelper(videoAt(where), { renders: { 100: how } });
+            const r = await call('capture_screen', { display: 'primary', maxDimension: 4096 });
+            assert.equal(r.isError, false, r.text);
+            images.push(imageOf(r.text));
+        }
+        // A hole cut around the video would trace where it is and follow it.
+        assert.ok(Buffer.from(images[0].data).equals(Buffer.from(images[1].data)), 'the image follows the video');
+        assert.ok(allBlank(images[0], rect(100, 100, 800, 600)), 'Notepad is blank whole');
+        assertNothingPrivate(images[0], 'screen copy under the video');
+        assert.deepEqual(at(images[0], 1100, 400), COLOURS.calculator, 'Calculator still renders itself');
+    });
+}
+
+for (const how of ['fallback', 'blank']) {
+    for (const [tool, args] of [
+        ['capture_screen', { window: 'Notepad', asRendered: true, maxDimension: 4096 }],
+        ['capture_screen', { window: 'Notepad', maxDimension: 4096 }],
+        ['read_text', { window: 'Notepad' }]
+    ]) {
+        test(`${tool} ${JSON.stringify(args)} of a window that renders ${how} reads the same wherever the video is over it`, async () => {
+            const results = [];
+            for (const where of OVER_NOTEPAD) {
+                const read = [];
+                captureHelper(videoAt(where), { renders: { 100: how }, overrides: { ocr: recordingOcr(read) } });
+                const r = await call(tool, args);
+                assert.equal(r.isError, false, r.text);
+                results.push({ text: normal(r.text), image: imageOf(r.text) ?? read.at(-1) });
+            }
+            assert.equal(results[0].text, results[1].text);
+            assert.doesNotMatch(results[0].text, /private text|\d+%/);
+            const [a, b] = results.map(x => x.image);
+            assert.deepEqual({ width: a.width, height: a.height }, { width: b.width, height: b.height });
+            assert.ok(Buffer.from(a.data).equals(Buffer.from(b.data)), 'the pixels follow the video');
+            assertNothingPrivate(a, `${tool} under the video`);
+        });
+    }
+}
 
 test('a capture on a display left of the primary one, at a negative origin and another scale', async () => {
     stub.__state.displays = [
@@ -180,19 +265,119 @@ test('asRendered names a shared window on top, worded the same with the video op
 test('capture_screen of a window that refused to render says the same with the video open or closed', async () => {
     const { text } = await sameWithAndWithout('capture_screen', { window: 'Notepad' }, { 100: 'fallback' }, false);
     assert.doesNotMatch(text, /\d+%/);
-    assert.match(text, /Parts of this window that are not on top show only shared windows; the rest is blank\./);
+    assert.match(text, /This window cannot render itself, so it comes from the screen and may be partly or wholly blank\./);
+});
+
+test('whether a refusing window reads as blank depends on its own render, never on what covers it', async () => {
+    // The video over all of Notepad leaves its screen copy one flat colour.
+    const whole = rect(50, 50, 1000, 800);
+    captureHelper(videoAt(whole), { renders: { 100: 'fallback' } });
+    const covered = await call('capture_screen', { window: 'Notepad' });
+    captureHelper(videoAt(null), { renders: { 100: 'fallback' } });
+    const open = await call('capture_screen', { window: 'Notepad' });
+    assert.equal(normal(covered.text), normal(open.text));
+    assert.doesNotMatch(covered.text, /flat colour/);
+
+    captureHelper(videoAt(whole), { renders: { 100: 'fallback' } });
+    const read = await call('read_text', { window: 'Notepad' });
+    captureHelper(videoAt(null), { renders: { 100: 'fallback' } });
+    const readOpen = await call('read_text', { window: 'Notepad' });
+    // What it found may differ (nothing at all under the video), but never why.
+    assert.deepEqual(notes(read.text), notes(readOpen.text));
+    assert.doesNotMatch(read.text, /rendered blank|GPU/);
 });
 
 // --- read_text of a window --------------------------------------------------------------
 
 for (const how of ['fallback', 'blank']) {
-    test(`read_text of a window that renders ${how} reads the same with the video open or closed`, async () => {
-        const { text } = await sameWithAndWithout('read_text', { window: 'Notepad' }, { 100: how });
-        assert.match(text, /notepad text/);
-        assert.doesNotMatch(text, /private text|shadow|\d+%|nothing covered/);
-        assert.match(text, /Parts of this window that are not on top show only shared windows; the rest is blank\./);
+    test(`read_text of a window that renders ${how} reads the same with the video beside it or closed`, async () => {
+        captureHelper(videoAt(BESIDE_NOTEPAD), { renders: { 100: how } });
+        const beside = await call('read_text', { window: 'Notepad' });
+        captureHelper(videoAt(null), { renders: { 100: how } });
+        const closed = await call('read_text', { window: 'Notepad' });
+        assert.equal(normal(beside.text), normal(closed.text));
+        assert.match(beside.text, /notepad text/);
+        assert.doesNotMatch(beside.text, /private text|shadow|\d+%|nothing covered/);
+        assert.match(beside.text, /This window cannot render itself, so it comes from the screen and may be partly or wholly blank\./);
+        // Over it, the note is the same word for word.
+        captureHelper(videoAt(OVER_NOTEPAD[1]), { renders: { 100: how } });
+        const over = await call('read_text', { window: 'Notepad' });
+        assert.deepEqual(notes(over.text), notes(closed.text));
+        assert.doesNotMatch(over.text, /private text|shadow|\d+%/);
     });
 }
+
+// --- renders that fail, and our own overlay ---------------------------------------------
+
+test('captures after the capture dir was emptied (as when the user stops sharing something) are still composed', async () => {
+    const dir = join(tmpdir(), 'screen-mcp-overlay', String(process.pid));
+    captureHelper(captureDesktop(true));
+    await call('capture_screen', { display: 'primary' });
+    // What index.ts does on every revocation: the private render dir goes too.
+    for (const name of readdirSync(dir)) rmSync(join(dir, name), { recursive: true, force: true });
+    const { image } = await sameWithAndWithout('capture_screen', { display: 'primary', maxDimension: 4096 });
+    assert.equal(stub.__state.grabs, 0, 'the screen was grabbed');
+    assert.deepEqual(at(image, 700, 400), COLOURS.notepad);
+    assertNothingPrivate(image, 'capture after a purge');
+    captureHelper(captureDesktop(true));
+    const window = await call('capture_screen', { window: 'Notepad' });
+    assert.equal(window.isError, false, window.text);
+});
+
+test('a shared window whose render fails is left blank, and the screen is never read for it', async () => {
+    const { image } = await sameWithAndWithout('capture_screen', { display: 'primary', maxDimension: 4096 }, { 100: 'error' });
+    assert.equal(stub.__state.grabs, 0, 'the screen was grabbed');
+    assert.ok(allBlank(image, rect(100, 100, 800, 600)), 'Notepad is blank');
+    assert.deepEqual(at(image, 1100, 400), COLOURS.calculator);
+});
+
+/** Our own full-screen overlay, in front, with a step strip over Notepad (say, a window title being confirmed). */
+const STRIP = [7, 77, 177, 255];
+function withOverlay(desktop) {
+    desktop.windows.unshift({
+        ref: '900', title: '', class: 'Chrome_WidgetWin_1', pid: process.pid, rect: rect(0, 0, 1920, 1080),
+        foreground: false, minimized: false, cloaked: false, elevated: false, hung: false
+    });
+    return desktop;
+}
+/** The overlay is see-through, so the fake screen does not paint it: only its strip, here. */
+function paintStrip() {
+    const s = stub.__state.screen[1];
+    for (let y = 600; y < 640; y += 1) for (let x = 150; x < 550; x += 1) s.data.set(STRIP, (y * s.width + x) * 4);
+}
+function stripPixels(img) {
+    let n = 0;
+    for (let i = 0; i < img.data.length; i += 4) if (img.data[i] === 7 && img.data[i + 1] === 77 && img.data[i + 2] === 177) n += 1;
+    return n;
+}
+
+test('with content protection off, our overlay is cut from screen copies like any window on top', async () => {
+    harness.setContentProtection(false);
+    try {
+        for (const [tool, args] of [
+            ['capture_screen', { display: 'primary', maxDimension: 4096 }],
+            ['capture_screen', { window: 'Notepad', asRendered: true, maxDimension: 4096 }],
+            ['capture_screen', { window: 'Notepad', maxDimension: 4096 }],
+            ['read_text', { window: 'Notepad' }]
+        ]) {
+            const read = [];
+            captureHelper(withOverlay(captureDesktop(false)), { renders: { 100: 'fallback' }, overrides: { ocr: recordingOcr(read) } });
+            paintStrip();
+            const r = await call(tool, args);
+            assert.equal(r.isError, false, r.text);
+            const img = imageOf(r.text) ?? read.at(-1);
+            assert.equal(stripPixels(img), 0, `${tool} ${JSON.stringify(args)} kept the overlay's strip`);
+        }
+    } finally {
+        harness.setContentProtection(true);
+    }
+});
+
+test('with content protection on, our overlay is not in the grab, so it hides nothing', async () => {
+    captureHelper(withOverlay(captureDesktop(false)), { renders: { 100: 'blank' } });
+    const r = await call('capture_screen', { display: 'primary', maxDimension: 4096 });
+    assert.deepEqual(at(imageOf(r.text), 300, 400), COLOURS.notepad);
+});
 
 // --- the user stops sharing mid-capture ---------------------------------------------------
 

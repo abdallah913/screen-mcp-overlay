@@ -240,7 +240,9 @@ test('rows carry state words, offscreen and popup marks', () => {
         n(1, 'listitem', 'Layer 9', { offscreen: true }),
         n(1, 'menu', 'File', { popup: true })
     ]);
-    assert.match(row(nodes[1], false), /^ {2}Rulers \[checkbox\] checked focused {2}el_/);
+    // Never "focused": no shared row has focus while the user is in a window
+    // they did not share, so the mark would say where they are.
+    assert.match(row(nodes[1], false), /^ {2}Rulers \[checkbox\] checked {2}el_/);
     assert.match(row(nodes[2], false), /^ {2}Layer 9 \[listitem\] offscreen {2}el_/);
     assert.match(row(nodes[3], false), /^ {2}\(popup\) File \[menu\] {2}el_/);
 });
@@ -256,6 +258,12 @@ test('element lines carry state words and the offscreen mark', () => {
         rect: { x: 1, y: 2, width: 3, height: 4 }
     });
     assert.equal(line, 'Dark mode [checkbox] checked offscreen  3x4@1,2  el_3');
+});
+
+test('element lines never say which control has focus', () => {
+    const line = state => elementLine({ ref: 'el_3', name: 'Name', role: 'edit', enabled: true, state, rect: { x: 1, y: 2, width: 3, height: 4 } });
+    assert.equal(line('focused'), 'Name [edit]  3x4@1,2  el_3');
+    assert.equal(line('checked,focused'), line('checked'));
 });
 
 // --- collapsing long lists ----------------------------------------------------
@@ -283,10 +291,15 @@ test('a short run is left alone', () => {
     assert.equal(marker(shown(list(8))), undefined);
 });
 
-test('a selected or focused item is never collapsed away', () => {
+test('a selected item is never collapsed away', () => {
     const rows = shown(list(20, i => (i === 11 ? { state: 'selected' } : {})));
     assert.ok(rows.some(x => x.name === 'File 12'));
     assert.equal(marker(rows).more, 14);
+});
+
+test('focus alone keeps no row: what is printed does not depend on where the user is', () => {
+    const rows = state => shown(list(20, i => (i === 11 ? { state } : {}))).map(x => row(x, false).replace(/el_\S+/, 'el_N'));
+    assert.deepEqual(rows('focused'), rows(undefined));
 });
 
 test('a collapsed item takes its children with it', () => {

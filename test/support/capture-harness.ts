@@ -5,3 +5,4 @@
  */
 export * from './harness.js';
 export { initCaptureDir, cleanupCaptureDir } from '../../src/main/capture.js';
+export { setContentProtection } from '../../src/main/overlay.js';

@@ -76,7 +76,10 @@ export interface ElementInfo {
     value?: string;
     /** Scrolled out of view: the rect is real but not visible. */
     offscreen?: boolean;
-    /** Comma-joined: checked, unchecked, mixed, selected, expanded, collapsed, focused. */
+    /**
+     * Comma-joined: checked, unchecked, mixed, selected, expanded, collapsed,
+     * focused. "focused" is never printed for an agent (uitree's words).
+     */
     state?: string;
     /** Set when the match is in a popup (menu, dropdown) of the window's process: that popup's ref. */
     window?: string;
@@ -621,13 +624,16 @@ export async function describeWindow(opts: {
     maxDepth?: number;
     /**
      * Read no focus: no row is marked focused, and a long list keeps no row
-     * for being focused. For comparing trees, which focus alone must not change.
+     * for being focused. The default: two trees then differ only when the
+     * window did, and every tree reaches an agent sooner or later, where focus
+     * would say whether the user is in a shared window or one they did not
+     * share (then no shared row has it). Only `false` reads it.
      */
     ignoreFocus?: boolean;
 }): Promise<Described> {
     const described = await send<Described>(
         'describe',
-        { window: opts.window, max_nodes: opts.maxNodes, max_depth: opts.maxDepth, ignore_focus: opts.ignoreFocus },
+        { window: opts.window, max_nodes: opts.maxNodes, max_depth: opts.maxDepth, ignore_focus: opts.ignoreFocus ?? true },
         20000
     );
     // The root row is the window itself, already addressable by its own ref.

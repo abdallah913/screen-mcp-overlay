@@ -161,6 +161,57 @@ test('"foreground" with nothing shared is the same refusal as any other window',
     assert.deepEqual(touched(calls), [], 'refused before the helper was asked about any window');
 });
 
+test('"foreground" is the frontmost shared window whichever window has focus, an always-on-top one included', async () => {
+    const run = async focus => {
+        const desktop = fakeDesktop();
+        // Calculator is always on top: first in z-order, without the focus.
+        const calc = desktop.windows.splice(1, 1)[0];
+        desktop.windows.unshift(calc);
+        for (const w of desktop.windows) w.foreground = false;
+        if (focus === 'video') desktop.windows.splice(1, 0, { ...video, foreground: true });
+        else desktop.windows.find(w => w.ref === focus).foreground = true;
+        const { calls } = fakeHelper({}, desktop);
+        const { text } = await call('describe_window', { window: 'foreground' });
+        assertNoLeak(text);
+        return calls.find(c => c.op === 'describe').params.window;
+    };
+    assert.equal(await run('100'), '200', 'the user in Notepad');
+    assert.equal(await run('video'), '200', 'the user in the video');
+    assert.equal(await run('200'), '200', 'the user in Calculator');
+});
+
+// --- focus --------------------------------------------------------------------------
+
+test('no row says which control has focus, so nothing says whether the user is in a shared window', async () => {
+    const save = { ref: 'el_1', name: 'Save', role: 'button', rect: rect(150, 150, 80, 24), enabled: true };
+    const run = async inVideo => {
+        const desktop = desktopWith(inVideo);
+        if (!inVideo) desktop.windows[0].foreground = true;
+        const front = desktop.windows.find(w => w.foreground).ref;
+        // As the real helper: a row is marked focused only when focus is read
+        // and the window walked is the one the user is in.
+        fakeHelper(
+            {
+                describe: p => ({
+                    nodes: desktop.tree.map(n => (!p.ignore_focus && p.window === front && n.role === 'document' ? { ...n, state: 'focused' } : n)),
+                    truncated: false
+                }),
+                find_elements: p => (p.window === '100' ? [{ ...save, state: front === '100' ? 'focused' : undefined }] : [])
+            },
+            desktop
+        );
+        const out = [];
+        for (const window of ['100', '200']) out.push((await call('describe_window', { window })).text);
+        out.push((await call('find_ui_elements', { name: 'Save' })).text);
+        out.push((await call('find_ui_elements', { window: 'Notepad', name: 'Save' })).text);
+        return out.map(normal);
+    };
+    const inNotepad = await run(false);
+    const inVideo = await run(true);
+    for (const text of inNotepad) assert.doesNotMatch(text, /focused/);
+    assert.deepEqual(inNotepad, inVideo);
+});
+
 // --- searching without a window -------------------------------------------------------
 
 test('find_ui_elements without a window searches each shared window, never the desktop', async () => {
@@ -401,9 +452,83 @@ test('a declined ask reads the same as one nobody answered, and shares nothing',
     assertNoLeak(text);
 });
 
+// --- describe_window baselines ---------------------------------------------------------
+
+const snapshotOf = text => /snapshotId: (\S+)/.exec(text)[1];
+const withDocument = (desktop, value) => desktop.tree.map(n => (n.role === 'document' ? { ...n, value } : n));
+
+test('a since= baseline does not outlive the user stopping sharing the window', async () => {
+    const desktop = fakeDesktop();
+    let tree = withDocument(desktop, 'my bank PIN is 1234');
+    fakeHelper({ describe: () => ({ nodes: tree, truncated: false }) }, desktop);
+    const snap = snapshotOf((await call('describe_window', { window: 'Notepad' })).text);
+    // The user takes Notepad back, deletes the line, and shares it again later.
+    harness.stopSharingWindow('100', { byUser: true });
+    tree = withDocument(desktop, 'shopping list');
+    harness.shareWindow(desktop.windows[0], { byUser: true });
+    const { text } = await call('describe_window', { window: 'Notepad', since: snap });
+    assert.doesNotMatch(text, /PIN/);
+    assert.ok(text.startsWith(`(baseline ${snap} is no longer cached, so this is a full tree)\n`), text);
+});
+
+test('stopping sharing anything drops, at once, every baseline but those of windows still shared by themselves', async () => {
+    fakeHelper();
+    const notepad = snapshotOf((await call('describe_window', { window: 'Notepad' })).text);
+    const calculator = snapshotOf((await call('describe_window', { window: 'Calculator' })).text);
+    // A dialog shared through its owner, or a window through its app.
+    store.recordSnapshot({ id: 'snap_dialog', windowRef: '600', at: Date.now(), nodes: [] });
+    harness.stopSharingWindow('200', { byUser: true });
+    assert.equal(store.snapshot(calculator), undefined);
+    assert.equal(store.snapshot('snap_dialog'), undefined);
+    assert.ok(store.snapshot(notepad), 'Notepad is shared as it was');
+    harness.stopSharingEverything({ byUser: true });
+    assert.equal(store.snapshot(notepad), undefined);
+});
+
+test('a baseline taken before the window was last shared is refused like an unknown one', async () => {
+    const desktop = fakeDesktop();
+    let tree = withDocument(desktop, 'my bank PIN is 1234');
+    fakeHelper({ describe: () => ({ nodes: tree, truncated: false }) }, desktop);
+    const snap = snapshotOf((await call('describe_window', { window: 'Notepad' })).text);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    // Shared anew without anything being revoked: say it closed, and a
+    // window with the same handle was shared later.
+    tree = withDocument(desktop, 'shopping list');
+    fakeHelper({ describe: () => ({ nodes: tree, truncated: false }) }, desktop);
+    const { text } = await call('describe_window', { window: 'Notepad', since: snap });
+    assert.doesNotMatch(text, /PIN/);
+    assert.ok(text.startsWith(`(baseline ${snap} is no longer cached, so this is a full tree)\n`), text);
+    // One taken during this share still works.
+    const now = snapshotOf(text);
+    tree = withDocument(desktop, 'shopping list, eggs');
+    assert.match((await call('describe_window', { window: 'Notepad', since: now })).text, /^1 change\(s\) since /);
+});
+
+test('snapshot ids cannot be guessed, from one another or by counting', async () => {
+    fakeHelper();
+    const ids = [];
+    for (let i = 0; i < 3; i += 1) ids.push(snapshotOf((await call('describe_window', { window: 'Notepad' })).text));
+    for (const id of ids) assert.match(id, /^snap_\d{20}$/);
+    assert.equal(new Set(ids).size, 3);
+    for (let n = 1; n <= 40; n += 1) {
+        const { text } = await call('describe_window', { window: 'Notepad', since: `snap_${n}` });
+        assert.ok(text.startsWith(`(baseline snap_${n} is no longer cached`), text);
+    }
+});
+
 // --- masking captures (pure) ------------------------------------------------------------
 
 const r = (x, y, width, height) => ({ x, y, width, height });
+
+test('capture layers: our overlay hides what is under it when it shows in grabs', () => {
+    const stack = [
+        { ref: 'overlay', pid: 1, rect: r(0, 0, 1920, 1080) },
+        { ref: '100', pid: 11, rect: r(100, 100, 800, 600) }
+    ];
+    const layers = captureLayers(stack, { pid: 1, panel: 'hud', overlayInGrab: true }, w => w.ref === '100');
+    assert.deepEqual(layers.map(l => [l.shared, Boolean(l.ignore)]), [[false, false], [true, false]]);
+    assert.deepEqual(keptInFrame(layers, layers, r(0, 0, 1920, 1080), { width: 1920, height: 1080 }), []);
+});
 
 test('capture layers: our overlay is see-through, the chat panel hides, sharing decides the rest', () => {
     const stack = [

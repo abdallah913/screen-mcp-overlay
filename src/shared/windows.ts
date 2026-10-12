@@ -28,7 +28,7 @@ export interface WindowLike {
     hung?: boolean;
 }
 
-/** Words that mean "whatever the user is looking at". */
+/** Words that mean "the window in front": the frontmost shared one (see matchWindow). */
 const FOREGROUND = new Set(['foreground', 'active', 'focused', 'current']);
 
 /** True for a ref as list_windows prints it: a stringified HWND. */
@@ -62,29 +62,27 @@ export function notShared(query: string, shared: readonly Pick<WindowLike, 'ref'
 /**
  * Pick the window a query means, or explain why none matches.
  *
- * An exact title beats a substring, and among several matches the foreground
- * window wins, then the frontmost: the window list arrives in z-order, and the
- * one in front is nearly always the one the user means. Guessing beats an
- * "ambiguous" error here because the chosen window's title is in every
- * response, so a wrong guess is visible and cheap to correct.
+ * An exact title beats a substring, and among several matches the frontmost
+ * wins: the window list arrives in z-order, and the one in front is nearly
+ * always the one the user means. Guessing beats an "ambiguous" error here
+ * because the chosen window's title is in every response, so a wrong guess is
+ * visible and cheap to correct.
  *
- * Given only shared windows, "foreground" is the shared window in front when
- * it has focus, else the frontmost shared one: never whatever the user is
- * actually looking at, which may be something they did not share.
+ * Given only shared windows, "foreground" is the frontmost shared one. Which
+ * window has focus is never consulted, here or in a tie: when the user is in
+ * a window they did not share, no shared window has it, so any choice made by
+ * focus would come out differently and say where they are.
  */
 export function matchWindow<W extends WindowLike>(query: string, windows: W[]): W | string {
     const q = query.trim();
     if (windows.length === 0) return notShared(q, windows);
 
-    if (FOREGROUND.has(q.toLowerCase())) {
-        return windows.find(w => w.foreground) ?? windows[0]!;
-    }
+    if (FOREGROUND.has(q.toLowerCase())) return windows[0]!;
 
     const needle = q.toLowerCase();
-    const best = (list: W[]): W | undefined => list.find(w => w.foreground) ?? list[0];
-    const exact = best(windows.filter(w => w.title.trim().toLowerCase() === needle));
+    const exact = windows.find(w => w.title.trim().toLowerCase() === needle);
     if (exact) return exact;
-    const partial = best(windows.filter(w => w.title.toLowerCase().includes(needle)));
+    const partial = windows.find(w => w.title.toLowerCase().includes(needle));
     if (partial) return partial;
     return notShared(q, windows);
 }
@@ -230,20 +228,22 @@ export interface StackLike {
 }
 
 /**
- * The stack as layers for masking a capture. Our own windows are left out
- * (the overlay is see-through and drawn for the user, and content protection
- * normally keeps it out of the grab anyway), except the chat panel: it is
- * opaque, carries the user's conversation, and can sit on top of a shared
- * window, so it hides what is under it and is never shown itself.
+ * The stack as layers for masking a capture. The chat panel is opaque,
+ * carries the user's conversation, and can sit on top of a shared window, so
+ * it hides what is under it and is never shown itself. Our other windows, the
+ * overlay, are see-through and left out while content protection keeps them
+ * out of the grab. When it does not (`overlayInGrab`), the overlay is in the
+ * grab like any window, step strip and all, and the strip can name a window
+ * the user is being asked about, so it is cut out like the panel.
  */
 export function captureLayers<S extends StackLike>(
     stack: readonly S[],
-    own: { pid: number; panel?: string },
+    own: { pid: number; panel?: string; overlayInGrab?: boolean },
     shared: (w: S) => boolean
 ): Layer[] {
     return stack.map(w => {
         if (w.ref === own.panel) return { rect: w.rect, shared: false };
-        if (w.pid === own.pid) return { rect: w.rect, shared: false, ignore: true };
+        if (w.pid === own.pid) return own.overlayInGrab ? { rect: w.rect, shared: false } : { rect: w.rect, shared: false, ignore: true };
         return { rect: w.rect, shared: shared(w) };
     });
 }

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { rmSync } from 'node:fs';
 import type { Annotation, CaptureRecord, Point, Rect, StepView, UiSnapshot } from '../shared/types.js';
@@ -17,6 +18,10 @@ class Store extends EventEmitter {
     private sweeper: NodeJS.Timeout | null = null;
 
     nextId(prefix: string): string {
+        // A snapshot id is a key to a window's content (since= replays it), and
+        // the server is shared by every client: one that counted could use
+        // another's. So those are random, in digits to keep the ids' shape.
+        if (prefix === 'snap') return `snap_${randomBytes(8).readBigUInt64BE().toString().padStart(20, '0')}`;
         this.seq += 1;
         return `${prefix}_${this.seq}`;
     }
@@ -196,6 +201,15 @@ class Store extends EventEmitter {
 
     snapshot(id: string): UiSnapshot | undefined {
         return this.snapshots.get(id);
+    }
+
+    /**
+     * Forget baselines (`which` of them; all by default): when the user stops
+     * sharing something, as the capture files go. A since= diff against one
+     * would replay what was read before, to whoever holds its id.
+     */
+    dropSnapshots(which: (s: UiSnapshot) => boolean = () => true): void {
+        for (const [id, s] of this.snapshots) if (which(s)) this.snapshots.delete(id);
     }
 
     /**

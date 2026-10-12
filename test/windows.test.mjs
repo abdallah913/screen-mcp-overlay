@@ -21,9 +21,11 @@ test('numeric refs are recognised, titles are not', () => {
     assert.equal(isWindowRef('3 windows'), false);
 });
 
-test('"foreground" picks the foreground window', () => {
-    assert.equal(matchWindow('foreground', desktop).ref, '200');
-    assert.equal(matchWindow('Active', desktop).ref, '200');
+test('"foreground" is the frontmost window, whichever one has focus', () => {
+    // Which shared window has focus says whether the user is in one they did
+    // not share (then none has), so it is never consulted.
+    assert.equal(matchWindow('foreground', desktop).ref, '100');
+    assert.equal(matchWindow('Active', desktop).ref, '100');
 });
 
 test('"foreground" falls back to the frontmost window when none has focus', () => {
@@ -39,9 +41,10 @@ test('a substring match prefers the frontmost window', () => {
     assert.equal(matchWindow('NOTEPAD ', desktop.slice(0, 3)).ref, '100');
 });
 
-test('a substring match prefers the foreground window', () => {
+test('a substring match prefers the frontmost window, whichever one has focus', () => {
     const list = [w('1', 'Chrome - A'), w('2', 'Chrome - B', true)];
-    assert.equal(matchWindow('chrome', list).ref, '2');
+    assert.equal(matchWindow('chrome', list).ref, '1');
+    assert.equal(matchWindow('chrome - b', [w('1', 'Chrome - B - Old'), w('2', 'Chrome - B')]).ref, '2', 'an exact title still wins');
 });
 
 test('no match explains itself and lists the (shared) windows it was given', () => {

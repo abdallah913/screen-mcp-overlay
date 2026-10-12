@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { CaptureRecord, DisplayInfo, Rect } from '../shared/types.js';
 import { clampRectToDisplay, fitScale } from '../shared/geometry.js';
 import { captureLayers, keptInFrame, nearlyUniform } from '../shared/windows.js';
-import { composeLayers, intersect, maskBitmap, type Bitmap, type Layer, type PaintLayer } from '../shared/visible.js';
+import { composeLayers, intersect, maskBitmap, unsharedOver, type Bitmap, type Layer, type PaintLayer } from '../shared/visible.js';
 import { store } from './store.js';
 import { compositeGrid } from './imageWorker.js';
 import { hudWindowRef, listAllWindows, printWindow, windowStack } from './uia.js';
@@ -14,6 +14,7 @@ import { toDisplayLocal } from './anchors.js';
 import { nativeImage } from 'electron';
 import { listDisplays } from './displays.js';
 import { pushMessage } from './hud.js';
+import { isContentProtected } from './overlay.js';
 
 /**
  * Screenshots are written here rather than returned as base64. Claude Code
@@ -46,10 +47,11 @@ function outDir(): string {
 }
 
 function rawDir(): string {
-    if (!privateDir) {
-        privateDir = join(outDir(), unguessable());
-        mkdirSync(privateDir, { recursive: true, mode: 0o700 });
-    }
+    if (!privateDir) privateDir = join(outDir(), unguessable());
+    // On every use: when the user stops sharing anything, the capture dir is
+    // emptied, this dir included (index.ts purgeCaptures). Every render after
+    // that would fail for want of it.
+    mkdirSync(privateDir, { recursive: true, mode: 0o700 });
     return privateDir;
 }
 
@@ -71,15 +73,32 @@ async function readScreen(): Promise<OnScreen[] | null> {
         // whatever really is there.
         const away = new Set(all.filter(w => w.cloaked || w.minimized).map(w => w.ref));
         const onScreen = stack.filter(w => !away.has(w.ref));
-        const layers = captureLayers(onScreen, { pid: process.pid, panel: hudWindowRef() }, w => isShared(w, stack));
+        // Without content protection, our overlay is in a screen grab like
+        // any other window, so it is masked like one.
+        const own = { pid: process.pid, panel: hudWindowRef(), overlayInGrab: !isContentProtected() };
+        const layers = captureLayers(onScreen, own, w => isShared(w, stack));
         return layers.map((layer, i) => ({ ...layer, ref: onScreen[i]!.ref }));
     } catch {
         return null;
     }
 }
 
-async function screenLayers(): Promise<Layer[] | null> {
-    return readScreen();
+/**
+ * Whether a shared window's screen pixels may be used, within `frame` (the
+ * part of the screen they would be painted from): only when it was on screen
+ * in both readings with nothing unshared in front of it there, shadows
+ * included. Masking around a window on top would leave a hole its shape,
+ * which follows it as it moves, so then the window is left blank whole: all
+ * that says is that something is over it, never what, where or how big.
+ */
+function screenCopyClear(ref: string, frame: Rect, before: OnScreen[] | null, after: OnScreen[] | null): boolean {
+    for (const reading of [before, after]) {
+        const at = reading ? reading.findIndex(w => w.ref === ref) : -1;
+        if (!reading || at < 0) return false;
+        const clip = intersect(reading[at]!.rect, frame);
+        if (!clip || unsharedOver(reading, at, clip)) return false;
+    }
+    return true;
 }
 
 /**
@@ -147,7 +166,11 @@ export interface WindowCapture {
     record: CaptureRecord;
     /** The raw window rect the image covers, virtual-screen physical, invisible resize border included. */
     rect: Rect;
-    /** The render is one flat colour: how PrintWindow sees GPU and DirectX surfaces. */
+    /**
+     * The window's own render is one flat colour: how PrintWindow sees GPU and
+     * DirectX surfaces. Never set for a screen copy, which can be flat only
+     * because of what covers the window.
+     */
     blank: boolean;
 }
 
@@ -163,8 +186,9 @@ export interface WindowCapture {
  * Two ways that can still go wrong are reported rather than hidden: the window
  * refused to render, so the helper copied the screen (`record.fallback`), or
  * it rendered blank. A screen copy is masked like any screen capture: only
- * what a shared window shows on top survives, so whatever covers the window
- * and the strips of desktop around its frame are blanked.
+ * what a shared window shows on top survives, the strips of desktop around
+ * its frame are blanked, and with anything unshared over it the whole copy is
+ * (see screenCopyClear).
  */
 export async function captureWindow(opts: {
     windowRef: string;
@@ -176,10 +200,19 @@ export async function captureWindow(opts: {
     const id = store.nextId('cap');
     // Read before the render as well as after: a fallback is only known once
     // it happened, and windows can move while it does.
-    const before = await screenLayers();
+    const before = await readScreen();
     let { rect, fallback, image } = await printToPrivate(opts.windowRef);
     if (image.isEmpty()) throw new Error('the window rendered an empty image');
-    if (fallback) image = fromBitmap(maskedBitmap(image, keptInFrame(before, await screenLayers(), rect, image.getSize())));
+    // Judged on the window's own render, before anything is masked: a screen
+    // copy blanked whole because something covers the window would otherwise
+    // read as a GPU surface, and say so.
+    const own = image.getSize();
+    const blank = !fallback && nearlyUniform(image.toBitmap(), own.width, own.height);
+    if (fallback) {
+        const after = await readScreen();
+        const keep = screenCopyClear(opts.windowRef, rect, before, after) ? keptInFrame(before, after, rect, own) : [];
+        image = fromBitmap(maskedBitmap(image, keep));
+    }
 
     const size = image.getSize();
     const downscale = fitScale(size, opts.maxDimension, opts.maxPixels);
@@ -192,7 +225,6 @@ export async function captureWindow(opts: {
     }
 
     const finalSize = image.getSize();
-    const blank = nearlyUniform(image.toBitmap(), finalSize.width, finalSize.height);
     const path = join(outDir(), `${unguessable()}.png`);
     let png = image.toPNG();
     if (opts.grid) png = await compositeGrid(png, gridStep(finalSize));
@@ -245,21 +277,30 @@ export interface CaptureOptions {
 }
 
 /**
- * A shared window's own render as a layer, or null when it has to come from
- * the screen instead: the window refused (the helper's screen copy is never
- * looked at), rendered one flat colour (a GPU surface), closed or failed.
+ * How a shared window goes into a composed capture: its own render; from the
+ * screen, when it refused (the helper's screen copy is never looked at) or
+ * rendered one flat colour (a GPU surface); or not at all, blank, when the
+ * render failed (it closed, or the render could not be written or read).
+ * A failure is not a reason to read the screen: that would take its pixels
+ * from wherever something else may be on top, for a fault of our own.
  */
-async function renderLayer(ref: string): Promise<{ image: Bitmap; rect: Rect } | null> {
+type Rendered = { image: Bitmap; rect: Rect } | 'screen' | 'none';
+
+async function renderLayer(ref: string): Promise<Rendered> {
+    let shot: Awaited<ReturnType<typeof printToPrivate>>;
     try {
-        const { rect, fallback, image } = await printToPrivate(ref);
-        if (fallback || image.isEmpty()) return null;
-        const { width, height } = image.getSize();
-        const data = new Uint8Array(image.toBitmap());
-        if (data.length !== width * height * 4 || nearlyUniform(data, width, height)) return null;
-        return { image: { data, width, height }, rect };
+        shot = await printToPrivate(ref);
     } catch {
-        return null;
+        return 'none';
     }
+    const { rect, fallback, image } = shot;
+    if (fallback) return 'screen';
+    if (image.isEmpty()) return 'none';
+    const { width, height } = image.getSize();
+    const data = new Uint8Array(image.toBitmap());
+    if (data.length !== width * height * 4) return 'none';
+    if (nearlyUniform(data, width, height)) return 'screen';
+    return { image: { data, width, height }, rect };
 }
 
 /** The display as the screen shows it, at full physical resolution, or null. */
@@ -289,15 +330,25 @@ async function grabDisplay(display: DisplayInfo): Promise<NativeImage | null> {
  * Only a shared window that will not render itself is taken from the screen:
  * a grab masked to what shared windows show on top both before and after it
  * (windows move while a capture is in flight), painted inside that window
- * only. That part is blank wherever something else covers the window.
+ * only, and only when nothing unshared is in front of it (screenCopyClear);
+ * else that window is blank whole. A window whose render failed is blank too.
  *
  * `area` and `frame` are virtual-screen physical: the canvas and the whole
  * display; nothing outside the display is painted, whatever a window spans.
+ * `fromScreen` is the windows that did not render themselves, painted from
+ * the screen or left blank: decided by how they render, never by what is on
+ * top of them.
  */
-async function compose(display: DisplayInfo, frame: Rect, area: Rect, upTo?: string): Promise<Bitmap> {
+async function compose(
+    display: DisplayInfo,
+    frame: Rect,
+    area: Rect,
+    upTo?: string
+): Promise<{ bitmap: Bitmap; fromScreen: Set<string> }> {
     const size = { width: area.width, height: area.height };
+    const fromScreen = new Set<string>();
     const before = await readScreen();
-    if (!before) return { data: composeLayers(size, area, []), ...size };
+    if (!before) return { bitmap: { data: composeLayers(size, area, []), ...size }, fromScreen };
     let stack = before;
     if (upTo !== undefined) {
         const at = stack.findIndex(w => w.ref === upTo);
@@ -308,23 +359,33 @@ async function compose(display: DisplayInfo, frame: Rect, area: Rect, upTo?: str
 
     // One at a time: the helper is single-threaded, and a burst of renders
     // would queue the anchor tracker behind them.
-    const rendered: { clip: Rect; render: { image: Bitmap; rect: Rect } | null }[] = [];
+    const rendered: { ref: string; clip: Rect; render: Rendered }[] = [];
     for (const w of shown) {
         const clip = intersect(w.rect, frame);
-        if (clip) rendered.push({ clip, render: await renderLayer(w.ref) });
+        if (clip) rendered.push({ ref: w.ref, clip, render: await renderLayer(w.ref) });
     }
 
+    // Grabbed whenever a window asks for the screen, covered or not, so not
+    // even the work done says whether something covers it.
     let screenCopy: Bitmap | null = null;
-    if (rendered.some(r => !r.render)) {
+    let after: OnScreen[] | null = null;
+    if (rendered.some(r => r.render === 'screen')) {
         const grab = await grabDisplay(display);
-        if (grab) screenCopy = maskedBitmap(grab, keptInFrame(before, await screenLayers(), frame, grab.getSize()));
+        after = await readScreen();
+        if (grab) screenCopy = maskedBitmap(grab, keptInFrame(before, after, frame, grab.getSize()));
     }
     const layers: PaintLayer[] = [];
-    for (const { clip, render } of rendered) {
-        if (render) layers.push({ image: render.image, rect: render.rect, clip: [clip] });
-        else if (screenCopy) layers.push({ image: screenCopy, rect: frame, clip: [clip] });
+    for (const { ref, clip, render } of rendered) {
+        if (typeof render === 'object') {
+            layers.push({ image: render.image, rect: render.rect, clip: [clip] });
+            continue;
+        }
+        fromScreen.add(ref);
+        if (render === 'screen' && screenCopy && screenCopyClear(ref, frame, before, after)) {
+            layers.push({ image: screenCopy, rect: frame, clip: [clip] });
+        }
     }
-    return { data: composeLayers(size, area, layers), ...size };
+    return { bitmap: { data: composeLayers(size, area, layers), ...size }, fromScreen };
 }
 
 /**
@@ -352,7 +413,8 @@ export async function captureDisplay(opts: CaptureOptions): Promise<CaptureRecor
     const origin = screen.dipToScreenPoint({ x: display.dipBounds.x, y: display.dipBounds.y });
     const frame = { x: origin.x, y: origin.y, width: full.width, height: full.height };
     const area = { x: frame.x + region.x, y: frame.y + region.y, width: region.width, height: region.height };
-    let image = fromBitmap(await compose(display, frame, area, opts.upTo));
+    const { bitmap, fromScreen } = await compose(display, frame, area, opts.upTo);
+    let image = fromBitmap(bitmap);
 
     const composed = image.getSize();
     const downscale = fitScale(composed, opts.maxDimension, opts.maxPixels);
@@ -381,7 +443,9 @@ export async function captureDisplay(opts: CaptureOptions): Promise<CaptureRecor
         // Image pixels per display-physical pixel.
         imageScale: finalSize.width / region.width,
         path,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        // A window as rendered that did not render itself, said in fixed words.
+        fallback: opts.upTo !== undefined && fromScreen.has(opts.upTo) ? true : undefined
     };
     store.recordCapture(record);
 

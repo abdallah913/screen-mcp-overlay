@@ -8,6 +8,7 @@ import {
     maskBitmap,
     composeLayers,
     coveredFraction,
+    unsharedOver,
     MASK_BGRA,
     SHARED_INSET_PX,
     OCCLUDER_SHADOW_PX
@@ -103,6 +104,19 @@ test('our see-through overlay neither shows nor hides anything', () => {
         { rect: r(10, 10, 100, 100), shared: true }
     ];
     assert.equal(area(visibleRegions(stack, 0, 0)), 100 * 100);
+});
+
+test('unsharedOver: anything not shared in front of a window, or its shadow, counts; behind it or shared does not', () => {
+    const win = r(100, 100, 800, 600);
+    const at = (layer, clip = win) => unsharedOver([layer, { rect: win, shared: true }], 1, clip);
+    assert.equal(at({ rect: r(600, 120, 900, 600), shared: false }), true, 'over part of it');
+    assert.equal(at({ rect: r(910, 100, 100, 100), shared: false }), true, 'its shadow falls on it');
+    assert.equal(at({ rect: r(100 + 800 + OCCLUDER_SHADOW_PX, 100, 100, 100), shared: false }), false, 'beyond its shadow');
+    assert.equal(at({ rect: r(600, 120, 900, 600), shared: true }), false, 'a shared window');
+    assert.equal(at({ rect: r(0, 0, 1920, 1080), shared: false, ignore: true }), false, 'our see-through overlay');
+    assert.equal(at({ rect: r(600, 120, 900, 600), shared: false }, r(100, 100, 300, 600)), false, 'outside the part painted');
+    // Behind it: what is there does not show through it on screen.
+    assert.equal(unsharedOver([{ rect: win, shared: true }, { rect: r(0, 0, 1920, 1080), shared: false }], 0, win), false);
 });
 
 test('a shared window behind another shared window shows only where it is not covered', () => {

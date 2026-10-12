@@ -12,8 +12,9 @@ import type { Rect } from './types.js';
  * any of it reaches the agent (as an image, or as text read from one),
  * everything that is not a shared window on top is painted over with one flat
  * colour, so the desktop, the taskbar, a notification and a video playing on
- * the side all look alike: a hole says nothing about what is in it, though
- * its shape follows whatever covers the window.
+ * the side all look alike. A hole cut around a window on top would still
+ * trace where it is, so a window with anything unshared over it is not taken
+ * from the screen at all (unsharedOver): it is blank whole.
  */
 
 /** A window in z-order, front first. */
@@ -90,6 +91,20 @@ export function visibleRegions(
         covering.push(layer.shared ? layer.rect : grow(layer.rect, shadow));
     }
     return shown;
+}
+
+/**
+ * Whether anything not shared is in front of the window at `at` (front
+ * first) within `clip`, its shadow included: then the screen there shows that
+ * window, and masking it out would leave a hole its shape, which follows it
+ * as it moves. Our see-through overlay does not count. What is behind the
+ * window does not either: on screen it shows only past the window's corners,
+ * which are pulled in anyway (SHARED_INSET_PX).
+ */
+export function unsharedOver(stack: readonly Layer[], at: number, clip: Rect, shadow = OCCLUDER_SHADOW_PX): boolean {
+    return stack
+        .slice(0, Math.max(0, at))
+        .some(l => !l.shared && !l.ignore && l.rect.width > 0 && l.rect.height > 0 && intersect(grow(l.rect, shadow), clip) !== null);
 }
 
 /**

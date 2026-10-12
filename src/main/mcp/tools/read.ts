@@ -137,20 +137,21 @@ async function sharedCover(ref: string, panel: boolean): Promise<string> {
 }
 
 /**
- * Said with every read of a window's screen pixels rather than its own
- * render, in the same words whatever covers it: on screen, any window on top
- * shows instead of it, and only shared ones are kept.
+ * Said with every read of a window that did not render itself, in the same
+ * words whether it refused, rendered blank or failed, and whatever covers it:
+ * its pixels are the screen's, blank wherever a window that is not shared is
+ * over it (then all of it is), so how much is blank must not be explained.
  */
-const SCREEN_COPY_NOTE = 'Parts of this window that are not on top show only shared windows; the rest is blank.';
+const SCREEN_COPY_NOTE = 'This window cannot render itself, so it comes from the screen and may be partly or wholly blank.';
 
 /**
  * Say when "the window's pixels" are really the screen's: then whatever is on
  * top of the window is in them, labelled as the window. That is the confident
  * wrong read that rendering the window itself exists to prevent.
  */
-async function screenPixelsWarning(window: string, why: string): Promise<string> {
+async function screenPixelsWarning(window: string): Promise<string> {
     const cover = await sharedCover(window, true).catch(() => '');
-    return `\nNote: ${why}, so this is the screen there. ${SCREEN_COPY_NOTE}${cover} focus_window brings it to the front.`;
+    return `\nNote: ${SCREEN_COPY_NOTE}${cover} focus_window brings it to the front.`;
 }
 
 /** Said with every capture of a window as rendered: what is on top of it, in fixed words. */
@@ -189,32 +190,30 @@ async function withImage(body: string, record: CaptureRecord, inline: boolean): 
  * follows the window instead of going stale in screen space.
  *
  * Reads the window's own render first, so a window behind another is still
- * read correctly. A render that failed, fell back to the screen, or came back
- * blank (GPU surfaces) is replaced by, or treated as, its screen pixels,
- * masked to the shared windows before OCR, with a note saying so in words
- * that depend on shared windows only. `ref` has already been checked as
+ * read correctly. A render that fell back to the screen is read as it is,
+ * masked; one that failed or came back blank (GPU surfaces) is replaced by
+ * the window as the screen shows it, masked the same way (capture.ts). Either
+ * way the note is the same fixed words. `ref` has already been checked as
  * shared, so a failed render here is the window's own doing.
  */
 async function readWindow(ref: string): Promise<{ record: CaptureRecord; lines: OcrLine[]; warning: string }> {
     const shot: WindowCapture | null = await captureWindow({ windowRef: ref, maxDimension: NATIVE, grid: false }).catch(
         () => null
     );
-    if (shot && !shot.blank) {
+    // `blank` is judged on the window's own render alone, never on a screen
+    // copy, which can be flat just because something unshared covers it all:
+    // the branch taken, and so the wording, must not depend on that.
+    if (shot && (shot.record.fallback || !shot.blank)) {
         const [visible] = await resolveRefs([ref]);
         const origin = visible?.rect ?? shot.rect;
         const lines = (await ocrImage(shot.record.path)).map(l => ({
             text: l.text,
             rect: windowOffsets(l.rect, shot.record.imageScale, shot.rect, origin)
         }));
-        const warning = shot.record.fallback
-            ? await screenPixelsWarning(ref, 'the window refused to render itself')
-            : '';
+        const warning = shot.record.fallback ? await screenPixelsWarning(ref) : '';
         return { record: shot.record, lines, warning };
     }
 
-    const why = shot
-        ? 'the window rendered blank (a GPU surface, which only the screen shows)'
-        : 'the window could not render itself';
     const { display, region } = await windowRegion(ref);
     const record = await captureDisplay({ display, region, upTo: ref, maxDimension: NATIVE, grid: false });
     // The crop starts at the window's visible top-left unless the display edge
@@ -223,7 +222,7 @@ async function readWindow(ref: string): Promise<{ record: CaptureRecord; lines: 
         text: l.text,
         rect: windowOffsets(l.rect, record.imageScale, record.regionPhysical, region)
     }));
-    return { record, lines, warning: await screenPixelsWarning(ref, why) };
+    return { record, lines, warning: await screenPixelsWarning(ref) };
 }
 
 export function registerRead(server: McpServer): void {
@@ -436,9 +435,8 @@ export function registerRead(server: McpServer): void {
                 if (args.window && !args.asRendered) {
                     const w = await readableWindow(args.window);
                     const shot = await captureWindow({ windowRef: w.ref, maxDimension, maxPixels, grid: args.grid });
-                    let warning = shot.record.fallback
-                        ? await screenPixelsWarning(w.ref, 'the window refused to render itself')
-                        : '';
+                    let warning = shot.record.fallback ? await screenPixelsWarning(w.ref) : '';
+                    // Only ever of its own render (see WindowCapture.blank).
                     if (shot.blank) {
                         warning +=
                             '\nNote: the window rendered as one flat colour, which is how GPU and DirectX ' +
@@ -460,6 +458,7 @@ export function registerRead(server: McpServer): void {
                 }
 
                 const record = await captureDisplay({ display, region, upTo, maxDimension, maxPixels, grid: args.grid });
+                if (record.fallback) warning += `\nNote: ${SCREEN_COPY_NOTE}`;
                 return withImage(captureBody(record, `display ${display.id}`) + warning, record, args.returnImage);
             })
     );

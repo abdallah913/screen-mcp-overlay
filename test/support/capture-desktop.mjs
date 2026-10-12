@@ -157,8 +157,9 @@ export function readImage(path) {
 
 /**
  * Install the fake helper over `desktop`. `renders` says how each window
- * renders itself: 'ok' (default), 'blank' (a flat GPU surface) or 'fallback'
- * (the window refused, so the helper copied the screen).
+ * renders itself: 'ok' (default), 'blank' (a flat GPU surface), 'fallback'
+ * (the window refused, so the helper copied the screen) or 'error' (the
+ * render failed, say because its file could not be written).
  */
 export function captureHelper(desktop, { renders = {}, overrides = {} } = {}) {
     const calls = [];
@@ -180,6 +181,7 @@ export function captureHelper(desktop, { renders = {}, overrides = {} } = {}) {
             const w = windows.find(x => x.ref === p.window);
             if (!w) throw new Error(`no window for ref '${p.window}'`);
             const how = renders[w.ref] ?? 'ok';
+            if (how === 'error') throw new Error(`could not write ${p.path}`);
             const { raw, img } = render(w);
             if (how === 'blank') img.data.fill(0);
             const out = how === 'fallback' ? screenCopy(raw) : img;
