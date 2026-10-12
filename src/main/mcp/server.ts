@@ -56,7 +56,7 @@ const INSTRUCTIONS =
     'wait_for_user_click when you cannot tell what they mean; show_message options for a quick question.';
 
 export function buildServer(): McpServer {
-    const server = new McpServer({ name: 'screen-mcp-overlay', version: '0.2.0' }, { instructions: INSTRUCTIONS });
+    const server = new McpServer({ name: 'screen-mcp-overlay', version: '0.3.0' }, { instructions: INSTRUCTIONS });
     registerTools(server);
     compactToolList(server);
     redactToolResults(server);
