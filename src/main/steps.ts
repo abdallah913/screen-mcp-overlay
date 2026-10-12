@@ -1,4 +1,5 @@
 import type { ClickResult, StepAnswer, StepView, UserAnswer } from '../shared/types.js';
+import { parseProgress } from '../shared/progress.js';
 import { store } from './store.js';
 
 /**
@@ -42,15 +43,133 @@ export interface StepRequest {
     fromApp?: boolean;
 }
 
+// ------------------------------------------------------------ the app's voice
+
 /**
- * Prompts that open with the app's name are the app speaking: asking the user
- * to share a window. An agent's prompt that opens the same way is labelled as
- * the agent's, so it cannot pass for that question.
+ * The app asks the user to share windows, and an agent must not be able to ask
+ * in its place. What tells them apart is structural: the app's own steps carry
+ * fromApp, and the panel card and overlay strip mark those with a badge that
+ * no text can draw. The wording is a second line: an agent's words that use
+ * the app's name are labelled as the agent's wherever the user meets them.
  */
 export const APP_VOICE = 'Screen MCP Overlay';
 
+const AGENT_SAYS = 'The agent says: ';
+
+/** About this much of an agent's words is quoted in one of the app's own lines. */
+const QUOTE_CHARS = 60;
+
+/** Take no space on screen, or reorder what follows: zero-width characters, direction controls, soft hyphens and the like. */
+const UNSEEN = /[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+/** Shown right to left from here: text checked in one order would be read in another. */
+const DIRECTION = /\p{Bidi_Control}/gu;
+/** Line breaks and other control characters. */
+const BREAKS = /[\p{Cc}\p{Zl}\p{Zp}]/gu;
+/** Anything that reads as a quotation mark; two single ones side by side pass for a double. */
+const QUOTE_MARKS = /["'`´“”„‟‘’‚‛«»‹›〝〞〟＂＇❛❜❝❞⹂″‶′‵ʹʺʻʼʽ˝ˮ״׳]+/g;
+
+/**
+ * Letters that pass for Latin ones on screen (Cyrillic, Greek, Armenian,
+ * Cherokee, small capitals), and the capital I, digits and bar that pass for
+ * l and o, each as look-alike=letter. Escaped, as most of them look exactly
+ * like what they stand for.
+ */
+const LOOKALIKES = new Map(
+    [
+        // Cyrillic
+        '\u0410=a \u0412=b \u0415=e \u0405=s \u0406=l \u0408=j \u041a=k \u041c=m \u041d=h \u041e=o \u0420=p \u0421=c \u0422=t',
+        '\u0423=y \u0425=x \u0474=v \u04ae=y \u04ba=h \u04c0=l \u051a=q \u051c=w \u0430=a \u0432=b \u0433=r \u0435=e \u0455=s',
+        '\u0456=i \u0458=j \u043a=k \u043c=m \u043d=h \u043e=o \u043f=n \u0440=p \u0441=c \u0442=t \u0443=y \u0445=x \u0475=v',
+        '\u04af=y \u04bb=h \u04cf=l \u0501=d \u051b=q \u051d=w',
+        // Greek
+        '\u0391=a \u0392=b \u0395=e \u0396=z \u0397=h \u0399=l \u039a=k \u039c=m \u039d=n \u039f=o \u03a1=p \u03a4=t \u03a5=y',
+        '\u03a7=x \u03b1=a \u03b3=y \u03b5=e \u03b7=n \u03b9=i \u03ba=k \u03bd=v \u03bf=o \u03c1=p \u03c4=t \u03c5=u \u03c7=x',
+        '\u03f2=c \u03f9=c \u03f3=j',
+        // Armenian
+        '\u0555=o \u0585=o \u054d=u \u057d=u \u0578=n \u0581=g \u0570=h',
+        // Cherokee
+        '\u13aa=a \u13f4=b \u13df=c \u13ac=e \u13bb=h \u13ab=j \u13e6=k \u13de=l \u13b7=m \u13eb=o \u13e2=p \u13a1=r \u13da=s',
+        '\u13a2=t \u13d9=v \u13b3=w \u13a0=d \u13a5=i \u13c3=z \u13a9=y \u13c0=g',
+        // Latin small capitals and dotless letters
+        '\u1d00=a \u0299=b \u1d04=c \u1d05=d \u1d07=e \u0262=g \u029c=h \u026a=i \u1d0a=j \u1d0b=k \u029f=l \u1d0d=m \u0274=n',
+        '\u1d0f=o \u1d18=p \u0280=r \ua731=s \u1d1b=t \u1d1c=u \u1d20=v \u1d21=w \u028f=y \u1d22=z \u0131=i \u0237=j \u0251=a',
+        '\u0261=g',
+        // Latin and digits: I, 1 and | for l, 0 for o
+        'I=l 1=l |=l 0=o'
+    ]
+        .join(' ')
+        .split(' ')
+        .map(pair => pair.split('=') as [string, string])
+);
+
+/**
+ * Text reduced to what it looks like: compatibility forms (fullwidth, maths
+ * letters) folded, invisible characters and accents dropped, look-alikes
+ * mapped to the Latin letter they pass for, case ignored, and only letters
+ * and digits kept, so neither spacing nor punctuation can split a name.
+ */
+function looksLike(text: string): string {
+    return [...text.normalize('NFKC').replace(UNSEEN, '').normalize('NFD').replace(/\p{M}/gu, '')]
+        .map(ch => LOOKALIKES.get(ch) ?? ch)
+        .join('')
+        .toLowerCase()
+        .replace(/rn/g, 'm')
+        .replace(/[^a-z0-9]/g, '');
+}
+
+/** The names the user knows the app by: its own, and the panel's title. */
+const APP_NAMES = [APP_VOICE, 'Screen Overlay'].map(looksLike);
+
+/** Whether the text, as it shows, uses one of the app's names anywhere. */
+function namesApp(text: string): boolean {
+    const seen = looksLike(text);
+    return APP_NAMES.some(name => seen.includes(name));
+}
+
+/**
+ * An agent's words as the user is to meet them: in a step, a panel line, a
+ * button, the voice or a caption on screen. Direction controls go, so the
+ * text reads in the order it was checked in. Words that use the app's name
+ * anywhere are labelled as the agent's and run onto one line, so no line of
+ * them starts as the app; a walkthrough's "n/N" stays in front of the label
+ * for the progress pill. Everything else is left as written.
+ */
 export function asAgentText(text: string): string {
-    return text.trimStart().toLowerCase().startsWith(APP_VOICE.toLowerCase()) ? `The agent says: ${text.trim()}` : text;
+    const shown = String(text).replace(DIRECTION, '');
+    if (!namesApp(shown)) return shown;
+    const flat = shown.replace(BREAKS, ' ').replace(UNSEEN, '').replace(/\s+/g, ' ').trim();
+    const progress = parseProgress(flat);
+    const lead = progress ? `${progress.n}/${progress.of} ` : '';
+    const rest = progress ? progress.rest : flat;
+    return rest.startsWith(AGENT_SAYS) ? `${lead}${rest}` : `${lead}${AGENT_SAYS}${rest}`;
+}
+
+/**
+ * Text quoted inside one of the app's own lines: one line, nothing invisible,
+ * no quotation marks of its own (so it cannot close the quote and carry on as
+ * the app), and cut to `max` characters.
+ */
+export function flatText(text: string, max: number): string {
+    const flat = String(text)
+        .replace(BREAKS, ' ')
+        .replace(UNSEEN, '')
+        .replace(QUOTE_MARKS, "'")
+        .replace(/\s+/g, ' ')
+        .trim();
+    const chars = [...flat];
+    return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : flat;
+}
+
+/**
+ * An agent's words quoted in one of the app's own lines (a refusal, a step
+ * replaced): “flattened and short”, or `instead` when they use the app's
+ * name, as the app's line would then carry the app's name twice, once in
+ * words it did not write. '' when nothing visible is left.
+ */
+export function quoteAgentText(text: string, instead: string, max = QUOTE_CHARS): string {
+    const whole = flatText(text, Infinity);
+    if (!whole) return '';
+    return namesApp(whole) ? instead : `“${flatText(whole, max)}”`;
 }
 
 export interface StepHandle {
@@ -67,6 +186,8 @@ export interface StepHandle {
 
 interface Pending {
     view: StepView;
+    /** The options as the agent gave them, which is what it hears back; the view's may be labelled. */
+    options?: string[];
     captureId?: string;
     got: ClickResult[];
     resolve: (a: StepAnswer) => void;
@@ -153,7 +274,10 @@ export function beginStep(req: StepRequest): StepHandle {
             mode: req.mode,
             count: req.mode === 'click' ? Math.max(1, req.count ?? 1) : 0,
             collected: 0,
-            options: req.options,
+            // A button is the agent's words too, and one can read as the
+            // app's answer to its own question.
+            options: req.fromApp ? req.options : req.options?.map(asAgentText),
+            fromApp: req.fromApp === true,
             startedAt: now,
             deadline: now + req.timeoutMs,
             progress: req.progress,
@@ -161,6 +285,7 @@ export function beginStep(req: StepRequest): StepHandle {
             targetIds: req.targetIds ?? [],
             keys
         },
+        options: req.options,
         captureId: req.captureId,
         got: [],
         resolve,
@@ -196,7 +321,7 @@ export function answerStep(answer: UserAnswer, id?: string): boolean {
     if (!p || (id !== undefined && id !== p.view.id)) return false;
     switch (answer.kind) {
         case 'choice': {
-            const label = p.view.options?.[answer.index];
+            const label = p.options?.[answer.index];
             if (label === undefined) return false;
             settle(p, { kind: 'choice', index: answer.index, label });
             return true;

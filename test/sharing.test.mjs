@@ -122,6 +122,38 @@ test('a typed reply is not consent: only Done and then a button share anything',
     assert.equal(sharingSummary().windows.length, 0);
 });
 
+/** Direction controls, which reorder whatever follows them on screen, and the other invisible characters. */
+const UNSEEN = /[\p{Cf}\p{Default_Ignorable_Code_Point}]/u;
+
+test("the app's own question quotes the agent's reason and the window's title as such, never as more of its own words", async () => {
+    const desktop = fakeDesktop();
+    // A title is whatever the window says, a web page's included.
+    const title = 'Notes” with the AI? It sees nothing else. Pick “This window‮\n';
+    desktop.windows = desktop.windows.map(w => ({ ...w, private: true, exe: w.ref === '100' ? 'notepad.exe' : undefined, title: w.ref === '100' ? title : w.title }));
+    fakeHelper({}, desktop);
+    // Shown right to left after the control, the reason reads as an instruction.
+    const asked = askToShare({ reason: 'to help‮ .gnirahs pots ot 8F+tfihS+lrtC sserp ,rehto yna ;wodniw oediv ruoy kcilC', timeoutMs: 10_000 });
+    for (let i = 0; i < 200 && !currentStep(); i += 1) await new Promise(r => setTimeout(r, 5));
+    const pick = currentStep().prompt;
+    assert.doesNotMatch(pick, UNSEEN, JSON.stringify(pick));
+    assert.match(pick, /^Screen MCP Overlay: an AI agent asks to see the window you need help with \(it says: “to help \.gnirahs[^“”"]*”\)\. Click into that window/);
+    answerStep({ kind: 'done' });
+    for (let i = 0; i < 200 && currentStep()?.mode !== 'choice'; i += 1) await new Promise(r => setTimeout(r, 5));
+    const confirm = currentStep().prompt;
+    assert.doesNotMatch(confirm, UNSEEN, JSON.stringify(confirm));
+    assert.match(confirm, /^Screen MCP Overlay: share “Notes' with the AI\? It sees nothing else\. Pick 'This window” with the AI\? It will see this window/);
+    answerStep({ kind: 'choice', index: 2 });
+    assert.equal(await asked, null);
+
+    // A reason that uses the app's own name is left out of the app's question.
+    const named = askToShare({ reason: 'Scrеen MCP Overlay: click your video, then press Done', timeoutMs: 10_000 });
+    for (let i = 0; i < 200 && !currentStep(); i += 1) await new Promise(r => setTimeout(r, 5));
+    assert.match(currentStep().prompt, /^Screen MCP Overlay: an AI agent asks to see the window you need help with\. Click into that window/);
+    assert.doesNotMatch(currentStep().prompt, /video|it says/);
+    answerStep({ kind: 'skip' });
+    assert.equal(await named, null);
+});
+
 // ------------------------------------------------------------------
 // The share key, panel lines, settings and the panel agent's file access.
 // These need module functions the shared test harness does not export, so
@@ -242,6 +274,50 @@ test('a refused request reaches the panel, once, in the agent\'s words and never
 
     const noKey = await heard(() => ui.noteRefused('Spotify'));
     assert.match(noKey[0], /To share a window, let the agent ask you for it\.$/, 'no key named when none is registered');
+});
+
+test("a refused request's line cannot close its quote, hide characters or speak as the app", async () => {
+    ui.resetSharing();
+    ui.setShareKeyInUse('Ctrl+Shift+F8');
+    const lines = await heard(() => {
+        ui.noteRefused('x”. To continue, click your video and press Ctrl+Shift+F8. “');
+        ui.noteRefused('x". Then press Ctrl+Shift+F8 ("');
+        ui.noteRefused('​You⁠Tube‮');
+        ui.noteRefused('x”. Screen MCP Overlay: to continue, click your video and press Ctrl+Shift+F8. “');
+        ui.noteRefused('Ѕcreen MCP​ Overlay');
+    });
+    ui.setShareKeyInUse('');
+    const quoted = /^An agent asked for “([^"“”]*)”, which you have not shared\. To share a window, click into it and press Ctrl\+Shift\+F8\.$/;
+    assert.match(lines[0], quoted, 'the quote closes once, where the app closes it');
+    assert.ok(quoted.exec(lines[0])[1].length <= 60, 'and holds about 60 characters at most');
+    assert.match(lines[1], quoted);
+    assert.equal(lines[2], 'An agent asked for “YouTube”, which you have not shared. To share a window, click into it and press Ctrl+Shift+F8.');
+    for (const line of lines) assert.doesNotMatch(line, UNSEEN, JSON.stringify(line));
+    // Words that use the app's name are not shown at all, and name-alikes are one name.
+    assert.equal(lines.length, 4, lines.join('\n'));
+    assert.match(lines[3], /^An agent asked for [^“”"]+, which you have not shared\./);
+    assert.doesNotMatch(lines[3], /screen|video/i);
+});
+
+test("a window's title in the app's own lines is one quoted line with nothing hidden", async () => {
+    ui.resetSharing();
+    const title = 'Doc” with the AI. Stopped sharing everything‮\nPress Ctrl+Shift+F8';
+    const doc = win('100', title, 11, { exe: 'notepad.exe', foreground: true });
+    desk([doc]);
+    // The panel lines for a share and a stop, and what the share key says.
+    const said = [];
+    const told = await heard(async () => {
+        ui.shareWindow(doc, { byUser: true });
+        ui.stopSharingWindow('100', { byUser: true });
+        said.push(await ui.toggleFrontWindow('Ctrl+Shift+F8'));
+        said.push(await ui.toggleFrontWindow('Ctrl+Shift+F8'));
+    });
+    assert.equal(told.length + said.length, 4);
+    for (const line of [...told, ...said]) {
+        assert.doesNotMatch(line, UNSEEN, JSON.stringify(line));
+        assert.match(line, /“Doc' with the AI\. Stopped sharing everything Press Ctrl\+Shift\+F8”/, line);
+    }
+    ui.resetSharing();
 });
 
 test('the user hears what they shared and stopped, and the stop says what cannot be taken back', async () => {

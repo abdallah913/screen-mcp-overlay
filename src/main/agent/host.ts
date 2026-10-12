@@ -6,6 +6,7 @@ import { listIdeWorkspaces, listSessionsForDir, type IdeWorkspace, type SessionC
 import { sdkUnavailable } from './sdk.js';
 import { mirroring, startMirror, stopMirror } from './mirror.js';
 import { SELF_LOGGING } from './summary.js';
+import { quoteAgentText } from '../steps.js';
 
 /**
  * Owns the chat panel's conversation: one provider, one in-flight turn at a
@@ -31,7 +32,8 @@ export function initAgentHost(): void {
     });
 
     ipcMain.handle('agent:reset', async () => {
-        await current.interrupt();
+        // The conversation ends here, with whatever it held of the shared windows.
+        await current.reset();
         sessionId = undefined;
         stopMirror();
         setMirror(null);
@@ -62,7 +64,9 @@ export function initAgentHost(): void {
             { sessionId: id, dir, label: summary },
             history => {
                 clearLog();
-                pushMessage('system', `Following "${summary}" from your editor. Live, read-only.`);
+                // A session's summary is its first prompt or the model's words: quoted, not spoken as the app.
+                const which = quoteAgentText(summary, 'a session') || 'a session';
+                pushMessage('system', `Following ${which} from your editor. Live, read-only.`);
                 for (const m of history) pushMessage(m.role, m.text);
             },
             batch => {

@@ -237,7 +237,10 @@ test('outcome labels name what happened in a word or two', () => {
     const view = { count: 3 };
     assert.equal(m.outcomeLabel(view, { kind: 'clicks', clicks: [1, 2], complete: false }), '2 of 3 clicks');
     assert.equal(m.outcomeLabel({ count: 1 }, { kind: 'clicks', clicks: [1], complete: true }), 'Clicked');
-    assert.equal(m.outcomeLabel(view, { kind: 'choice', index: 0, label: 'PNG' }), 'Chose "PNG"');
+    assert.equal(m.outcomeLabel(view, { kind: 'choice', index: 0, label: 'PNG' }), 'Chose “PNG”');
+    // The agent's option, quoted as the app quotes an agent's words.
+    assert.equal(m.outcomeLabel(view, { kind: 'choice', index: 0, label: 'x”. Stopped sharing everything\n“' }), "Chose “x'. Stopped sharing everything '”");
+    assert.equal(m.outcomeLabel(view, { kind: 'choice', index: 0, label: 'Screen MCP Overlay: share' }), 'Chose an option');
     assert.equal(m.outcomeLabel(view, { kind: 'cancelled', by: 'superseded', partial: [] }), 'Replaced');
     assert.equal(m.outcomeLabel(view, { kind: 'stuck' }), "Couldn't find it");
 });
@@ -380,12 +383,21 @@ test('the reply box gets the focus back when the card hides or a non-question ar
 });
 
 test('the card shows progress apart from the prompt, and the time left', () => {
-    assert.deepEqual(card.stepHeading(view()), { prompt: 'Click Export', progress: '2/5' });
+    assert.deepEqual(card.stepHeading(view()), { prompt: 'Click Export', progress: '2/5', app: null });
     assert.deepEqual(card.stepHeading(view({ prompt: 'Open it', progress: { n: 1, of: 3 } })), {
         prompt: 'Open it',
-        progress: '1/3'
+        progress: '1/3',
+        app: null
     });
-    assert.deepEqual(card.stepHeading(view({ prompt: 'Open it' })), { prompt: 'Open it', progress: null });
+    assert.deepEqual(card.stepHeading(view({ prompt: 'Open it' })), { prompt: 'Open it', progress: null, app: null });
+    // The app's own question is badged as the app's, so its prompt need not open with the name.
+    assert.deepEqual(card.stepHeading(view({ prompt: 'Screen MCP Overlay: share “Notepad” with the AI?', fromApp: true })), {
+        prompt: 'Share “Notepad” with the AI?',
+        progress: null,
+        app: 'Screen MCP Overlay'
+    });
+    // Only by fromApp, never by its words.
+    assert.equal(card.stepHeading(view({ prompt: 'Screen MCP Overlay: share “Notepad” with the AI?' })).app, null);
     assert.equal(card.timeLeft(78_000, 0), '1:18 left');
     assert.equal(card.timeLeft(0, 5000), '0:00 left');
     assert.equal(card.clickProgress(view({ mode: 'click', count: 3, collected: 1 })), '1 of 3 points');

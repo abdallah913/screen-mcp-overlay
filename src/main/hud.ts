@@ -14,7 +14,7 @@ import { parseProgress } from '../shared/progress.js';
 import { listDisplays } from './displays.js';
 import { pingTargets, raiseOverlays } from './overlay.js';
 import { settings } from './settings.js';
-import { answerStep, asAgentText, cancelStep, currentStep, onStepEnded } from './steps.js';
+import { answerStep, asAgentText, cancelStep, currentStep, onStepEnded, quoteAgentText } from './steps.js';
 import { store } from './store.js';
 import { focusWindow, setHudWindowRef } from './uia.js';
 
@@ -302,6 +302,15 @@ export function setMirror(label: string | null): void {
 }
 
 /**
+ * Say an agent's words aloud (show_message with speak). Heard, the app's
+ * name is all there is to go on, so words that use it are labelled as the
+ * agent's, as they are on screen.
+ */
+export function speak(text: string, rate: number): boolean {
+    return say(asAgentText(text), rate);
+}
+
+/**
  * Speak through the panel's renderer.
  *
  * Chromium ships speechSynthesis and it uses the installed Windows voices, so
@@ -309,7 +318,7 @@ export function setMirror(label: string | null): void {
  * not around to speak through, or has found no local voice to speak with,
  * rather than pretending it worked.
  */
-export function speak(text: string, rate: number): boolean {
+function say(text: string, rate: number): boolean {
     const win = hudWindow();
     if (!win || localVoice === false) return false;
     win.webContents.send('hud:speak', { text, rate });
@@ -400,8 +409,9 @@ function stepChanged(): void {
 function sayStep(step: StepView): void {
     const prefs = settings();
     if (!prefs.readStepsAloud) return;
+    // Already labelled if it is an agent's (beginStep), and the app's own if not.
     const line = parseProgress(step.prompt)?.rest ?? step.prompt;
-    if (speak(line, prefs.speechRate)) spokenFor = step.id;
+    if (say(line, prefs.speechRate)) spokenFor = step.id;
 }
 
 function stepEnded(view: StepView, answer: StepAnswer): void {
@@ -410,7 +420,14 @@ function stepEnded(view: StepView, answer: StepAnswer): void {
     // The two ways a step ends that the agent did not cause and the user may
     // not have meant: say so where they can see it.
     if (answer.by === 'superseded') {
-        pushMessage('system', `Replaced a pending step with a newer one: "${view.prompt}".`);
+        // A system line, which an agent's words must not be able to continue.
+        const what = view.fromApp ? '' : quoteAgentText(view.prompt, 'a step that used this app’s name');
+        pushMessage(
+            'system',
+            view.fromApp
+                ? 'Replaced this app’s own question with a newer step.'
+                : `Replaced a pending step with a newer one${what ? `: ${what}` : ''}.`
+        );
     } else if (answer.by === 'clear') {
         pushMessage('system', 'Cleared the screen and stopped the current step. The agent has been told.');
     }
@@ -434,7 +451,7 @@ export function outcomeLabel(view: StepView, a: StepAnswer): string {
         case 'reply':
             return 'Replied';
         case 'choice':
-            return `Chose "${a.label}"`;
+            return `Chose ${quoteAgentText(a.label, 'an option') || 'an option'}`;
         case 'timeout':
             return 'No response';
         case 'cancelled':

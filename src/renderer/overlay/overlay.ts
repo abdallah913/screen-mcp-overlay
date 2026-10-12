@@ -27,6 +27,7 @@ import {
     type CuesHeard,
     type OverlayFrame
 } from '../../shared/layout.js';
+import { withoutAppName } from '../hud/step.js';
 
 /**
  * The drawing surface. The window exactly covers one display in DIPs, so the
@@ -56,6 +57,7 @@ const api = window.overlayApi;
 const canvas = document.getElementById('c') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
 const strip = document.getElementById('strip') as HTMLDivElement;
+const stripApp = document.getElementById('strip-app') as HTMLSpanElement;
 const stripProgressEl = document.getElementById('strip-progress') as HTMLSpanElement;
 const stripText = document.getElementById('strip-text') as HTMLSpanElement;
 const stripTime = document.getElementById('strip-time') as HTMLSpanElement;
@@ -389,7 +391,14 @@ function updateStrip(targetRects: Rect[], others: Rect[]): void {
         return;
     }
 
-    const { progress, prompt } = stripProgress(step);
+    // Whose question this is, told by the badge rather than by any words in
+    // it: only the app's own steps carry fromApp.
+    const app = step.fromApp === true;
+    strip.classList.toggle('app', app);
+    stripApp.hidden = !app;
+    const progressed = stripProgress(step);
+    const { progress } = progressed;
+    const prompt = app ? withoutAppName(progressed.prompt) : progressed.prompt;
     stripProgressEl.textContent = progress ? `${progress.n}/${progress.of}` : '';
     const remaining = step.count - step.collected;
     stripText.textContent = step.mode === 'click' && step.count > 1 ? `${prompt}  (${remaining} more to click)` : prompt;

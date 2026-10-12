@@ -1,6 +1,6 @@
 import { listAllWindows, setHelperShared, type WindowInfo } from './uia.js';
 import { settings, updateSettings } from './settings.js';
-import { beginStep } from './steps.js';
+import { beginStep, flatText, quoteAgentText } from './steps.js';
 
 /**
  * Which windows the AI may see.
@@ -98,6 +98,19 @@ const ALREADY_SEEN = 'What an agent already saw stays in its conversation; the p
 /** Who changed a share: only what the user did is told back to them in the panel. */
 export interface ShareChange {
     byUser?: boolean;
+}
+
+/** How much of a window's title the app's own lines quote. */
+const TITLE_CHARS = 80;
+
+/**
+ * A window's title, quoted in the app's own words. A title is whatever the
+ * window says, a web page's included: one line, nothing hidden and no quotation
+ * marks of its own, so it cannot close the quote and carry on as the app, nor
+ * turn the rest of the line around with a direction control.
+ */
+function titled(title: string): string {
+    return `“${flatText(title, TITLE_CHARS)}”`;
 }
 
 function appSet(): Set<string> {
@@ -204,7 +217,7 @@ export function revocationCount(): number {
 export function shareWindow(w: Pick<WindowInfo, 'ref' | 'pid' | 'title' | 'exe'>, how: ShareChange = {}): void {
     grants.set(w.ref, { ref: w.ref, pid: w.pid, title: w.title, exe: w.exe, since: Date.now() });
     announce();
-    if (how.byUser) tell(`Now sharing “${w.title}” with the AI, and the dialogs it opens. ${howToStop()}`);
+    if (how.byUser) tell(`Now sharing ${titled(w.title)} with the AI, and the dialogs it opens. ${howToStop()}`);
 }
 
 export function stopSharingWindow(ref: string, how: ShareChange = {}): void {
@@ -214,7 +227,7 @@ export function stopSharingWindow(ref: string, how: ShareChange = {}): void {
     // Known even before any window list was read.
     revokedRefs.add(ref);
     revoked();
-    if (how.byUser) tell(`Stopped sharing “${g.title}” with the AI. ${ALREADY_SEEN}`);
+    if (how.byUser) tell(`Stopped sharing ${titled(g.title)} with the AI. ${ALREADY_SEEN}`);
 }
 
 export function shareApp(exe: string, how: ShareChange = {}): void {
@@ -348,17 +361,18 @@ const refusedAt = new Map<string, number>();
  * to any agent.
  */
 export function noteRefused(what: string): void {
-    // The agent's own words, shown to the user: one line, and short, so it
-    // cannot pass for the app's own text or push the panel's history away.
-    const flat = String(what).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
-    const shown = flat.length > 80 ? `${flat.slice(0, 79)}…` : flat;
+    // The agent's own words, in a line in the app's voice: one line, short,
+    // with no quotation marks of its own to close the quote with, so it cannot
+    // carry on as the app or push the panel's history away; and not at all
+    // when they use the app's name.
+    const shown = quoteAgentText(String(what), 'something it described using this app’s name');
     const now = Date.now();
     const key = shown.toLowerCase();
     if (shown && now - (refusedAt.get(key) ?? -Infinity) >= REFUSED_REPEAT_MS) {
         refusedAt.set(key, now);
         if (refusedAt.size > 200) refusedAt.delete(refusedAt.keys().next().value!);
         tell(
-            `An agent asked for “${shown}”, which you have not shared. ` +
+            `An agent asked for ${shown}, which you have not shared. ` +
                 (keyInUse
                     ? `To share a window, click into it and press ${keyInUse}.`
                     : 'To share a window, let the agent ask you for it.')
@@ -411,23 +425,24 @@ function frontOf(all: readonly WindowInfo[]): WindowInfo | undefined {
  * guessed never reaches the screen, so it cannot probe for an app by watching
  * whether a prompt appears. Resolves with the window shared, or null.
  *
- * Both steps say they come from the overlay rather than the agent, and the
- * agent's reason is quoted as its words: the agent can draw a look-alike
- * question with show_message, so the wording is what tells them apart. Only
- * Done and then one of the buttons share anything; a typed reply, Skip, a
- * timeout or another step taking over all share nothing.
+ * Both steps are the app's own (fromApp), which the panel and the overlay
+ * badge as such; the agent can put up a look-alike question with
+ * show_message, but never with that badge. The agent's reason is quoted as its
+ * words. Only Done and then one of the buttons share anything; a typed reply,
+ * Skip, a timeout or another step taking over all share nothing.
  */
 export async function askToShare(opts: {
     reason?: string;
     timeoutMs: number;
     signal?: AbortSignal;
 }): Promise<WindowInfo | null> {
-    // Its quotes go too, so the reason cannot close the quote and carry on as if the overlay said it.
-    const flat = (opts.reason ?? '').replace(/[“”"]/g, "'").replace(/\s+/g, ' ').trim();
-    const why = flat.length > REASON_CHARS ? `${flat.slice(0, REASON_CHARS - 1)}…` : flat;
+    // Quoted so it cannot close the quote and carry on as if the overlay said
+    // it, and left out when it uses the app's name: the app's question would
+    // then name the app in the agent's words too.
+    const why = quoteAgentText(opts.reason ?? '', '', REASON_CHARS);
     const pick = beginStep({
         prompt:
-            `Screen MCP Overlay: an AI agent asks to see the window you need help with${why ? ` (it says: “${why}”)` : ''}. ` +
+            `Screen MCP Overlay: an AI agent asks to see the window you need help with${why ? ` (it says: ${why})` : ''}. ` +
             'Click into that window, then press Done. Nothing else on your screen is shared; Skip shares nothing.',
         mode: 'watch',
         fromApp: true,
@@ -472,7 +487,7 @@ export async function askToShare(opts: {
     const options = ['This window', ...(whole ? [whole] : []), "Don't share"];
     const confirm = beginStep({
         prompt:
-            `Screen MCP Overlay: share “${candidate.title}” with the AI? ` +
+            `Screen MCP Overlay: share ${titled(candidate.title)} with the AI? ` +
             'It will see this window and the dialogs it opens, nothing else, until you stop sharing it.',
         mode: 'choice',
         fromApp: true,
@@ -499,14 +514,14 @@ export async function toggleFrontWindow(keyLabel: string): Promise<string> {
     if (!front) return `Click into the window you want to share first, then press ${keyLabel || 'the share key'}.`;
     if (granted(front.ref, front.pid)) {
         stopSharingWindow(front.ref);
-        return `Stopped sharing “${front.title}” with the AI. ${ALREADY_SEEN}`;
+        return `Stopped sharing ${titled(front.title)} with the AI. ${ALREADY_SEEN}`;
     }
     if (isShared(front, all)) {
         const how = front.exe && appSet().has(front.exe.toLowerCase()) ? `all ${appLabel(front.exe)} windows are` : 'the window it belongs to is';
-        return `“${front.title}” is already shared, because ${how}. Stop that from the tray menu.`;
+        return `${titled(front.title)} is already shared, because ${how}. Stop that from the tray menu.`;
     }
     shareWindow(front);
-    return `Now sharing “${front.title}” with the AI, and the dialogs it opens${keyLabel ? `. Press ${keyLabel} in it again to stop` : ''}.`;
+    return `Now sharing ${titled(front.title)} with the AI, and the dialogs it opens${keyLabel ? `. Press ${keyLabel} in it again to stop` : ''}.`;
 }
 
 /** For tests and the share key: the share state is pushed to a helper that just started. */

@@ -37,6 +37,8 @@
 
   <section id="step-card" tabindex="-1" hidden>
     <div id="step-head">
+      <!-- The app's own questions only (StepView.fromApp): no agent's words can draw this. -->
+      <span id="step-app" class="app-badge" hidden title="This question comes from Screen MCP Overlay itself, not from an AI agent"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.2 2.6 3.2v4c0 3.3 2.2 6.2 5.4 7.6 3.2-1.4 5.4-4.3 5.4-7.6v-4L8 1.2Z"/><path class="tick" d="M5.5 8.2 7.2 9.9l3.3-3.6"/></svg>Screen MCP Overlay</span>
       <span id="step-progress" hidden></span>
       <span id="step-kind"></span>
       <span class="spacer"></span>

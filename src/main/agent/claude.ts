@@ -88,16 +88,66 @@ function judge(toolName: string, input: unknown, cwd: string): Verdict {
 // import needs an explicit resolution mode.
 type QueryFn = SdkModule['query'];
 type QueryHandle = ReturnType<QueryFn>;
+type UserMessage = Exclude<Parameters<QueryFn>[0]['prompt'], string> extends AsyncIterable<infer M> ? M : never;
 
 async function loadQuery(): Promise<QueryFn> {
     return (await loadSdk()).query;
+}
+
+/**
+ * What the user types, handed to the agent's process as it arrives. The
+ * process stays up between turns, so the conversation lives in it and nowhere
+ * on disk (see persistSession); ending the inbox ends the conversation.
+ */
+class Inbox implements AsyncIterable<UserMessage> {
+    private queue: UserMessage[] = [];
+    private waiting: ((r: IteratorResult<UserMessage>) => void) | null = null;
+    private ended = false;
+
+    push(text: string): void {
+        if (this.ended) return;
+        const message: UserMessage = { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null };
+        if (this.waiting) {
+            this.waiting({ value: message, done: false });
+            this.waiting = null;
+        } else {
+            this.queue.push(message);
+        }
+    }
+
+    end(): void {
+        this.ended = true;
+        this.waiting?.({ value: undefined, done: true });
+        this.waiting = null;
+    }
+
+    [Symbol.asyncIterator](): AsyncIterator<UserMessage> {
+        return {
+            next: () => {
+                const message = this.queue.shift();
+                if (message) return Promise.resolve({ value: message, done: false });
+                if (this.ended) return Promise.resolve({ value: undefined, done: true });
+                return new Promise(resolve => (this.waiting = resolve));
+            }
+        };
+    }
+}
+
+/** One conversation: its process, what it is sent, and its session id once known. */
+interface Conversation {
+    handle: QueryHandle;
+    inbox: Inbox;
+    sessionId?: string;
+    /** Resolves once the conversation is ended from this side, so a turn waiting on it stops waiting. */
+    ended: Promise<void>;
+    end: () => void;
 }
 
 export class ClaudeProvider implements AgentProvider {
     readonly id = 'claude';
     readonly label = 'Claude (Agent SDK)';
 
-    private active: QueryHandle | null = null;
+    private conversation: Conversation | null = null;
 
     async check(): Promise<string | null> {
         try {
@@ -111,82 +161,42 @@ export class ClaudeProvider implements AgentProvider {
 
     async send(input: SendInput, emit: (e: AgentEvent) => void): Promise<{ sessionId?: string }> {
         const query = await loadQuery();
-        const cwd = process.env.SCREEN_OVERLAY_CWD || app.getPath('home');
+        // A conversation lives as long as its process. A session id this
+        // provider does not hold (none at all after New) starts a new one:
+        // there is nothing on disk to resume it from.
+        let conv = this.conversation;
+        if (!conv || !input.sessionId || input.sessionId !== conv.sessionId) {
+            this.end();
+            conv = this.start(query);
+        }
+        conv.inbox.push(input.prompt);
 
-        const handle = query({
-            prompt: input.prompt,
-            options: {
-                model: process.env.SCREEN_OVERLAY_MODEL || 'claude-opus-5',
-                cwd,
-                resume: input.sessionId,
-                includePartialMessages: true,
-                maxTurns: 24,
-                systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_APPEND },
-                mcpServers: {
-                    [SERVER_NAME]: {
-                        type: 'http',
-                        url: mcpUrl(),
-                        // The endpoint refuses a request without the token. A
-                        // header rather than ?key= keeps the token out of the
-                        // URL, which the SDK may log.
-                        headers: { Authorization: `Bearer ${settings().token}` },
-                        // The overlay tools must be in the turn-1 prompt; without
-                        // this they can be deferred behind tool search and the
-                        // agent will not know it can draw.
-                        alwaysLoad: true
-                    }
-                },
-                // The built-ins offered at all; everything else is absent.
-                tools: BUILTINS,
-                // Auto-approves our tools only. Read is left to the gates below,
-                // which look at the path.
-                allowedTools: OVERLAY_TOOLS,
-                // The gate that always runs. canUseTool is asked only when a
-                // tool would otherwise prompt, and Claude Code lets Read inside
-                // the working directory (the home folder) through without
-                // asking; a hook sees every call, Read of any path included,
-                // and tools from the user's own settings too.
-                hooks: {
-                    PreToolUse: [
-                        {
-                            hooks: [
-                                async input => {
-                                    if (input.hook_event_name !== 'PreToolUse') return {};
-                                    const verdict = judge(input.tool_name, input.tool_input, cwd);
-                                    return verdict.allowed
-                                        ? {}
-                                        : {
-                                              hookSpecificOutput: {
-                                                  hookEventName: 'PreToolUse' as const,
-                                                  permissionDecision: 'deny' as const,
-                                                  permissionDecisionReason: verdict.why
-                                              }
-                                          };
-                                }
-                            ]
-                        }
-                    ]
-                },
-                // The same rule again, for whatever does reach a prompt.
-                canUseTool: async (toolName, input) => {
-                    const verdict = judge(toolName, input, cwd);
-                    // Return no updatedInput: supplying one would REPLACE the
-                    // tool's arguments rather than approve them as-is.
-                    return verdict.allowed
-                        ? { behavior: 'allow' as const }
-                        : { behavior: 'deny' as const, message: verdict.why };
-                }
-            }
-        });
-
-        this.active = handle;
-        let sessionId = input.sessionId;
+        const stopped = conv.ended.then(() => ({ done: true, value: undefined }) as const);
         let textId: string | null = null;
         let thinking = false;
 
         try {
-            for await (const msg of handle) {
-                if ('session_id' in msg && typeof msg.session_id === 'string') sessionId = msg.session_id;
+            for (;;) {
+                // One message at a time rather than for-await: leaving a
+                // for-await loop would end the conversation with the turn.
+                const pending = conv.handle.next();
+                // Ended from this side (New) while waiting: the read may still
+                // fail once the process is gone, and nobody is listening then.
+                pending.catch(() => undefined);
+                const next = await Promise.race([pending, stopped]);
+                if (next.done) {
+                    if (thinking) emit({ type: 'thinking', active: false });
+                    if (textId) emit({ type: 'text-end', id: textId });
+                    if (this.conversation === conv) {
+                        // The process went away on its own; what it held went with it.
+                        this.end(conv);
+                        emit({ type: 'error', message: 'The conversation ended. The next message starts a new one.' });
+                    }
+                    emit({ type: 'done' });
+                    break;
+                }
+                const msg = next.value;
+                if ('session_id' in msg && typeof msg.session_id === 'string') conv.sessionId = msg.session_id;
 
                 if (msg.type === 'stream_event') {
                     const ev = msg.event as { type: string; [k: string]: unknown };
@@ -242,26 +252,135 @@ export class ClaudeProvider implements AgentProvider {
                         costUsd: 'total_cost_usd' in msg ? (msg.total_cost_usd as number) : undefined,
                         turns: msg.num_turns
                     });
+                    // The turn is over; the conversation waits for the next message.
+                    break;
                 }
             }
         } catch (err) {
+            // A process that failed mid-turn is not trusted with another.
+            this.end(conv);
             emit({ type: 'error', message: (err as Error).message });
             emit({ type: 'done' });
-        } finally {
-            this.active = null;
         }
 
-        return { sessionId };
+        return { sessionId: conv.sessionId };
+    }
+
+    /** Start a conversation: one agent process, fed what the user types. */
+    private start(query: QueryFn): Conversation {
+        const cwd = process.env.SCREEN_OVERLAY_CWD || app.getPath('home');
+        const inbox = new Inbox();
+        let end!: () => void;
+        const ended = new Promise<void>(resolve => (end = resolve));
+
+        const handle = query({
+            prompt: inbox,
+            options: {
+                model: process.env.SCREEN_OVERLAY_MODEL || 'claude-opus-5',
+                cwd,
+                includePartialMessages: true,
+                maxTurns: 24,
+                systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_APPEND },
+                // None of the user's own Claude Code setup. Their settings
+                // files would bring hooks, permission rules that skip
+                // canUseTool, plugins and CLAUDE.md (text from their disk about
+                // other work); their MCP servers would bring tools of their
+                // own; auto-memory would bring notes from other sessions, and
+                // keep notes on this one. The panel runs on this file alone.
+                settingSources: [],
+                strictMcpConfig: true,
+                settings: { autoMemoryEnabled: false },
+                // No transcript on disk: what the agent saw of the shared
+                // windows would otherwise stay in ~/.claude/projects after the
+                // user stopped sharing them, and after New.
+                persistSession: false,
+                mcpServers: {
+                    [SERVER_NAME]: {
+                        type: 'http',
+                        url: mcpUrl(),
+                        // The endpoint refuses a request without the token. A
+                        // header rather than ?key= keeps the token out of the
+                        // URL, which the SDK may log.
+                        headers: { Authorization: `Bearer ${settings().token}` },
+                        // The overlay tools must be in the turn-1 prompt; without
+                        // this they can be deferred behind tool search and the
+                        // agent will not know it can draw.
+                        alwaysLoad: true
+                    }
+                },
+                // The built-ins offered at all; everything else is absent.
+                tools: BUILTINS,
+                // Auto-approves our tools only. Read is left to the gates below,
+                // which look at the path.
+                allowedTools: OVERLAY_TOOLS,
+                // The gate that always runs. canUseTool is asked only when a
+                // tool would otherwise prompt, and Claude Code lets Read inside
+                // the working directory (the home folder) through without
+                // asking; a hook sees every call, Read of any path included.
+                hooks: {
+                    PreToolUse: [
+                        {
+                            hooks: [
+                                async input => {
+                                    if (input.hook_event_name !== 'PreToolUse') return {};
+                                    const verdict = judge(input.tool_name, input.tool_input, cwd);
+                                    return verdict.allowed
+                                        ? {}
+                                        : {
+                                              hookSpecificOutput: {
+                                                  hookEventName: 'PreToolUse' as const,
+                                                  permissionDecision: 'deny' as const,
+                                                  permissionDecisionReason: verdict.why
+                                              }
+                                          };
+                                }
+                            ]
+                        }
+                    ]
+                },
+                // The same rule again, for whatever does reach a prompt.
+                canUseTool: async (toolName, input) => {
+                    const verdict = judge(toolName, input, cwd);
+                    // Return no updatedInput: supplying one would REPLACE the
+                    // tool's arguments rather than approve them as-is.
+                    return verdict.allowed
+                        ? { behavior: 'allow' as const }
+                        : { behavior: 'deny' as const, message: verdict.why };
+                }
+            }
+        });
+
+        const conv: Conversation = { handle, inbox, ended, end };
+        this.conversation = conv;
+        return conv;
+    }
+
+    /** End a conversation (the current one by default): its process goes, and what it held with it. */
+    private end(conv: Conversation | null = this.conversation): void {
+        if (!conv) return;
+        if (this.conversation === conv) this.conversation = null;
+        conv.end();
+        conv.inbox.end();
+        try {
+            conv.handle.close();
+        } catch {
+            // Already gone.
+        }
     }
 
     async interrupt(): Promise<void> {
-        const handle = this.active;
-        if (!handle) return;
+        const conv = this.conversation;
+        if (!conv) return;
         try {
-            await handle.interrupt();
+            // The turn ends with a result, and the conversation carries on.
+            await conv.handle.interrupt();
         } catch {
-            handle.close();
+            // One that cannot be interrupted is ended; the next message starts afresh.
+            this.end(conv);
         }
-        this.active = null;
+    }
+
+    async reset(): Promise<void> {
+        this.end();
     }
 }

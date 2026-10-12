@@ -1,7 +1,13 @@
+import { flatText, quoteAgentText } from '../steps.js';
+
 /**
  * Tool calls as the panel shows them: a line a person can read ("reading
- * Notepad") rather than a tool name. Shared by the built-in agent and by Follow
- * mode, which mirrors an editor session's transcript.
+ * “Notepad”") rather than a tool name. Shared by the built-in agent and by
+ * Follow mode, which mirrors an editor session's transcript.
+ *
+ * The arguments are the agent's words, and these lines look like the app's
+ * own notices, so each is quoted the way the app quotes an agent: one short
+ * line that cannot close its quote, and never the app's name.
  */
 
 /**
@@ -16,6 +22,10 @@ export const SELF_LOGGING = /^mcp__screen-overlay__(highlight_and_wait|wait_for_
 export function summarise(name: string, input: unknown): string {
     const short = name.replace(/^mcp__[^_]+__/, '');
     const args = (input ?? {}) as Record<string, unknown>;
+    /** One of the agent's arguments, quoted; '' when it gave none. */
+    const quoted = (value: unknown, instead: string, max?: number): string =>
+        value === undefined || value === null ? '' : quoteAgentText(String(value), instead, max);
+    const window = quoted(args.window, 'a window it named after this app');
 
     switch (short) {
         case 'list_windows':
@@ -24,27 +34,31 @@ export function summarise(name: string, input: unknown): string {
             return args.ask ? 'asking you to share a window' : 'listing the windows you shared';
         case 'describe_window':
         case 'find_ui_elements':
-            return `reading ${args.window ? String(args.window) : 'what you shared'}`;
+            return `reading ${window || 'what you shared'}`;
         case 'read_text':
             return 'reading text off the screen';
-        case 'capture_screen':
-            return `looking at ${args.window ? String(args.window) : args.display ? `display ${String(args.display)}` : 'what you shared'}`;
+        case 'capture_screen': {
+            const display = quoted(args.display, 'a display it named after this app');
+            const which = display.startsWith('“') ? `display ${display}` : display;
+            return `looking at ${window || which || 'what you shared'}`;
+        }
         case 'annotate': {
             const shapes = Array.isArray(args.shapes) ? args.shapes : [];
-            const kinds = shapes.map(s => String((s as { type?: unknown }).type ?? '?'));
+            const kinds = shapes.map(s => flatText(String((s as { type?: unknown }).type ?? '?'), 12));
             return `drawing ${kinds.length} shape(s): ${kinds.join(', ')}`;
         }
         case 'clear_annotations':
             return 'clearing the screen';
         case 'wait_for_user_click':
         case 'highlight_and_wait':
-            return `asking you: ${String(args.prompt ?? '')}`;
+            return `asking you: ${quoted(args.prompt, 'a step that used this app’s name')}`;
         case 'wait_for_element':
-            return `waiting for ${String(args.name ?? args.automationId ?? args.role ?? 'the UI')}`;
+            return `waiting for ${quoted(args.name ?? args.automationId ?? args.role, 'something it named after this app') || 'the UI'}`;
         case 'show_message':
             return 'posting a message';
         case 'Read':
-            return `reading ${String(args.file_path ?? '')}`;
+            // Room for a whole path, which says what the agent tried to open.
+            return `reading ${quoted(args.file_path, 'a file it named after this app', 120)}`;
         default:
             return short;
     }
