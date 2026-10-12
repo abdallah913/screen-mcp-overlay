@@ -218,9 +218,17 @@ programs whose windows are unrelated things, so a second browser window stays pr
 
 What to know:
 
-- **Screenshots are masked.** Anything that is not a shared window on top (other windows, the
-  desktop, the taskbar, a notification) is painted over in one flat colour before the image or the
-  text read from it reaches an agent.
+- **Screenshots show shared windows only.** A screenshot is built from each shared window's own
+  picture on a blank background, so nothing of any other window (its pixels, its outline, its shadow),
+  the desktop, the taskbar or a notification is ever in it, and no text is read from them. A shared
+  window that cannot draw its own picture (some games and video players) is taken from the screen
+  instead, and left blank whenever anything you have not shared is in front of it.
+- **Nothing about other windows leaks through the wording either.** An agent is not told which window
+  you are working in, whether something you have not shared covers what it pointed at, or that a window
+  you stopped sharing has closed. A tool call during which you stop sharing something returns nothing
+  it read.
+- **The overlay's own questions carry its badge.** Asking you to share a window is done by the overlay,
+  marked as such; an agent's message that tries to look like one is labelled as the agent's.
 - **A shared browser window shows its tab strip**, so the titles of its other tabs are visible, and
   switching that window to another tab shows that tab. Sharing is per window, not per tab: put what
   you want private in a separate browser window.

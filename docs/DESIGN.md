@@ -83,13 +83,24 @@ window may decide behaviour but never wording: it is "another window" at most, w
 timing. A step whose `until` would be met by an unshared window does not see it; a window that opened
 or closed unshared is simply not in the After block.
 
-**Masking.** A screen capture holds every window. Before any of it reaches an agent, as an image or as
-text read from one, everything that is not a shared window on top is painted one flat colour
-([visible.ts](../src/shared/visible.ts)): the desktop, the taskbar, a notification and the video all
-look the same, so a hole says nothing about what is in it. The visible region comes from the helper's
-z-ordered stack of every top-level window, ours included; shared windows are pulled in by two pixels at
-their edges, because Windows 11 rounds corners and drop shadows spill over. Masking happens at full
-resolution, before OCR, before the image is shrunk and before anything is written to disk.
+**Composed captures.** A screen grab holds every window, and even with the rest painted over, the
+hole a covering window leaves traces its outline. So a capture of a display or a region is never a
+screen grab: it is composed ([capture.ts](../src/main/capture.ts),
+[visible.ts](../src/shared/visible.ts)) on a blank canvas from each shared window's own render, back to
+front in z-order, so nothing of any other window (pixels, outline, drop shadow, rounded corners), the
+desktop, the taskbar, a notification or the overlay is ever read. Only a shared window that cannot
+render itself (some GPU and DirectX surfaces) comes from the screen, painted around with wide margins
+(10 px in for rounded corners, 20 px out for shadows), and blank whole whenever anything unshared is in
+front of it, so no hole follows a private window. Every screen-copied result carries the same fixed
+note, whatever covers it. Images are composed at full resolution, before OCR, before shrinking and
+before anything is written to disk, under names an agent cannot guess.
+
+**Nothing in the wording either.** Which window has focus is not reported, and "foreground" means the
+frontmost shared window, so nothing says whether the user is working in an unshared app. Coverage is
+mentioned only when what covers a target is shared or is the chat panel. A tool call during which the
+user stops sharing anything returns one fixed sentence and nothing it read, and a window the user
+stopped sharing is never reported again, not even when it closes. `since=` baselines of a window are
+dropped when its share ends and are refused if older than its current share.
 
 **The helper refuses on its own as well.** `set_shared` tells the Rust helper what is shared, and it
 refuses raw window handles and element refs outside that set, so a check the TypeScript side misses (a
@@ -168,17 +179,10 @@ and you got the window in front — under the right name, so it looked correct a
 confidently. Verified by deliberately covering a window 72% and capturing it: the render shows the
 target, and the covering window does not appear at all.
 
-`asRendered: true` gives the old behaviour when you genuinely want what the user sees, occlusions
-included. It reports how much is covered, naming the covering window only when it is shared too;
-anything else is masked out of the image and is "another window" in the text:
-
-```
-WARNING: about 72% of this window is covered by another window.
-Those pixels are blanked out. Drop asRendered, or call focus_window first.
-```
-
-The overlay's own windows are excluded from that calculation — they span the whole screen, so
-counting them would report every window as fully covered, always.
+`asRendered: true` gives what the user sees, occlusions included, as far as sharing allows: the
+window and the shared windows in front of it, each from its own render. A window that is not shared
+is not in the picture at all, and not in the wording: how much of the window is covered is said only
+for shared windows and the chat panel, so the answer does not change as an unshared window moves.
 
 ### Deltas
 
@@ -441,8 +445,9 @@ not taken as consent to share it.
 - **Drawings follow targets across monitors.** They are drawn on every display they touch, point at the
   edge when the target is off every display, and say on the other displays where the step is.
 - **A target behind another window** is drawn dashed with "behind another window" (or the covering
-  window's title when that is shared too), and the agent is told the same, instead of a confident
-  circle on the covering window. **A scrolled-out target** gets a pointer rather
+  window's title when that is shared too), instead of a confident circle on the covering window. The
+  agent is told only when what covers it is shared, or is the chat panel: hearing that something
+  unshared sits over a control would say where that window is. **A scrolled-out target** gets a pointer rather
   than a ring on unrelated UI, and `scroll_window {name}` brings it into view.
 - **The overlay's own UI moves out of the way.** The step strip docks away from the target, the panel
   dodges to a free corner when a drawing lands under it (never while focused or in use), and a
@@ -471,18 +476,20 @@ not taken as consent to share it.
   drawing on a menu item is re-found when the menu reopens, not reported as its app closing.
 - **describe_window's budget counts the rows it prints**, not the unnamed wrappers it walked past, and
   it says when it stopped and which subtrees it never reached. Long lists are cut short in the walk
-  itself (eight rows of a run, plus any row that is selected, expanded or holds the focus, then a
-  count of the rest), so the budget reaches the buttons after them. Rows skipped this way are not
+  itself (eight rows of a run, plus any row that is selected or expanded, then a count of the
+  rest), so the budget reaches the buttons after them. Rows skipped this way are not
   read, so `since=` and a `changes` step that saw nothing say so, and point at naming the row. A control that vanishes mid-walk ends only its
   own branch; only a timeout or a dead provider stops the walk. Open popups get their own share of the budget. Rows carry state words
-  (`checked`, `expanded`, `selected`, `focused`), and the diff reports them
+  (`checked`, `expanded`, `selected`), and the diff reports them. Focus is not reported: which control
+  has it would say whether the user is working in a shared window or somewhere else
   (`~ Dark mode [checkbox] unchecked -> checked`).
 - **Window blockers have names.** A minimised shared window can still be named by title, with a note.
   A shared one on another virtual desktop, one running as administrator (UIPI blocks reading it) and
   one not responding are marked as such, instead of failing as "not open" or "no accessibility
   provider". A window that is not shared gets none of these: it gets the one refusal.
-- **read_text reads the window it was asked about**, rendered by PrintWindow as capture_screen does,
-  and falls back to a screen crop with a warning when the render fails or comes back blank.
+- **read_text reads the window it was asked about**, rendered by PrintWindow as capture_screen does.
+  A window that cannot render itself is read from the screen instead, with one fixed note, and blank
+  whenever anything unshared is in front of it.
 - **Fewer cross-process calls.** Property reads are batched with UI Automation cache requests (with a
   live read on any error, but not after a timeout or a dead provider), and bounded connection and
   transaction timeouts stop a hung app from wedging the single-threaded helper. The anchor tracker's
@@ -819,10 +826,12 @@ v0.1. The base was verified end to end on Windows 11. Not yet done:
   stepping; `covered` sampling with the panel on top; elevation and hang detection; and that the
   bounded UIA timeouts never cut off a slow but healthy app. `scripts/describe-check.mjs`,
   `delta-check.mjs` and `smoke.mjs` exercise much of it.
-- **Sharing is not yet verified on Windows either.** Check first: masking against the real z-order,
-  including the bands `EnumWindows` order does not reflect (Start, notifications, Alt+Tab, which shows
-  thumbnails of every window); owned-window sharing for a packaged app's cross-process file picker;
-  and the share key with an elevated window in front.
+- **Sharing is not yet verified on Windows either.** Check first: composed captures against real
+  windows (PrintWindow per shared window, its invisible resize border, DPI scaling and monitors with
+  negative origins); the screen-copy fallback for windows that cannot render themselves, against the
+  bands `EnumWindows` order does not reflect (Start, notifications, Alt+Tab, which shows thumbnails of
+  every window); owned-window sharing for a packaged app's cross-process file picker; and the share
+  key with an elevated window in front.
 - **Event-driven waits** — waits poll (400-500 ms; `changes` on a whole window at most once a second
   over 80 nodes). UIA event subscriptions would cut latency further, but they mean COM event handlers
   on UIA's own threads writing into a single-threaded helper, which cannot be tested off Windows and
