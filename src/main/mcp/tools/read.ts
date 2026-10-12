@@ -4,9 +4,19 @@ import type { CaptureRecord, DisplayInfo, Rect } from '../../../shared/types.js'
 import { DEFAULT_CAPTURE } from '../../../shared/geometry.js';
 import { clean, elementLine, rectText } from '../../../shared/uitree.js';
 import { windowFlags, windowLine, windowOffsets } from '../../../shared/windows.js';
+import { coveredFraction, intersect } from '../../../shared/visible.js';
 import { listDisplays, resolveDisplay } from '../../displays.js';
 import { captureDisplay, captureWindow, type WindowCapture } from '../../capture.js';
-import { findElements, occlusionOf, ocrImage, resolveRefs, resolveWindowInfo, type OcrLine } from '../../uia.js';
+import {
+    PANEL_NAME,
+    findElements,
+    hudWindowRef,
+    ocrImage,
+    resolveRefs,
+    resolveWindowInfo,
+    windowStack,
+    type OcrLine
+} from '../../uia.js';
 import { askToShare, sharedWindows } from '../../sharing.js';
 import { toDisplayLocal } from '../../anchors.js';
 import { describeWindowAsText } from '../../describe.js';
@@ -98,23 +108,55 @@ async function readableWindow(query: string): Promise<{ ref: string; note?: stri
 }
 
 /**
- * Say when "the window's pixels" are really the screen's: then anything on top
- * of the window is in them, labelled as the window. That is the confident wrong
- * read that rendering the window itself exists to prevent.
+ * How much of a window is under shared windows (and the chat panel, when
+ * `panel`), as a sentence for a note, or '' when hardly any of it is. Only
+ * those may be mentioned, and they are measured from where they are, never
+ * from what else is on screen: a window the user did not share changes
+ * neither the number nor whether the sentence is there, so moving one over
+ * the window cannot be followed through it. (The helper's occlusion figure
+ * counts every window on top, shared or not, which is why it is not used.)
+ */
+async function sharedCover(ref: string, panel: boolean): Promise<string> {
+    const [stack, shared] = await Promise.all([windowStack(), sharedWindows()]);
+    const at = stack.findIndex(w => w.ref === ref);
+    if (at < 0) return '';
+    const target = stack[at]!.rect;
+    const hud = panel ? hudWindowRef() : undefined;
+    const names: string[] = [];
+    const over: Rect[] = [];
+    for (const w of stack.slice(0, at)) {
+        const s = shared.find(x => x.ref === w.ref);
+        const name = s ? `"${clean(s.title).slice(0, 50)}"` : hud !== undefined && w.ref === hud ? PANEL_NAME : '';
+        if (!name || !intersect(w.rect, target)) continue;
+        over.push(w.rect);
+        if (!names.includes(name)) names.push(name);
+    }
+    const covered = coveredFraction(target, over);
+    if (covered <= 0.02) return '';
+    return ` About ${Math.round(covered * 100)}% of it is under ${names.slice(0, 3).join(', ')}.`;
+}
+
+/**
+ * Said with every read of a window's screen pixels rather than its own
+ * render, in the same words whatever covers it: on screen, any window on top
+ * shows instead of it, and only shared ones are kept.
+ */
+const SCREEN_COPY_NOTE = 'Parts of this window that are not on top show only shared windows; the rest is blank.';
+
+/**
+ * Say when "the window's pixels" are really the screen's: then whatever is on
+ * top of the window is in them, labelled as the window. That is the confident
+ * wrong read that rendering the window itself exists to prevent.
  */
 async function screenPixelsWarning(window: string, why: string): Promise<string> {
-    const occ = await occlusionOf(window).catch(() => null);
-    if (occ && occ.covered > 0.02) {
-        // Names only as occlusionOf makes them safe: a shared title, the panel,
-        // or "another window". The pixels of an unshared cover are blanked.
-        return (
-            `\nWARNING: ${why}, so this is the screen there, and about ${Math.round(occ.covered * 100)}% of the ` +
-            `window is covered by ${occ.by.slice(0, 3).join(', ') || 'another window'}; that part shows what is ` +
-            'on top, or is blanked. focus_window first.'
-        );
-    }
-    return `\nNote: ${why}, so this is the screen there; nothing covered the window.`;
+    const cover = await sharedCover(window, true).catch(() => '');
+    return `\nNote: ${why}, so this is the screen there. ${SCREEN_COPY_NOTE}${cover} focus_window brings it to the front.`;
 }
+
+/** Said with every capture of a window as rendered: what is on top of it, in fixed words. */
+const AS_RENDERED_NOTE =
+    '\nAs on screen, with only shared windows drawn: a shared window on top of this one covers it, anything ' +
+    'else on top is left out.';
 
 function captureBody(record: CaptureRecord, source: string): string {
     // Worth a few tokens: a downscaled image is the usual reason small text is
@@ -148,10 +190,10 @@ async function withImage(body: string, record: CaptureRecord, inline: boolean): 
  *
  * Reads the window's own render first, so a window behind another is still
  * read correctly. A render that failed, fell back to the screen, or came back
- * blank (GPU surfaces) is replaced by, or treated as, a screen crop, masked to
- * the shared windows before OCR, with a warning saying the window is covered
- * (naming the cover only when it is shared). `ref` has already been checked
- * as shared, so a failed render here is the window's own doing.
+ * blank (GPU surfaces) is replaced by, or treated as, its screen pixels,
+ * masked to the shared windows before OCR, with a note saying so in words
+ * that depend on shared windows only. `ref` has already been checked as
+ * shared, so a failed render here is the window's own doing.
  */
 async function readWindow(ref: string): Promise<{ record: CaptureRecord; lines: OcrLine[]; warning: string }> {
     const shot: WindowCapture | null = await captureWindow({ windowRef: ref, maxDimension: NATIVE, grid: false }).catch(
@@ -174,7 +216,7 @@ async function readWindow(ref: string): Promise<{ record: CaptureRecord; lines: 
         ? 'the window rendered blank (a GPU surface, which only the screen shows)'
         : 'the window could not render itself';
     const { display, region } = await windowRegion(ref);
-    const record = await captureDisplay({ display, region, maxDimension: NATIVE, grid: false });
+    const record = await captureDisplay({ display, region, upTo: ref, maxDimension: NATIVE, grid: false });
     // The crop starts at the window's visible top-left unless the display edge
     // clipped it, so offset by wherever it really starts.
     const lines = (await ocrImage(record.path)).map(l => ({
@@ -362,7 +404,7 @@ export function registerRead(server: McpServer): void {
                 asRendered: z
                     .boolean()
                     .default(false)
-                    .describe('With window: crop the screen instead, as covered.'),
+                    .describe('With window: as on screen, under shared windows on top of it.'),
                 maxDimension: z
                     .number()
                     .int()
@@ -409,20 +451,15 @@ export function registerRead(server: McpServer): void {
 
                 let display = resolveDisplay(args.display, listDisplays());
                 let region = args.region;
+                let upTo: string | undefined;
                 let warning = '';
                 if (args.window) {
-                    const window = (await readableWindow(args.window)).ref;
-                    const occ = await occlusionOf(window).catch(() => null);
-                    if (occ && occ.covered > 0.02) {
-                        warning =
-                            `\nWARNING: about ${Math.round(occ.covered * 100)}% of this window is covered by ` +
-                            `${occ.by.slice(0, 3).join(', ') || 'another window'}; that part shows what is on ` +
-                            'top, or is blanked. Drop asRendered, or focus_window first.';
-                    }
-                    ({ display, region } = await windowRegion(window));
+                    upTo = (await readableWindow(args.window)).ref;
+                    warning = AS_RENDERED_NOTE + (await sharedCover(upTo, false).catch(() => ''));
+                    ({ display, region } = await windowRegion(upTo));
                 }
 
-                const record = await captureDisplay({ display, region, maxDimension, maxPixels, grid: args.grid });
+                const record = await captureDisplay({ display, region, upTo, maxDimension, maxPixels, grid: args.grid });
                 return withImage(captureBody(record, `display ${display.id}`) + warning, record, args.returnImage);
             })
     );

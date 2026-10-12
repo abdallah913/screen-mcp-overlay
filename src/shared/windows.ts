@@ -41,7 +41,10 @@ export function isWindowRef(query: string): boolean {
  * open, is open but not shared, or the ref was made up: any difference would
  * tell the agent that an app it guessed is running. Lists the shared windows
  * only, so a wrong guess among them is cheap to correct, and says how to get
- * one shared. Echoes nothing but the agent's own query.
+ * one shared. Echoes nothing but the agent's own query, tidied (whitespace
+ * collapsed, cut at 80 characters) by the query alone: nothing downstream may
+ * rewrite it depending on what is open, or a guess that comes back changed
+ * would say a window with that title exists.
  */
 export function notShared(query: string, shared: readonly Pick<WindowLike, 'ref' | 'title'>[]): string {
     const listed = shared
@@ -146,9 +149,14 @@ export function windowFlags(w: WindowLike): string {
     );
 }
 
-/** One window per line: `ref WxH@x,y title`, the same shape everywhere. Only ever for a shared window. */
+/**
+ * One window per line: `ref WxH@x,y title`, the same shape everywhere. Only
+ * ever for a shared window. Which one has focus is left out: when the user is
+ * working in a window they did not share, no shared window has it, so a mark
+ * on the focused one would say so by being missing.
+ */
 export function windowLine(w: WindowLike): string {
-    return `${w.ref} ${rectText(w.rect)} ${clean(w.title)}${w.foreground ? ' [foreground]' : ''}${windowFlags(w)}`;
+    return `${w.ref} ${rectText(w.rect)} ${clean(w.title)}${windowFlags(w)}`;
 }
 
 /**

@@ -1,11 +1,9 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { z } from 'zod';
 import type { ShapeType } from '../../../shared/types.js';
 import { DEFAULT_COLORS as PALETTE } from '../../../shared/palette.js';
-import { clean } from '../../../shared/uitree.js';
 import { notShared } from '../../../shared/windows.js';
-import { NotSharedError, lastWindowList } from '../../uia.js';
-import { noteRefused, sharedOf, sharedWindows } from '../../sharing.js';
+import { NotSharedError } from '../../uia.js';
+import { noteRefused, revocationCount, sharedWindows } from '../../sharing.js';
 
 /*
  * Shared pieces of the tool layer.
@@ -24,24 +22,56 @@ export const text = (t: string): Result => ({ content: [{ type: 'text', text: t 
 export const fail = (t: string): Result => ({ content: [{ type: 'text', text: t }], isError: true });
 
 /**
- * Run a handler, turning anything it throws into an error the agent can read,
- * and making sure neither its result nor its error says anything about a
- * window the user has not shared (see agentSafe and redact).
+ * What a call hears when the user stopped sharing something while it ran.
+ * Fixed, and the same whichever window it was: what was read may be from the
+ * window the user just took back, and saying which would say more again.
+ */
+export const STOPPED_WHILE_RUNNING =
+    'The user stopped sharing a window while this ran, so nothing from it is returned. list_windows shows what ' +
+    'is shared now.';
+
+/**
+ * Run a handler, turning anything it throws into an error the agent can read.
+ *
+ * What keeps unshared windows out of a result is structural: every window is
+ * checked against the shared set before anything is read from it, and only
+ * shared windows are listed, described, searched or painted into a capture.
+ * Nothing here rewrites a result by the titles of what is open: replacing a
+ * private window's title wherever it appeared changed a shared page's text,
+ * or the agent's own echoed guess, only while that window was open, which
+ * told the agent it was open and what it was called.
+ *
+ * A share the user withdraws while the handler runs can still be in what it
+ * read, so then nothing of the result goes back, whichever window it was.
  */
 export async function guarded(tool: string, fn: () => Promise<Result>): Promise<Result> {
+    const revocations = revocationCount();
+    let result: Result;
     try {
-        return redactResult(await fn());
+        result = await fn();
     } catch (err) {
-        return redactResult(fail(`${tool}: ${await agentSafe(err as Error)}`));
+        result = fail(`${tool}: ${await agentSafe(err as Error)}`);
     }
+    if (revocationCount() === revocations || ANSWERS_STOPS_ITSELF.has(tool)) return result;
+    return fail(`${tool}: ${STOPPED_WHILE_RUNNING}`);
 }
+
+/**
+ * Tools that watch for a share ending while they wait, and then stop reading
+ * and answer in fixed words of their own (guide.ts, waits.ts). A walkthrough
+ * step or a wait can run for many minutes, and the user stopping some other
+ * share meanwhile must not throw away what the step found in the windows
+ * still shared.
+ */
+const ANSWERS_STOPS_ITSELF = new Set(['highlight_and_wait', 'wait_for_element']);
 
 /**
  * Helper errors that say something about one window: that it closed, hangs, is
  * minimised or elsewhere. Every window is checked against the shared set
  * before the helper is asked, so these normally concern a shared window; one
  * that names a window that is not shared (the share was withdrawn mid-call, or
- * a path missed the check) must read like any window that is not open.
+ * a path missed the check) must read like any window that is not open. Judged
+ * by the ref the error names alone, never by titles.
  */
 const WINDOW_STATE = /no window for ref|not responding|has closed|closed|minimi[sz]ed|other (virtual )?desktop|could not be resolved/i;
 
@@ -57,71 +87,23 @@ async function agentSafe(err: Error): Promise<string> {
     return notShared(unshared, shared);
 }
 
-/**
- * The strings the agent itself sent in the current call. Text the agent
- * supplied is never redacted when echoed back: replacing its own words only
- * when they happen to be an open window's title would tell it the window is
- * open.
+/*
+ * The server's last pass over every result (server.ts) once rewrote the
+ * titles of windows that are not shared; that is what made it an oracle (see
+ * guarded). These stay so the server's wrapper keeps working, and change
+ * nothing: a result reads the same whatever else is open.
  */
-const agentInput = new AsyncLocalStorage<string[]>();
 
-function stringsIn(value: unknown, out: string[] = []): string[] {
-    if (typeof value === 'string') out.push(value);
-    else if (Array.isArray(value)) for (const v of value) stringsIn(v, out);
-    else if (value && typeof value === 'object') for (const v of Object.values(value)) stringsIn(v, out);
-    return out;
+export function withAgentInput<T>(_args: unknown, fn: () => T): T {
+    return fn();
 }
 
-/** Run one tool call with the agent's own arguments in scope, for redact. */
-export function withAgentInput<T>(args: unknown, fn: () => T): T {
-    return agentInput.run(stringsIn(args), fn);
-}
-
-/** Below this length a title is a word ("Photos", "Mail") that shared content may well contain. */
-const REDACT_MIN = 6;
-const GENERIC = 'another window';
-
-/**
- * Defence in depth behind every check that keeps unshared windows out of
- * responses: any full title of a window that is not shared, as seen in the
- * last window list, becomes "another window" wherever it appears. Whole
- * titles only, and only ones no shared title contains, so a shared page that
- * mentions "YouTube" or a shared window whose title includes the unshared one
- * reads as it is.
- */
 export function redact(text: string): string {
-    const all = lastWindowList();
-    if (all.length === 0 || !text) return text;
-    const shared = sharedOf(all);
-    const sharedTitles = shared.map(w => w.title);
-    const echoed = agentInput.getStore() ?? [];
-    const forms = new Set<string>();
-    for (const w of all) {
-        if (shared.includes(w)) continue;
-        // As printed raw, with whitespace collapsed, and cut where lists cut it.
-        for (const t of [w.title.trim(), clean(w.title), clean(w.title).slice(0, 50)]) {
-            if (t.length >= REDACT_MIN) forms.add(t);
-        }
-    }
-    const titles = [...forms]
-        .filter(t => !sharedTitles.some(s => s.includes(t) || clean(s).includes(t)))
-        .filter(t => !echoed.some(e => e.includes(t)) && !GENERIC.includes(t))
-        .sort((a, b) => b.length - a.length);
-    let out = text;
-    for (const t of titles) if (out.includes(t)) out = out.split(t).join(GENERIC);
-    return out;
+    return text;
 }
 
-/** redact over every text block of a result; images are masked where they are made (capture.ts). */
 export function redactResult<R extends { content: unknown[] }>(r: R): R {
-    return {
-        ...r,
-        content: r.content.map(c =>
-            c && typeof c === 'object' && (c as { type?: string }).type === 'text'
-                ? { ...(c as { text: string }), text: redact((c as { text: string }).text) }
-                : c
-        )
-    };
+    return r;
 }
 
 export const WINDOW = 'Shared window: ref, title substring or "foreground".';

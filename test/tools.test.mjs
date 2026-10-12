@@ -79,7 +79,7 @@ test('list_windows prints one compact line per shared window, without our own or
     const { text } = await call('list_windows');
     const lines = text.split('\n');
     assert.equal(lines[0], '2 shared window(s), ref WxH@x,y title:');
-    assert.equal(lines[1], '100 800x600@100,100 Untitled - Notepad [foreground]');
+    assert.equal(lines[1], '100 800x600@100,100 Untitled - Notepad');
     assert.equal(lines[2], '200 320x500@1000,100 Calculator');
     assert.match(lines[3], /^displays: 1 primary 1920x1080 scale 1$/);
 });

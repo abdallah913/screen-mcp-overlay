@@ -1,13 +1,19 @@
 import type { Rect } from './types.js';
 
 /**
- * Which parts of the screen show a shared window, for masking captures.
+ * What a capture may show: composing one from shared windows' own renders,
+ * and, where a window cannot render itself, which parts of the screen show a
+ * shared window.
  *
- * A screen grab holds every window the user has open. Before any of it reaches
- * the agent (as an image, or as text read from one), everything that is not a
- * shared window on top is painted over with one flat colour, so the desktop,
- * the taskbar, a notification and a video playing on the side all look alike:
- * a hole says nothing about what is in it.
+ * Captures are composed (composeLayers): each shared window painted from its
+ * own render onto a blank canvas, so nothing about any other window, its
+ * outline included, is in them. A screen grab is the fallback for a window
+ * that will not render, and it holds every window the user has open. Before
+ * any of it reaches the agent (as an image, or as text read from one),
+ * everything that is not a shared window on top is painted over with one flat
+ * colour, so the desktop, the taskbar, a notification and a video playing on
+ * the side all look alike: a hole says nothing about what is in it, though
+ * its shape follows whatever covers the window.
  */
 
 /** A window in z-order, front first. */
@@ -19,12 +25,21 @@ export interface Layer {
 }
 
 /**
- * How far a shared window is pulled in at its edges, and every other window
- * pushed out: Windows 11 rounds window corners, so the corners inside a
- * window's frame show what is behind it, and drop shadows spill a few pixels
- * onto the windows below.
+ * How far a shared window's area is pulled in at its edges when its pixels
+ * come from the screen: Windows 11 rounds window corners (8px), and inside
+ * that rounding the screen shows whatever is behind the window. With margin.
+ * Mirrored by the helper's own screen-copy masking (native/uia-helper).
  */
-export const EDGE_PX = 2;
+export const SHARED_INSET_PX = 10;
+
+/**
+ * How far every window that is not shared is pushed out before it is cut
+ * from a shared window: its drop shadow falls on the windows below, up to
+ * about 16px from its edge, and a band of shadow along a shared window traces
+ * the private window's outline as surely as the window itself. With margin.
+ * Mirrored by the helper's own screen-copy masking (native/uia-helper).
+ */
+export const OCCLUDER_SHADOW_PX = 20;
 
 const right = (r: Rect): number => r.x + r.width;
 const bottom = (r: Rect): number => r.y + r.height;
@@ -57,18 +72,22 @@ function minus(a: Rect, b: Rect): Rect[] {
  * The parts of shared windows that are on top, in the stack's coordinates.
  * Everything not covered by the result is to be masked.
  */
-export function visibleRegions(stack: readonly Layer[], edge = EDGE_PX): Rect[] {
+export function visibleRegions(
+    stack: readonly Layer[],
+    inset = SHARED_INSET_PX,
+    shadow = OCCLUDER_SHADOW_PX
+): Rect[] {
     const covering: Rect[] = [];
     const shown: Rect[] = [];
     for (const layer of stack) {
         if (layer.ignore || layer.rect.width <= 0 || layer.rect.height <= 0) continue;
         if (layer.shared) {
-            let parts = [grow(layer.rect, -edge)].filter(r => r.width > 0 && r.height > 0);
+            let parts = [grow(layer.rect, -inset)].filter(r => r.width > 0 && r.height > 0);
             for (const c of covering) parts = parts.flatMap(p => minus(p, c));
             shown.push(...parts);
         }
         // A shared window hides what is behind it too, without spilling.
-        covering.push(layer.shared ? layer.rect : grow(layer.rect, edge));
+        covering.push(layer.shared ? layer.rect : grow(layer.rect, shadow));
     }
     return shown;
 }
@@ -123,6 +142,86 @@ export function maskBitmap(bitmap: Uint8Array, width: number, height: number, ke
         for (let y = k.y; y < k.y + k.height; y += 1) {
             const start = (y * width + k.x) * 4;
             out.set(bitmap.subarray(start, start + k.width * 4), start);
+        }
+    }
+    return out;
+}
+
+/** How much of `target` the rects in `above` hide between them, 0..1: overlapping ones count once. */
+export function coveredFraction(target: Rect, above: readonly Rect[]): number {
+    const whole = target.width * target.height;
+    if (whole <= 0) return 0;
+    let open = [target];
+    for (const a of above) open = open.flatMap(p => minus(p, a));
+    const left = open.reduce((sum, r) => sum + r.width * r.height, 0);
+    return 1 - left / whole;
+}
+
+/** A BGRA bitmap, rows packed. */
+export interface Bitmap {
+    data: Uint8Array;
+    width: number;
+    height: number;
+}
+
+/** One image to paint into a composed capture. */
+export interface PaintLayer {
+    image: Bitmap;
+    /** Where the image lies, virtual-screen physical; it is stretched over this rect. */
+    rect: Rect;
+    /** The only parts painted, virtual-screen physical: nothing of the image outside them is read. */
+    clip: readonly Rect[];
+}
+
+/**
+ * A capture composed from images rather than masked from the screen: a canvas
+ * of `size` physical pixels whose top-left is `origin` (virtual-screen
+ * physical, so negative left of or above the primary display), blank in the
+ * mask colour, with each layer painted over it in order, back to front,
+ * inside its clip and the canvas only.
+ *
+ * Each shared window is painted from its own render, so the canvas holds the
+ * shared windows whole and in their order, and nothing else at all: no window
+ * the user did not share, not even the outline of one, since where it sits on
+ * screen is never consulted. A layer is sampled by nearest pixel, which keeps
+ * a 1:1 render exact and lets a screen frame of a slightly different size
+ * land on the same physical pixels. A layer whose buffer is not the size it
+ * claims paints nothing.
+ */
+export function composeLayers(
+    size: { width: number; height: number },
+    origin: { x: number; y: number },
+    layers: readonly PaintLayer[]
+): Uint8Array {
+    const { width, height } = size;
+    const out = new Uint8Array(Math.max(0, width * height * 4));
+    for (let i = 0; i < out.length; i += 4) out.set(MASK_BGRA, i);
+    const canvas = { x: origin.x, y: origin.y, width, height };
+    for (const layer of layers) {
+        const { image, rect } = layer;
+        if (image.width <= 0 || image.height <= 0 || image.data.length !== image.width * image.height * 4) continue;
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const kx = image.width / rect.width;
+        const ky = image.height / rect.height;
+        const exact = kx === 1 && ky === 1;
+        for (const c of layer.clip) {
+            const part = intersect(c, rect);
+            const area = part && intersect(part, canvas);
+            if (!area) continue;
+            for (let y = area.y; y < bottom(area); y += 1) {
+                const sy = Math.min(image.height - 1, Math.floor((y - rect.y) * ky));
+                const to = ((y - origin.y) * width + (area.x - origin.x)) * 4;
+                if (exact) {
+                    const from = (sy * image.width + (area.x - rect.x)) * 4;
+                    out.set(image.data.subarray(from, from + area.width * 4), to);
+                    continue;
+                }
+                for (let x = 0; x < area.width; x += 1) {
+                    const sx = Math.min(image.width - 1, Math.floor((area.x + x - rect.x) * kx));
+                    const from = (sy * image.width + sx) * 4;
+                    out.set(image.data.subarray(from, from + 4), to + x * 4);
+                }
+            }
         }
     }
     return out;

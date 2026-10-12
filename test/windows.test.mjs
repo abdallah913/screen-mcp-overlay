@@ -59,11 +59,15 @@ test('with nothing shared, a miss lists nothing and counts nothing', () => {
     );
 });
 
-test('window lines are one compact line each', () => {
-    assert.equal(
-        windowLine({ ref: '7', title: 'A\nB', rect: { x: -8, y: 0, width: 10, height: 20 }, foreground: true }),
-        '7 10x20@-8,0 A B [foreground]'
-    );
+test('window lines are one compact line each, and never say which window has focus', () => {
+    // A mark on the focused shared window would, by its absence, say the
+    // user is working in a window they did not share.
+    for (const foreground of [true, false]) {
+        assert.equal(
+            windowLine({ ref: '7', title: 'A\nB', rect: { x: -8, y: 0, width: 10, height: 20 }, foreground }),
+            '7 10x20@-8,0 A B'
+        );
+    }
 });
 
 import { pickWindow, windowBlocker, coverVerdict, nearlyUniform, windowOffsets } from '../dist-test/windows.js';

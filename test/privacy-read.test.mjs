@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { call, connect, fakeDesktop, fakeHelper, harness, rect } from './support/fake-helper.mjs';
 import { captureLayers, keptInFrame } from '../dist-test/windows.js';
-import { MASK_BGRA, maskBitmap } from '../dist-test/visible.js';
+import { MASK_BGRA, SHARED_INSET_PX, maskBitmap } from '../dist-test/visible.js';
 
 /*
  * A window the user has not shared must be indistinguishable, through every
@@ -248,21 +248,122 @@ test('a helper error naming an unshared window reads as the refusal', async () =
     }
 });
 
-test('a private window title that reaches a response anyway is replaced, but the agent\'s own words are not', async () => {
-    const desktop = desktopWith(true);
-    desktop.controls = [{ ref: 'el_1', name: `Now playing: ${VIDEO}`, role: 'text', rect: rect(150, 150, 80, 24), enabled: true }];
-    fakeHelper({}, desktop);
-    const { text } = await call('find_ui_elements', { window: 'Notepad' });
-    assertNoLeak(text);
-    assert.match(text, /Now playing: another window/);
+/** Notepad's document reads `doc`; a private window titled `title` is open in front when `open`. */
+function mentioning(doc, title, open) {
+    const desktop = desktopWith(false);
+    desktop.tree = desktop.tree.map(n => (n.role === 'document' ? { ...n, value: doc } : n));
+    desktop.controls = [...desktop.controls, { ref: 'el_3', name: doc, role: 'text', rect: rect(100, 180, 800, 20), enabled: true }];
+    if (open) desktop.windows.unshift({ ...video, title });
+    return desktop;
+}
 
-    // Echoed back as typed whether or not such a window is open: rewriting it
-    // only when it is would say that it is.
-    fakeHelper({}, desktopWith(true));
-    const typed = await call('describe_window', { window: VIDEO });
-    fakeHelper({}, desktopWith(false));
-    assert.equal(typed.text, (await call('describe_window', { window: VIDEO })).text);
-    assert.match(typed.text, new RegExp(`no shared window matches "${VIDEO}"`));
+test("shared content that mentions a private window's title reads as it is, whether or not that window is open", async () => {
+    const jazz = 'Relaxing Jazz Piano Music for Work and Study - 3 Hours';
+    for (const [title, doc] of [
+        [VIDEO, `Things to watch later: ${VIDEO}`],
+        [`${jazz} - YouTube - Google Chrome`, `Up next: ${jazz} (1.2M views)`],
+        ['Task Manager', 'Open Task Manager and click Apply'],
+        ['Settings', 'Open Settings and click Apply']
+    ]) {
+        for (const [tool, args] of [
+            ['describe_window', { window: 'Notepad' }],
+            ['find_ui_elements', { window: 'Notepad', name: 'Apply' }],
+            ['find_ui_elements', { window: 'Notepad', name: 'later' }],
+            ['find_ui_elements', { window: 'Notepad', name: 'Up next' }]
+        ]) {
+            fakeHelper({}, mentioning(doc, title, true));
+            const open = await call(tool, args);
+            fakeHelper({}, mentioning(doc, title, false));
+            const closed = await call(tool, args);
+            assert.equal(normal(open.text), normal(closed.text), `${tool} ${JSON.stringify(args)} with "${title}" open`);
+            assert.doesNotMatch(open.text, /another window/, open.text);
+        }
+    }
+    fakeHelper({}, mentioning(`Things to watch later: ${VIDEO}`, VIDEO, true));
+    assert.match((await call('describe_window', { window: 'Notepad' })).text, new RegExp(`"Things to watch later: ${VIDEO}"`));
+});
+
+test('a title guess is echoed the same whether or not a window with that title is open, however it is spaced', async () => {
+    const guesses = [
+        VIDEO,
+        'Lofi  beats - YouTube - Google Chrome',
+        'Lofi\tbeats - YouTube - Google Chrome',
+        ' Lofi beats -\nYouTube - Google Chrome',
+        'Lofi beats  - YouTube - Google Chrome',
+        'Task  Manager',
+        'Spotify  Premium'
+    ];
+    const titles = { 'Task  Manager': 'Task Manager', 'Spotify  Premium': 'Spotify Premium' };
+    const tools = [
+        ['describe_window', q => ({ window: q })],
+        ['find_ui_elements', q => ({ window: q, name: 'Save' })],
+        ['read_text', q => ({ window: q })],
+        ['capture_screen', q => ({ window: q })],
+        ['focus_window', q => ({ window: q })],
+        ['scroll_window', q => ({ window: q })],
+        ['annotate', q => ({ anchor: { window: q }, shapes: [{ type: 'circle' }] })],
+        ['wait_for_element', q => ({ condition: 'appears', name: 'x', window: q, timeoutMs: 0 })]
+    ];
+    for (const q of guesses) {
+        const title = titles[q] ?? VIDEO;
+        for (const [tool, args] of tools) {
+            const desktop = desktopWith(true);
+            desktop.windows[0].title = title;
+            fakeHelper({}, desktop);
+            const open = await call(tool, args(q));
+            fakeHelper({}, desktopWith(false));
+            const closed = await call(tool, args(q));
+            assert.equal(open.text, closed.text, `${tool} ${JSON.stringify(q)}`);
+            assert.doesNotMatch(open.text, /another window/, `${tool} ${JSON.stringify(q)}: ${open.text}`);
+        }
+    }
+});
+
+// --- the user stops sharing while a read is in flight ----------------------------------------
+
+const STOPPED =
+    'The user stopped sharing a window while this ran, so nothing from it is returned. list_windows shows what is shared now.';
+
+test('a read that finishes after the user stopped sharing returns nothing of what it read', async () => {
+    for (const [tool, args, op] of [
+        ['describe_window', { window: 'Notepad' }, 'describe'],
+        ['find_ui_elements', { window: 'Notepad', name: 'Save' }, 'find_elements'],
+        ['find_ui_elements', { name: 'Save' }, 'find_elements'],
+        ['list_windows', {}, 'list_windows']
+    ]) {
+        // Which window stopped being shared does not show: the answer is the same for either.
+        for (const ref of ['100', '200']) {
+            const desktop = fakeDesktop();
+            desktop.tree = desktop.tree.map(n => (n.role === 'document' ? { ...n, value: 'my bank PIN is 1234' } : n));
+            const answers = {
+                describe: () => ({ nodes: desktop.tree, truncated: false }),
+                find_elements: () => desktop.controls,
+                list_windows: () => desktop.windows
+            };
+            let stopped = false;
+            fakeHelper(
+                {
+                    [op]: p => {
+                        if (!stopped) harness.stopSharingWindow(ref, { byUser: true });
+                        stopped = true;
+                        return answers[op](p);
+                    }
+                },
+                desktop
+            );
+            const r = await call(tool, args);
+            assert.equal(r.isError, true, `${tool} after ${ref} stopped: ${r.text}`);
+            assert.equal(r.text, `${tool}: ${STOPPED}`);
+        }
+    }
+});
+
+test('a read with no share withdrawn while it ran is answered as usual', async () => {
+    fakeHelper();
+    harness.stopSharingWindow('200', { byUser: true });
+    const r = await call('describe_window', { window: 'Notepad' });
+    assert.equal(r.isError, false, r.text);
+    assert.match(r.text, /Text editor \[document\] "hello"/);
 });
 
 // --- asking to share ------------------------------------------------------------------------
@@ -285,7 +386,8 @@ test('list_windows with ask shares the window the user picks, and then it is rea
     const { calls } = fakeHelper({}, desktopWith(true));
     const [result] = await Promise.all([call('list_windows', { ask: 'to read the video title' }), answerShare(0)]);
     assert.equal(result.isError, false, result.text);
-    assert.match(result.text, new RegExp(`^3 shared window\\(s\\)[^]*\\n500 900x600@600,120 ${VIDEO} \\[foreground\\]`));
+    assert.match(result.text, new RegExp(`^3 shared window\\(s\\)[^]*\\n500 900x600@600,120 ${VIDEO}\\n`));
+    assert.doesNotMatch(result.text, /\[foreground\]/);
     const described = await call('describe_window', { window: '500' });
     assert.equal(described.isError, false, described.text);
     assert.equal(calls.filter(c => c.op === 'describe').at(-1).params.window, '500');
@@ -337,7 +439,8 @@ test('only what was shared both before and after the grab is kept, in the frame\
     const kept = keptInFrame(before, after, r(1000, 0, 800, 600), { width: 400, height: 300 });
     assert.equal(kept.length, 1);
     const [k] = kept;
-    assert.ok(k.x >= 50 && k.x <= 52, `left edge at the later position: ${k.x}`);
+    // The later position, pulled in at the edge, at half scale.
+    assert.equal(k.x, Math.floor((100 + SHARED_INSET_PX) / 2), `left edge at the later position: ${k.x}`);
     assert.ok(k.x + k.width <= 200, 'right edge at the earlier position');
 
     const frame = new Uint8Array(400 * 300 * 4).fill(200);

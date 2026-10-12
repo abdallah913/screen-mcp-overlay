@@ -128,13 +128,6 @@ export interface Coverage {
     by: string[];
 }
 
-export interface Occlusion {
-    /** Rough fraction of the window hidden behind windows above it, 0..1. */
-    covered: number;
-    /** The windows on top, nearest first, as the agent may hear them (see agentSafeNames). */
-    by: string[];
-}
-
 export interface OcrLine {
     text: string;
     rect: Rect;
@@ -233,16 +226,11 @@ export function isElementRefLive(ref: string): boolean {
 
 /**
  * The last full window list read, for deciding synchronously whether a window
- * is shared (issuing refs, forgetting them, naming covers, redacting). Every
- * agent request lists the windows before it touches one, so this is current
- * where it matters; a window missing from it counts as not shared.
+ * is shared (issuing refs, forgetting them, naming covers). Every agent
+ * request lists the windows before it touches one, so this is current where
+ * it matters; a window missing from it counts as not shared.
  */
 let lastSeen: WindowInfo[] = [];
-
-/** The last full window list, shared or not. For internal decisions and redaction only. */
-export function lastWindowList(): readonly WindowInfo[] {
-    return lastSeen;
-}
 
 /** Whether a top-level window is shared, judged from the last window list. */
 function sharedNow(ref: string): boolean {
@@ -659,17 +647,6 @@ export async function describeWindow(opts: {
 /** Bring a window to the front and give it focus. */
 export function focusWindow(ref: string): Promise<{ focused: boolean }> {
     return send<{ focused: boolean }>('focus_window', { window: ref }, 6000);
-}
-
-/**
- * How much of a window is hidden behind others.
- *
- * Our own pid is excluded: the overlay windows span the whole screen, so
- * counting them would report every window as fully covered.
- */
-export async function occlusionOf(ref: string): Promise<Occlusion> {
-    const occ = await send<Occlusion>('occlusion', { window: ref, ignore_pid: process.pid }, 6000);
-    return { ...occ, by: agentSafeNames(occ.by) };
 }
 
 /**
