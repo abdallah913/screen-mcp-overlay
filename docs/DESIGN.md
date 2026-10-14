@@ -599,7 +599,7 @@ unreadable.
 | Concern | Approach | Why |
 |---|---|---|
 | Access control | Bearer token (header or `?key=`), no CORS headers at all, browsers refused outright, DNS-rebinding protection on | An earlier version sent `Access-Control-Allow-Origin: *` on an unauthenticated endpoint that reads the screen — meaning any web page you visited could `fetch()` it. Private Network Access restrictions would mitigate that but are not universally enforced. Local MCP clients never send `Origin` and never need CORS, so refusing anything that does costs nothing. |
-| Sharing | Nothing visible until shared; one refusal for unshared and absent alike; captures masked | See [Sharing](#sharing--nothing-is-visible-until-the-user-shares-it). |
+| Sharing | Nothing visible until shared; one refusal for unshared and absent alike; captures composed from shared windows only | See [Sharing](#sharing--nothing-is-visible-until-the-user-shares-it). |
 | Audit | Captures and requests for unshared windows post a line into the panel | A screen read, or an attempt at one, should never be silent. |
 | Transport | Streamable HTTP on loopback, stateless | stdio would tie the overlay's lifetime to one Claude Code session and spawn a second copy of the app per client. HTTP lets many clients share one long-lived overlay. |
 | Server state | None. Everything lives in [`store`](../src/main/store.ts) | Lets the MCP layer be stateless and still have every client see the same screen. |
@@ -607,7 +607,7 @@ unreadable.
 | Not appearing in its own screenshots | `setContentProtection(true)` → `WDA_EXCLUDEFROMCAPTURE` | DWM draws the overlay on the physical display but omits it from every capture pipeline. No hide → capture → show race. Win10 2004+. |
 | Screenshots to the agent | A **file path**, not base64 | Claude Code renders inline MCP images as *text* — 15–25k tokens versus ~1.6k for a native image block ([#31208](https://github.com/anthropics/claude-code/issues/31208)). The agent's own Read tool ingests the path natively. `returnImage: true` opts back in. |
 | Human-in-the-loop | `wait_for_user_click` as a blocking tool call | MCP elicitation is form/URL-shaped and unsupported by several clients; a long-running tool call works everywhere. |
-| Anchored annotations | A 186 KB Rust helper (`native/uia-helper`) speaking JSON lines over stdio | One long-lived process: the tracker re-reads rectangles ~8x a second, and a process spawn per query would cost more than the query. It **must** call `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` — without it Windows silently returns DPI-virtualised rectangles. |
+| Anchored annotations | A small Rust helper (`native/uia-helper`) speaking JSON lines over stdio | One long-lived process: the tracker re-reads rectangles ~8x a second, and a process spawn per query would cost more than the query. It **must** call `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` — without it Windows silently returns DPI-virtualised rectangles. |
 | Physical -> display-local coords | `screen.screenToDipPoint`, never division by a scale factor | With two monitors at different scaling the DIP layout is not a uniform scaling of the physical layout; arithmetic that assumes it is puts annotations on the wrong screen. |
 | Following an editor session | Tail the transcript JSONL; never write to it | The only supported direction. Injecting into a live session would need the undocumented peer-messaging protocol, which would break on updates. |
 | Z-order vs the chat panel | Re-raise overlays when the panel is focused | Windows collapses every `alwaysOnTop` level into one topmost band, so activation order decides. Click-through means the panel underneath stays usable. |
@@ -725,6 +725,18 @@ Turning the option off skips signing (there is no certificate anyway) and skips 
 portable targets wrap the app up. The result builds cleanly as a normal user, with a proper icon and
 version strings. Re-enable the option if you ever add real code signing.
 
+**Cross-building on Linux.** 0.3.0 was built on Ubuntu 24.04 rather than Windows. The helper comes
+from the MinGW toolchain (`apt install gcc-mingw-w64-x86-64`, `rustup target add
+x86_64-pc-windows-gnu`, then `cargo build --release --target x86_64-pc-windows-gnu --manifest-path
+native/uia-helper/Cargo.toml`), and `npm run build:native` does not do that, so the exe has to be
+copied from `target/x86_64-pc-windows-gnu/release/` to `target/release/`, the path
+`extraResources` reads. Skip the copy and a stale helper ships. It imports only Windows system DLLs
+(`msvcrt.dll` in place of the VC++ runtime). electron-builder then needs Wine with 32-bit support
+(`dpkg --add-architecture i386`, `apt install wine wine32:i386 wine64`), for rcedit in the afterPack
+hook and to run the NSIS stub that writes the uninstaller. Ubuntu installs `wine64` under
+`/usr/lib/wine`, which has to be on `PATH`, and the Wine prefix has to be created after the 32-bit
+part is installed. Then `npm run icon && npm run build && npx electron-builder --win`.
+
 The app icon is generated from code by [scripts/make-icon.mjs](../scripts/make-icon.mjs) — shapes are
 rasterised from signed distance fields, PNG-encoded by hand and packed into a multi-resolution `.ico`
 with no image dependencies, so it is reviewable in a diff rather than an opaque binary.
@@ -741,8 +753,8 @@ npm run dist           # installer + portable exe
 npm run dist:dir       # unpacked app only, for quick checks
 
 node scripts/smoke.mjs         # end-to-end MCP client test against a running overlay
-npm test                       # 71 tests: geometry, tree keys and diffing, window matching, and every
-                               # MCP tool end to end against a fake helper (runs on any OS)
+npm test                       # geometry, tree keys and diffing, window matching, sharing and privacy,
+                               # and every MCP tool end to end against a fake helper (runs on any OS)
 node scripts/anchor-check.mjs  # anchors a box to a window, moves it, checks the box follows
 node scripts/describe-check.mjs # describe_window vs screenshot cost, selector anchors
 node scripts/wait-check.mjs    # wait_for_element against a real app opening and closing
@@ -826,7 +838,7 @@ without touching COM.
 
 ## Status
 
-v0.1. The base was verified end to end on Windows 11. Not yet done:
+v0.3.0. The base (v0.1) was verified end to end on Windows 11. Not yet done:
 
 - **The guidance pass is not yet verified on Windows.** It was built and tested off Windows: the
   TypeScript against a fake helper, the Rust helper compiled for Windows but not run. Check first:
@@ -841,6 +853,11 @@ v0.1. The base was verified end to end on Windows 11. Not yet done:
   negative origins); which real windows fail to render and come out blank (video players, games);
   shared-only coverage against the helper's on-screen sampling; owned-window sharing for a packaged
   app's cross-process file picker; and the share key's dialog with an elevated window in front.
+- **0.3.0 is the first release cross-built on Linux** (see [Packaging notes](#packaging-notes)). Its
+  installer was installed and uninstalled under Wine, and its MCP server and helper were run from the
+  installed copy, but Electron cannot open a window under Wine. Check first: that the app starts, that
+  the MinGW-built helper answers UI Automation queries, and that Defender or SmartScreen does not
+  block the unsigned `uia-helper.exe`.
 - **Event-driven waits** — waits poll (400-500 ms; `changes` on a whole window at most once a second
   over 80 nodes). UIA event subscriptions would cut latency further, but they mean COM event handlers
   on UIA's own threads writing into a single-threaded helper, which cannot be tested off Windows and
