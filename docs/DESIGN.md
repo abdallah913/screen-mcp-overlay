@@ -725,8 +725,15 @@ Turning the option off skips signing (there is no certificate anyway) and skips 
 portable targets wrap the app up. The result builds cleanly as a normal user, with a proper icon and
 version strings. Re-enable the option if you ever add real code signing.
 
-**Cross-building on Linux.** 0.3.0 was built on Ubuntu 24.04 rather than Windows. The helper comes
-from the MinGW toolchain (`apt install gcc-mingw-w64-x86-64`, `rustup target add
+**Releases** come from the [Release workflow](../.github/workflows/release.yml): run it from the
+Actions tab on `main`, or push a tag `vX.Y.Z` matching `package.json`. It runs the tests on Linux,
+then builds on a Windows runner (MSVC for the helper, whose unit tests run there too) and publishes
+the installer, the portable exe and `SHA256SUMS.txt` as the release for that version, with
+[docs/release-notes/vX.Y.Z.md](release-notes/) as its notes when there is one. It creates the tag
+when it does not exist, and run again it replaces the files of an existing release.
+
+**Cross-building on Linux** works too, for checking a build without Windows (0.3.0 was checked this
+way before release). The helper comes from the MinGW toolchain (`apt install gcc-mingw-w64-x86-64`, `rustup target add
 x86_64-pc-windows-gnu`, then `cargo build --release --target x86_64-pc-windows-gnu --manifest-path
 native/uia-helper/Cargo.toml`), and `npm run build:native` does not do that, so the exe has to be
 copied from `target/x86_64-pc-windows-gnu/release/` to `target/release/`, the path
@@ -853,11 +860,11 @@ v0.3.0. The base (v0.1) was verified end to end on Windows 11. Not yet done:
   negative origins); which real windows fail to render and come out blank (video players, games);
   shared-only coverage against the helper's on-screen sampling; owned-window sharing for a packaged
   app's cross-process file picker; and the share key's dialog with an elevated window in front.
-- **0.3.0 is the first release cross-built on Linux** (see [Packaging notes](#packaging-notes)). Its
-  installer was installed and uninstalled under Wine, and its MCP server and helper were run from the
-  installed copy, but Electron cannot open a window under Wine. Check first: that the app starts, that
-  the MinGW-built helper answers UI Automation queries, and that Defender or SmartScreen does not
-  block the unsigned `uia-helper.exe`.
+- **0.3.0 has not been run end to end on Windows.** A Linux cross-build of it was installed and
+  uninstalled under Wine, and its MCP server and helper were run from the installed copy, but
+  Electron cannot open a window under Wine. Check first: that the app starts, that the helper answers
+  UI Automation queries, and that Defender or SmartScreen does not block the unsigned
+  `uia-helper.exe`.
 - **Event-driven waits** — waits poll (400-500 ms; `changes` on a whole window at most once a second
   over 80 nodes). UIA event subscriptions would cut latency further, but they mean COM event handlers
   on UIA's own threads writing into a single-threaded helper, which cannot be tested off Windows and
