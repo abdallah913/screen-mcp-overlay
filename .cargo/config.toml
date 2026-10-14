@@ -1,0 +1,9 @@
+# The UI Automation helper links the C runtime statically on Windows (MSVC).
+# Linked dynamically it needs VCRUNTIME140.dll, the Visual C++ redistributable,
+# which Windows does not include and the installer does not ship: without it
+# the helper does not start, and nothing can be read from any window.
+#
+# Cargo reads this from the directory it runs in, and the npm scripts run it
+# from the repo root (cargo build --manifest-path native/uia-helper/Cargo.toml).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

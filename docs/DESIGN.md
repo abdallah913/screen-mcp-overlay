@@ -734,6 +734,12 @@ when it does not exist; run again, it replaces the files of an existing release,
 commit its tag points at. The build runs with a read-only token, and only the small publish job,
 which runs none of the build's tools, can write to the repo.
 
+The helper links the C runtime statically on Windows ([.cargo/config.toml](../.cargo/config.toml)).
+Linked dynamically it needs `VCRUNTIME140.dll` from the Visual C++ redistributable, which Windows
+does not include and the installer does not ship, so on a PC without it the helper would not start
+and nothing could be read from any window. Releases up to 0.3.0 had that dependency; the Release
+workflow now fails if it comes back.
+
 **Cross-building on Linux** works too, for checking a build without Windows (0.3.0 was checked this
 way before release). The helper comes from the MinGW toolchain (`apt install gcc-mingw-w64-x86-64`, `rustup target add
 x86_64-pc-windows-gnu`, then `cargo build --release --target x86_64-pc-windows-gnu --manifest-path

@@ -84,6 +84,18 @@ jobs:
       - name: Build installer and portable exe
         run: npm run dist -- --publish never
 
+      # The helper must start on a PC without the Visual C++ redistributable,
+      # which the installer does not ship (see .cargo/config.toml).
+      - name: Helper needs no Visual C++ runtime
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { Write-Error 'dumpbin.exe not found'; exit 1 }
+          $deps = & $dumpbin.FullName /nologo /dependents release\win-unpacked\resources\uia-helper.exe | Out-String
+          Write-Output $deps
+          if ($deps -match '(?i)vcruntime|msvcp|api-ms-win-crt') { Write-Error 'uia-helper.exe needs the Visual C++ runtime'; exit 1 }
+
       - name: Checksums
         shell: bash
         working-directory: release
