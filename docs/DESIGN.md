@@ -730,7 +730,9 @@ Actions tab on `main`, or push a tag `vX.Y.Z` matching `package.json`. It runs t
 then builds on a Windows runner (MSVC for the helper, whose unit tests run there too) and publishes
 the installer, the portable exe and `SHA256SUMS.txt` as the release for that version, with
 [docs/release-notes/vX.Y.Z.md](release-notes/) as its notes when there is one. It creates the tag
-when it does not exist, and run again it replaces the files of an existing release.
+when it does not exist; run again, it replaces the files of an existing release, but only from the
+commit its tag points at. The build runs with a read-only token, and only the small publish job,
+which runs none of the build's tools, can write to the repo.
 
 **Cross-building on Linux** works too, for checking a build without Windows (0.3.0 was checked this
 way before release). The helper comes from the MinGW toolchain (`apt install gcc-mingw-w64-x86-64`, `rustup target add
