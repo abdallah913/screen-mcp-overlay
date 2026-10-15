@@ -466,11 +466,21 @@ function refreshTrayMenu(): void {
     );
 }
 
-// The panel ignores a close (Alt+F4) by hiding instead; quitting must still close it.
-app.on('before-quit', allowHudClose);
+// Quitting closes every window first, and one that refuses cancels the quit,
+// leaving the app running in the tray. The panel ignores a close (Alt+F4) by
+// hiding, so it is told to allow one; the overlay windows cannot be closed at
+// all, so they go now (see destroyOverlay).
+app.on('before-quit', () => {
+    allowHudClose();
+    destroyOverlay();
+});
 
 app.on('will-quit', () => {
     globalShortcut.unregisterAll();
+    // Gone now, rather than when the process ends: Windows keeps the icon of
+    // a process that exits without removing it until the pointer passes over.
+    tray?.destroy();
+    tray = null;
 });
 
 app.on('quit', () => {

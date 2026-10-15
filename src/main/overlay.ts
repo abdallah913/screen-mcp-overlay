@@ -59,6 +59,8 @@ let contentProtection = process.env.SCREEN_OVERLAY_SHOW_IN_CAPTURE !== '1';
 let picking = false;
 /** The overlay whose step strip is under the pointer, which alone takes mouse input. */
 let hovered: OverlayWindow | null = null;
+/** Set once the app is quitting: no overlay window is made after that. */
+let closed = false;
 let hoverFailsafe: NodeJS.Timeout | null = null;
 /** The panel window whose moves we follow, to keep the spotlight scrim off it. */
 let watchedHud: BrowserWindow | null = null;
@@ -288,6 +290,9 @@ function watchHud(): void {
 
 /** Rebuild windows to match the current display topology. */
 export function syncDisplays(): void {
+    // A display change while quitting would bring back a window that cannot
+    // be closed, and that cancels the quit (see destroyOverlay).
+    if (closed) return;
     const displays = listDisplays();
     const seen = new Set<string>();
 
@@ -432,7 +437,16 @@ export function raiseOverlays(): void {
     }
 }
 
+/**
+ * Destroy every overlay window, for good: called as the app starts to quit.
+ * They are made `closable: false` (Alt+F4 must not take one away while a
+ * click step makes it focusable), and Electron's quit closes every window
+ * first and gives up at one that cannot be closed: the app stayed running,
+ * in the tray, after Quit. Destroyed here, before that, nothing is left to
+ * refuse, and nothing makes a new one.
+ */
 export function destroyOverlay(): void {
+    closed = true;
     for (const entry of windows.values()) dispose(entry);
     windows.clear();
     setHovered(null);
